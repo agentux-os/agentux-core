@@ -6,6 +6,9 @@
 //! built from the parsed file while checking the rules serde cannot express:
 //! which fields each step type accepts, loops that only point backwards and
 //! carry a limit, and references to roles and checks that must exist.
+//!
+//! Without a file, [`Config::default_for`] builds the built-in pipeline with
+//! checks detected from the project (see [`detect_checks`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,7 +16,10 @@ use std::{fmt, fs, io};
 
 use serde::Deserialize;
 
+mod detect;
 mod validate;
+
+pub use detect::detect_checks;
 
 /// Name of the pipeline file at the root of a project.
 pub const FILE_NAME: &str = "agentux.yaml";
@@ -21,8 +27,9 @@ pub const FILE_NAME: &str = "agentux.yaml";
 /// The only `version` this release understands.
 pub const SUPPORTED_VERSION: u32 = 1;
 
-/// The built-in pipeline used when a project has no `agentux.yaml`.
-/// It is the example from ADR 0005, verbatim.
+/// The example from ADR 0005, verbatim. The built-in default pipeline is this
+/// file with its checks replaced by the detected ones; see
+/// [`Config::default_for`].
 const DEFAULT_YAML: &str = include_str!("default.yaml");
 
 /// A validated `agentux.yaml`.
@@ -223,18 +230,37 @@ impl Config {
         Self::from_yaml(&input)
     }
 
-    /// The pipeline used when a project has no `agentux.yaml`.
-    pub fn builtin_default() -> Self {
-        Self::from_yaml(DEFAULT_YAML).expect("the built-in default pipeline is valid")
+    /// The pipeline used when the project at `project_root` has no
+    /// `agentux.yaml`: the ADR 0005 example, with its `lint` and `test` checks
+    /// detected from the project ([`detect_checks`]) instead of `just`. The
+    /// gate runs whichever checks were found and is left out when none were.
+    pub fn default_for(project_root: &Path) -> Self {
+        let mut config =
+            Self::from_yaml(DEFAULT_YAML).expect("the built-in default pipeline is valid");
+        config.checks = detect_checks(project_root);
+        let names: Vec<String> = config.checks.iter().map(|c| c.name.clone()).collect();
+        let gate = config
+            .pipeline
+            .iter()
+            .position(|step| step.kind() == StepKind::Gate)
+            .expect("the built-in default pipeline has a gate");
+        if names.is_empty() {
+            // Loops in the default only target steps before the gate, so
+            // removing it leaves every `Loop::target` index valid.
+            config.pipeline.remove(gate);
+        } else if let Step::Gate { checks, .. } = &mut config.pipeline[gate] {
+            *checks = names;
+        }
+        config
     }
 
-    /// Loads `agentux.yaml` from a project root, falling back to the built-in
-    /// default pipeline when the file does not exist.
+    /// Loads `agentux.yaml` from a project root, falling back to
+    /// [`Config::default_for`] the project when the file does not exist.
     pub fn load(project_root: &Path) -> Result<Self, ConfigError> {
         let path = project_root.join(FILE_NAME);
         match fs::read_to_string(&path) {
             Ok(input) => Self::from_yaml(&input),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::builtin_default()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default_for(project_root)),
             Err(source) => Err(ConfigError::Read { path, source }),
         }
     }
