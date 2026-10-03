@@ -88,14 +88,37 @@ fn validate_reports_unknown_keys() {
 }
 
 #[test]
-fn validate_without_a_file_uses_the_default_pipeline() {
+fn validate_without_a_file_shows_the_effective_default_pipeline() {
     let dir = tempfile::tempdir().unwrap();
     let output = aux(&["validate", path(dir.path())]);
     assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("built-in default pipeline applies"), "{out}");
     assert!(
-        stdout(&output).contains("built-in default pipeline applies"),
-        "{}",
-        stdout(&output)
+        out.contains("(plan -> implement -> review -> pull_request)"),
+        "{out}"
+    );
+    assert!(out.contains("gate step is left out"), "{out}");
+
+    fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]
+",
+    )
+    .unwrap();
+    let output = aux(&["validate", path(dir.path())]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(
+        out.contains("(plan -> implement -> gate -> review -> pull_request)"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "  test: cargo test
+"
+        ),
+        "{out}"
     );
 }
 
@@ -119,6 +142,18 @@ fn run_is_not_implemented_yet() {
         stderr(&output).contains("not implemented yet"),
         "{}",
         stderr(&output)
+    );
+}
+
+#[test]
+fn exec_rejects_unknown_harnesses() {
+    let output = aux(&["exec", "--harness", "nope", "hello"]);
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("unknown harness `nope`"), "{err}");
+    assert!(
+        err.contains("claude-code, codex, opencode, antigravity"),
+        "{err}"
     );
 }
 

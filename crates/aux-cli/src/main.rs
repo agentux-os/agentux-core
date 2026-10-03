@@ -8,6 +8,8 @@ use agentux_config::{Config, ConfigError, FILE_NAME};
 use agentux_worktree::Worktrees;
 use clap::{Args, Parser, Subcommand};
 
+mod exec;
+
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
 #[derive(Parser)]
@@ -28,6 +30,17 @@ enum Command {
     /// Create, list and remove run worktrees by hand (development aid)
     #[command(subcommand)]
     Worktree(WorktreeCommand),
+    /// Send one prompt to a harness over ACP and stream what it does
+    /// (development aid; asks y/n for each permission request)
+    Exec {
+        /// Harness to run: claude-code, codex, opencode or antigravity
+        #[arg(long)]
+        harness: String,
+        /// Working directory of the harness
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        prompt: String,
+    },
     /// Start a run from an issue or prompt (not implemented yet)
     Run {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -79,6 +92,11 @@ fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Validate { path } => validate(&path),
         Command::Worktree(command) => worktree(command),
+        Command::Exec {
+            harness,
+            cwd,
+            prompt,
+        } => exec::exec(&harness, &cwd, &prompt),
         Command::Run { .. } => Err("`aux run` is not implemented yet".into()),
     };
     match result {
@@ -94,11 +112,18 @@ fn validate(path: &Path) -> Result {
     let file = if path.is_dir() {
         let file = path.join(FILE_NAME);
         if !file.exists() {
+            let config = Config::default_for(path);
             println!(
                 "{}: no {FILE_NAME}; the built-in default pipeline applies ({})",
                 path.display(),
-                summary(&Config::builtin_default())
+                summary(&config)
             );
+            if config.checks.is_empty() {
+                println!("no lint or test commands detected; the gate step is left out");
+            } else {
+                println!("detected checks:");
+                print_checks(&config);
+            }
             return Ok(());
         }
         file
@@ -111,12 +136,22 @@ fn validate(path: &Path) -> Result {
         _ => format!("{} is invalid: {e}", file.display()),
     })?;
     println!("{}: valid ({})", file.display(), summary(&config));
+    if !config.checks.is_empty() {
+        println!("checks:");
+        print_checks(&config);
+    }
     Ok(())
 }
 
 fn summary(config: &Config) -> String {
     let steps: Vec<&str> = config.pipeline.iter().map(|s| s.kind().as_str()).collect();
     steps.join(" -> ")
+}
+
+fn print_checks(config: &Config) {
+    for check in &config.checks {
+        println!("  {}: {}", check.name, check.run);
+    }
 }
 
 fn worktree(command: WorktreeCommand) -> Result {

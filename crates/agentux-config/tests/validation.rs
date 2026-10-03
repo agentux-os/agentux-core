@@ -5,7 +5,7 @@ use agentux_config::{
     Budget, Bus, BusTool, Check, Config, ConfigError, FILE_NAME, Loop, Role, Step, StepKind,
 };
 
-/// The full example from ADR 0005, which is also the built-in default.
+/// The full example from ADR 0005, which the built-in default is built from.
 const ADR_EXAMPLE: &str = include_str!("../src/default.yaml");
 
 /// Roles and checks shared by the smaller test files; append a `pipeline:`.
@@ -138,8 +138,18 @@ fn adr_example_parses_into_the_expected_config() {
 }
 
 #[test]
-fn builtin_default_is_the_adr_example() {
-    let default = Config::builtin_default();
+fn default_with_just_lint_and_test_recipes_is_the_adr_example() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("justfile"),
+        "lint:
+    true
+test:
+    true
+",
+    )
+    .unwrap();
+    let default = Config::default_for(dir.path());
     assert_eq!(default, Config::from_yaml(ADR_EXAMPLE).unwrap());
     let kinds: Vec<StepKind> = default.pipeline.iter().map(Step::kind).collect();
     assert_eq!(
@@ -155,16 +165,103 @@ fn builtin_default_is_the_adr_example() {
 }
 
 #[test]
+fn default_gates_on_the_detected_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("go.mod"),
+        "module example.com/x
+",
+    )
+    .unwrap();
+    let default = Config::default_for(dir.path());
+    assert_eq!(
+        default.checks,
+        [
+            Check {
+                name: "lint".into(),
+                run: "go vet ./...".into()
+            },
+            Check {
+                name: "test".into(),
+                run: "go test ./...".into()
+            }
+        ]
+    );
+    assert_eq!(
+        default.pipeline[2],
+        Step::Gate {
+            checks: vec!["lint".into(), "test".into()],
+            on_fail: Some(Loop {
+                target: 1,
+                limit: 3
+            }),
+        }
+    );
+
+    // Only a test script: the gate runs just that.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("package.json"),
+        r#"{"scripts": {"test": "vitest"}}"#,
+    )
+    .unwrap();
+    let default = Config::default_for(dir.path());
+    assert!(matches!(
+        &default.pipeline[2],
+        Step::Gate { checks, .. } if checks == &["test"]
+    ));
+}
+
+#[test]
+fn default_without_detectable_checks_omits_the_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let default = Config::default_for(dir.path());
+    assert!(default.checks.is_empty());
+    let kinds: Vec<StepKind> = default.pipeline.iter().map(Step::kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            StepKind::Plan,
+            StepKind::Implement,
+            StepKind::Review,
+            StepKind::PullRequest
+        ]
+    );
+    // The review still loops back to `implement`.
+    assert!(matches!(
+        default.pipeline[2],
+        Step::Review {
+            on_changes_requested: Some(Loop { target: 1, .. }),
+            ..
+        }
+    ));
+}
+
+#[test]
 fn load_uses_the_default_without_a_file_and_the_file_when_present() {
     let dir = tempfile::tempdir().unwrap();
-    assert_eq!(Config::load(dir.path()).unwrap(), Config::builtin_default());
+    fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+    assert_eq!(
+        Config::load(dir.path()).unwrap(),
+        Config::default_for(dir.path())
+    );
 
-    let yaml = with_pipeline("  - step: implement\n    role: implementer\n");
+    let yaml = with_pipeline(
+        "  - step: implement
+    role: implementer
+",
+    );
     fs::write(dir.path().join(FILE_NAME), &yaml).unwrap();
     let config = Config::load(dir.path()).unwrap();
     assert_eq!(config.pipeline.len(), 1);
 
-    fs::write(dir.path().join(FILE_NAME), "version: 2\npipeline: []\n").unwrap();
+    fs::write(
+        dir.path().join(FILE_NAME),
+        "version: 2
+pipeline: []
+",
+    )
+    .unwrap();
     assert!(matches!(
         Config::load(dir.path()),
         Err(ConfigError::Invalid(_))
