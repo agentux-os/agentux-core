@@ -13,8 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 agentux-config.workspace = true
+agentux-harness.workspace = true
 agentux-worktree.workspace = true
 clap.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
 
 [dev-dependencies]
 tempfile.workspace = true

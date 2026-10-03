@@ -146,6 +146,18 @@ fn run_is_not_implemented_yet() {
 }
 
 #[test]
+fn exec_rejects_unknown_harnesses() {
+    let output = aux(&["exec", "--harness", "nope", "hello"]);
+    assert!(!output.status.success());
+    let err = stderr(&output);
+    assert!(err.contains("unknown harness `nope`"), "{err}");
+    assert!(
+        err.contains("claude-code, codex, opencode, antigravity"),
+        "{err}"
+    );
+}
+
+#[test]
 fn worktree_create_list_remove() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("repo");

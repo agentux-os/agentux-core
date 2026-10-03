@@ -8,6 +8,8 @@ use agentux_config::{Config, ConfigError, FILE_NAME};
 use agentux_worktree::Worktrees;
 use clap::{Args, Parser, Subcommand};
 
+mod exec;
+
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
 #[derive(Parser)]
@@ -28,6 +30,17 @@ enum Command {
     /// Create, list and remove run worktrees by hand (development aid)
     #[command(subcommand)]
     Worktree(WorktreeCommand),
+    /// Send one prompt to a harness over ACP and stream what it does
+    /// (development aid; asks y/n for each permission request)
+    Exec {
+        /// Harness to run: claude-code, codex, opencode or antigravity
+        #[arg(long)]
+        harness: String,
+        /// Working directory of the harness
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+        prompt: String,
+    },
     /// Start a run from an issue or prompt (not implemented yet)
     Run {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -79,6 +92,11 @@ fn main() -> ExitCode {
     let result = match Cli::parse().command {
         Command::Validate { path } => validate(&path),
         Command::Worktree(command) => worktree(command),
+        Command::Exec {
+            harness,
+            cwd,
+            prompt,
+        } => exec::exec(&harness, &cwd, &prompt),
         Command::Run { .. } => Err("`aux run` is not implemented yet".into()),
     };
     match result {
