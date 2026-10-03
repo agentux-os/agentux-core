@@ -1,0 +1,44 @@
+version: 1
+
+# Roles map to harnesses. Any harness configured in AgentUX can fill a role.
+roles:
+  implementer:
+    harness: claude-code
+  reviewer:
+    harness: codex            # a different vendor than the implementer
+  planner:
+    harness: claude-code
+    model: opus               # optional; passed to the harness if it supports it
+
+# Commands the gate steps run, inside the run's worktree.
+checks:
+  - name: lint
+    run: just lint
+  - name: test
+    run: just test
+
+pipeline:
+  - step: plan
+    role: planner
+    approve: true             # wait for the human before implementing
+  - step: implement
+    role: implementer
+  - step: gate
+    checks: [lint, test]
+    on_fail: implement        # loop back with the failure output
+    max_attempts: 3
+  - step: review
+    role: reviewer
+    on_changes_requested: implement
+    max_rounds: 2
+  - step: pull_request
+    draft: false
+    approve: false            # true = wait for the human before opening the PR
+
+# Agent bus limits (ADR 0004).
+bus:
+  max_turns_per_exchange: 6
+  allow: [post_message, request_review, handoff, get_run_state, ask_human]
+
+budget:
+  max_usd_per_run: 10         # pause the run and ask the human when exceeded
