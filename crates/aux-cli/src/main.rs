@@ -9,12 +9,17 @@ use agentux_worktree::Worktrees;
 use clap::{Args, Parser, Subcommand};
 
 mod exec;
+mod remote;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
 #[derive(Parser)]
 #[command(name = "aux", version, about = "AgentUX command-line interface")]
 struct Cli {
+    /// agentuxd socket [default: $AGENTUX_SOCKET, else
+    /// $XDG_RUNTIME_DIR/agentux/agentuxd.sock]
+    #[arg(long, global = true)]
+    socket: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -41,11 +46,58 @@ enum Command {
         cwd: PathBuf,
         prompt: String,
     },
-    /// Start a run from an issue or prompt (not implemented yet)
-    Run {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+    /// Run the daemon in the foreground
+    Daemon {
+        /// SQLite database [default: $XDG_STATE_HOME/agentux/agentuxd.db, else
+        /// ~/.local/state/agentux/agentuxd.db]
+        #[arg(long)]
+        database: Option<PathBuf>,
+        /// Answer agent steps with a scripted fake instead of a harness
+        #[arg(long)]
+        fake_agents: bool,
     },
+    /// Start a run in a project
+    Run {
+        /// Project directory (inside a git repository)
+        #[arg(default_value = ".")]
+        project_dir: PathBuf,
+        /// What to do
+        #[arg(long, short)]
+        prompt: Option<String>,
+        /// Issue number on the project's forge
+        #[arg(long, short)]
+        issue: Option<u64>,
+        /// Run title [default: first line of the prompt, or "Issue #N"]
+        #[arg(long)]
+        title: Option<String>,
+        /// Follow the run after starting it, like `aux watch`
+        #[arg(long, short)]
+        watch: bool,
+    },
+    /// List active runs and pending approvals
+    Ps {
+        /// Include finished runs
+        #[arg(long, short)]
+        all: bool,
+    },
+    /// Approve a pending request
+    Approve {
+        request_id: String,
+        /// Note recorded with the decision
+        #[arg(long, short)]
+        message: Option<String>,
+    },
+    /// Deny a pending request; its run fails
+    Deny {
+        request_id: String,
+        /// Reason recorded with the decision
+        #[arg(long, short)]
+        message: Option<String>,
+    },
+    /// Follow a run's events until it finishes
+    Watch { run_id: String },
+    /// Cancel a run (its worktree and branch are kept)
+    Cancel { run_id: String },
 }
 
 #[derive(Subcommand)]
@@ -89,7 +141,8 @@ struct RepoArg {
 }
 
 fn main() -> ExitCode {
-    let result = match Cli::parse().command {
+    let cli = Cli::parse();
+    let result = match cli.command {
         Command::Validate { path } => validate(&path),
         Command::Worktree(command) => worktree(command),
         Command::Exec {
@@ -97,7 +150,15 @@ fn main() -> ExitCode {
             cwd,
             prompt,
         } => exec::exec(&harness, &cwd, &prompt),
-        Command::Run { .. } => Err("`aux run` is not implemented yet".into()),
+        Command::Daemon {
+            database,
+            fake_agents,
+        } => daemon(agentuxd::Options {
+            socket: cli.socket,
+            database,
+            fake_agents,
+        }),
+        command => remote(cli.socket, command),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -106,6 +167,45 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn daemon(options: agentuxd::Options) -> Result {
+    tokio::runtime::Runtime::new()?.block_on(agentuxd::run(options))
+}
+
+fn remote(socket: Option<PathBuf>, command: Command) -> Result {
+    let remote = remote::Remote::new(socket)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        match command {
+            Command::Run {
+                project_dir,
+                prompt,
+                issue,
+                title,
+                watch,
+            } => remote.run(&project_dir, prompt, issue, title, watch).await,
+            Command::Ps { all } => remote.ps(all).await,
+            Command::Approve {
+                request_id,
+                message,
+            } => remote.resolve(&request_id, true, message).await,
+            Command::Deny {
+                request_id,
+                message,
+            } => remote.resolve(&request_id, false, message).await,
+            Command::Watch { run_id } => remote.watch(&run_id).await,
+            Command::Cancel { run_id } => remote.cancel(&run_id).await,
+            Command::Validate { .. }
+            | Command::Worktree(_)
+            | Command::Exec { .. }
+            | Command::Daemon { .. } => {
+                unreachable!("handled locally")
+            }
+        }
+    })
 }
 
 fn validate(path: &Path) -> Result {

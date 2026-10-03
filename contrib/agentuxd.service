@@ -1,0 +1,29 @@
+# systemd user unit for the AgentUX daemon.
+#
+# Install to ~/.config/systemd/user/ (or /usr/lib/systemd/user/ in the image)
+# and enable with:
+#
+#   systemctl --user enable --now agentuxd.service
+#
+# The daemon listens on %t/agentux/agentuxd.sock ($XDG_RUNTIME_DIR) and keeps
+# its state in ~/.local/state/agentux/agentuxd.db ($XDG_STATE_HOME). Unfinished
+# runs resume when it starts again.
+
+[Unit]
+Description=AgentUX daemon
+Documentation=https://github.com/agentux-os/agentux-core
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/agentuxd --socket %t/agentux/agentuxd.sock
+# SIGTERM stops it cleanly; a run in the middle of a step resumes (and runs
+# that step again) on the next start.
+KillMode=mixed
+Restart=on-failure
+RestartSec=2
+# Check commands run with the user manager's environment; import PATH into it
+# (systemctl --user import-environment PATH) if they need tools from ~/.local/bin.
+Environment=RUST_BACKTRACE=1
+
+[Install]
+WantedBy=default.target
