@@ -19,7 +19,10 @@ agentux-store = { path = "crates/agentux-store" }
 agentux-worktree = { path = "crates/agentux-worktree" }
 agentuxd = { path = "crates/agentuxd" }
 agent-client-protocol = "2.2"
+base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
+crossterm = { version = "0.29", default-features = false }
+portable-pty = "0.9"
 rmcp = { version = "3.5", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
 schemars = "1"

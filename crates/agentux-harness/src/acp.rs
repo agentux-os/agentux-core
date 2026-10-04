@@ -4,6 +4,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +42,10 @@ pub struct SessionOptions {
     /// Model to select through the session's `model` config option, when the
     /// agent offers one (see [`ModelSelection`]).
     pub model: Option<String>,
+    /// Reopen this existing session with `session/load` instead of creating
+    /// one with `session/new`. The agent must advertise `loadSession`. The
+    /// history it replays while loading is not passed on as events.
+    pub load: Option<String>,
 }
 
 /// What became of the model asked for in [`SessionOptions::model`].
@@ -77,6 +82,12 @@ impl AcpHarness {
     /// Model to select in every session this harness starts.
     pub fn with_model(mut self, model: Option<String>) -> Self {
         self.options.model = model;
+        self
+    }
+
+    /// Reopen this session (`session/load`) instead of creating a new one.
+    pub fn with_load(mut self, session_id: Option<String>) -> Self {
+        self.options.load = session_id;
         self
     }
 
@@ -117,6 +128,8 @@ pub struct AcpSession {
     task: JoinHandle<Result<(), agent_client_protocol::Error>>,
     process: Option<AgentProcess>,
     model: ModelSelection,
+    /// The agent advertised `loadSession`.
+    can_load: bool,
 }
 
 impl AcpSession {
@@ -141,7 +154,7 @@ impl AcpSession {
     ) -> Result<(Self, Events), Error> {
         let options = SessionOptions {
             mcp_servers: mcp_servers.to_vec(),
-            model: None,
+            ..SessionOptions::default()
         };
         Self::connect_with(transport, cwd, &options, permissions).await
     }
@@ -161,11 +174,18 @@ impl AcpSession {
         let (close, close_rx) = oneshot::channel::<()>();
 
         let current_turn = Arc::clone(&turn);
+        // Set while `session/load` replays the history: those updates are
+        // the past, not events of this session's turns.
+        let replaying = Arc::new(AtomicBool::new(false));
+        let replay = Arc::clone(&replaying);
         let builder = Client
             .builder()
             .name("agentux")
             .on_receive_notification(
                 async move |notification: acp::SessionNotification, _connection| {
+                    if replay.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
                     for event in events_from(notification.update) {
                         // The caller may have stopped listening; that is fine.
                         let _ = events_tx.send(event);
@@ -209,7 +229,7 @@ impl AcpSession {
             });
         };
 
-        connection
+        let initialized = connection
             .send_request(
                 acp::InitializeRequest::new(ProtocolVersion::V1).client_info(
                     acp::Implementation::new("agentux", env!("CARGO_PKG_VERSION")),
@@ -217,35 +237,66 @@ impl AcpSession {
             )
             .block_task()
             .await?;
-        let session = connection
-            .send_request(new_session_request(cwd, &options.mcp_servers))
-            .block_task()
-            .await?;
+        let can_load = initialized.agent_capabilities.load_session;
+        let (session_id, config_options) = match &options.load {
+            None => {
+                let session = connection
+                    .send_request(new_session_request(cwd, &options.mcp_servers))
+                    .block_task()
+                    .await?;
+                (session.session_id, session.config_options)
+            }
+            Some(_) if !can_load => return Err(Error::LoadUnsupported),
+            Some(id) => {
+                let session_id = acp::SessionId::new(id.clone());
+                replaying.store(true, Ordering::SeqCst);
+                let loaded = connection
+                    .send_request(
+                        acp::LoadSessionRequest::new(session_id.clone(), cwd)
+                            .mcp_servers(mcp_servers(&options.mcp_servers)),
+                    )
+                    .block_task()
+                    .await;
+                replaying.store(false, Ordering::SeqCst);
+                (session_id, loaded?.config_options)
+            }
+        };
         let model = match &options.model {
             None => ModelSelection::Default,
             Some(model) => {
-                let offered = session.config_options.as_deref().unwrap_or_default();
-                select_model(&connection, &session.session_id, offered, model).await
+                let offered = config_options.as_deref().unwrap_or_default();
+                select_model(&connection, &session_id, offered, model).await
             }
         };
 
         Ok((
             Self {
                 connection,
-                session_id: session.session_id,
+                session_id,
                 turn,
                 close,
                 task,
                 process: None,
                 model,
+                can_load,
             },
             events,
         ))
     }
 
-    /// The agent's identifier for this session.
+    /// The agent's identifier for this session. For the built-in adapters
+    /// it is also the vendor's own session id (see the crate README), which
+    /// the harness's TUI can resume ([`HarnessSpec::tui_resume`]).
+    ///
+    /// [`HarnessSpec::tui_resume`]: crate::HarnessSpec::tui_resume
     pub fn id(&self) -> &str {
         &self.session_id.0
+    }
+
+    /// Whether the agent can reopen its sessions with `session/load`
+    /// ([`SessionOptions::load`]).
+    pub fn can_load(&self) -> bool {
+        self.can_load
     }
 
     /// Whether the model asked for in [`SessionOptions`] is in use.
@@ -414,8 +465,13 @@ impl Drop for AgentProcess {
 }
 
 /// The `session/new` request for `cwd`, with `mcp_servers` as stdio servers.
-fn new_session_request(cwd: &Path, mcp_servers: &[McpServer]) -> acp::NewSessionRequest {
-    let servers = mcp_servers
+fn new_session_request(cwd: &Path, servers: &[McpServer]) -> acp::NewSessionRequest {
+    acp::NewSessionRequest::new(cwd).mcp_servers(mcp_servers(servers))
+}
+
+/// `mcp_servers` as ACP stdio servers.
+fn mcp_servers(mcp_servers: &[McpServer]) -> Vec<acp::McpServer> {
+    mcp_servers
         .iter()
         .map(|server| {
             let env = server
@@ -429,8 +485,7 @@ fn new_session_request(cwd: &Path, mcp_servers: &[McpServer]) -> acp::NewSession
                     .env(env),
             )
         })
-        .collect();
-    acp::NewSessionRequest::new(cwd).mcp_servers(servers)
+        .collect()
 }
 
 fn events_from(update: acp::SessionUpdate) -> Vec<Event> {

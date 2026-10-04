@@ -28,6 +28,10 @@ impl Remote {
         Ok(Self { socket })
     }
 
+    pub fn socket(&self) -> &Path {
+        &self.socket
+    }
+
     async fn connect(&self) -> Result<Client> {
         Ok(Client::connect(&self.socket).await?)
     }

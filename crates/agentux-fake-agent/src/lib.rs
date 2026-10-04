@@ -204,7 +204,16 @@ pub struct Setup {
     /// Called with the config id and value of each
     /// `session/set_config_option` request.
     pub on_set_config: OnSetConfig,
+    /// Advertise `loadSession` and answer `session/load` (replaying one
+    /// agent message, [`REPLAYED`], as the history). Without it, the agent
+    /// has no `session/load`.
+    pub load_session: bool,
+    /// Called with the session id of each `session/load` request.
+    pub on_load_session: Box<dyn Fn(&str) + Send + Sync>,
 }
+
+/// The history a loaded session replays.
+pub const REPLAYED: &str = "(replayed history)";
 
 impl Default for Setup {
     fn default() -> Self {
@@ -212,6 +221,8 @@ impl Default for Setup {
             on_new_session: Box::new(|_| {}),
             models: Vec::new(),
             on_set_config: Box::new(|_, _| {}),
+            load_session: false,
+            on_load_session: Box::new(|_| {}),
         }
     }
 }
@@ -225,6 +236,8 @@ pub fn spawn_with(
         on_new_session,
         models,
         on_set_config,
+        load_session,
+        on_load_session,
     } = setup;
     let model_option = (!models.is_empty()).then(|| {
         acp::SessionConfigOption::select(
@@ -248,8 +261,35 @@ pub fn spawn_with(
         .builder()
         .name("fake-agent")
         .on_receive_request(
-            async |request: acp::InitializeRequest, responder, _cx| {
-                responder.respond(acp::InitializeResponse::new(request.protocol_version))
+            async move |request: acp::InitializeRequest, responder, _cx| {
+                responder.respond(
+                    acp::InitializeResponse::new(request.protocol_version).agent_capabilities(
+                        acp::AgentCapabilities::new().load_session(load_session),
+                    ),
+                )
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let cwd = Arc::clone(&cwd);
+                async move |request: acp::LoadSessionRequest,
+                            responder,
+                            cx: ConnectionTo<Client>| {
+                    if !load_session {
+                        return responder
+                            .respond_with_error(agent_client_protocol::Error::method_not_found());
+                    }
+                    on_load_session(&request.session_id.0);
+                    *cwd.lock().unwrap() = request.cwd;
+                    cx.send_notification(acp::SessionNotification::new(
+                        request.session_id.clone(),
+                        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(text_block(
+                            REPLAYED,
+                        ))),
+                    ))?;
+                    responder.respond(acp::LoadSessionResponse::new())
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )

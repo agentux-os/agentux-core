@@ -21,6 +21,18 @@ How each harness is launched as an ACP agent, as of 2026-10-03. Versions are pin
 | `opencode` | `opencode acp` | Native | [registry entry](https://github.com/agentclientprotocol/registry/blob/main/opencode/agent.json), [docs](https://opencode.ai/docs/acp/) |
 | `antigravity` (experimental) | `agy_acp_server.par --uid=` | Separate ACP server binary from Google (`agy-acp-server`, proprietary), downloaded from `dl.google.com`. It is not the `agy` CLI and must be put on `PATH` by hand. | [registry entry](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json) |
 
+### Vendor session ids and the TUI
+
+`AcpSession::id` is the ACP session id. For the three non-experimental harnesses it is also the vendor's own session id, so the vendor's interactive TUI can resume the same conversation (`HarnessSpec::tui_resume`, used by `agentuxd`'s terminal mode). All three advertise `loadSession`, so the session can be reopened over ACP afterwards (`SessionOptions::load`; the history the agent replays while loading is dropped, not streamed as events).
+
+| id | TUI command | Why the ids match |
+|---|---|---|
+| `claude-code` | `claude --resume <id>` | `claude-agent-acp` 0.85.1 (`src/acp-agent.ts`) creates a random UUID per `session/new` and passes it to the Claude Agent SDK as the session id ("`resume` names the Claude session, which shares the ACP session id") |
+| `codex` | `codex resume <id>` | `codex-acp` 2.1.1 (`src/CodexAcpClient.ts`) returns the Codex app-server's `thread.id` as the `sessionId` |
+| `opencode` | `opencode --session <id>` | `opencode acp` returns the id of the OpenCode session it creates; with OpenCode 1.18.34 the id from `session/new` is the one `opencode session list` shows |
+
+The command lines were checked against the `--help` of Claude Code 2.1.257, Codex CLI 0.153.2 and OpenCode 1.18.34. Antigravity has no such command.
+
 Antigravity stays experimental: the `agy` CLI's headless mode hangs without a TTY ([google-antigravity/antigravity-cli#318](https://github.com/google-antigravity/antigravity-cli/issues/318)), so there is no fallback, and the ACP server has not been tried with AgentUX. The `--uid=` argument comes from the registry's Linux entry and is undocumented.
 
 Each harness uses the login the user set up for it (ADR 0002); nothing here handles credentials.

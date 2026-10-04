@@ -31,6 +31,19 @@ pub mod method {
     pub const BUS_HELLO: &str = "bus.hello";
     /// Used by `aux bus-stdio` (the bus bridge), not by the cockpit.
     pub const BUS_CALL: &str = "bus.call";
+    pub const TERMINALS_OPEN: &str = "terminals.open";
+    pub const TERMINALS_ATTACH: &str = "terminals.attach";
+    pub const TERMINALS_WRITE: &str = "terminals.write";
+    pub const TERMINALS_RESIZE: &str = "terminals.resize";
+    pub const TERMINALS_CLOSE: &str = "terminals.close";
+    pub const TERMINALS_LIST: &str = "terminals.list";
+    /// Server-to-client notification: output of a terminal this connection
+    /// opened or attached, [`super::TerminalOutput`].
+    pub const TERMINAL_OUTPUT: &str = "terminal_output";
+    /// Server-to-client notification: the terminal's process exited or the
+    /// terminal was closed, [`super::TerminalExit`]. The last one for that
+    /// terminal.
+    pub const TERMINAL_EXIT: &str = "terminal_exit";
     /// Server-to-client notification carrying one [`crate::Event`].
     pub const EVENT: &str = "event";
     /// Server-to-client notification sent once per `events.subscribe`, after
@@ -313,4 +326,135 @@ pub struct BusPosted {
     /// No session plays the target role: the message waits, and a session
     /// is started for the role.
     pub queued_for_role: Option<String>,
+}
+
+/// What a terminal runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TerminalCommand {
+    /// The session's harness in its own interactive TUI, resuming the same
+    /// vendor session. Falls back to `shell` when that is not possible.
+    #[serde(rename = "harness-tui", alias = "harness_tui")]
+    HarnessTui,
+    /// The user's shell (`$SHELL`, else `/bin/sh`) in the run's worktree.
+    #[serde(rename = "shell")]
+    Shell,
+}
+
+impl TerminalCommand {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HarnessTui => "harness-tui",
+            Self::Shell => "shell",
+        }
+    }
+}
+
+impl fmt::Display for TerminalCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Params of `terminals.open`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenTerminal {
+    /// The session to open (its run's worktree is the working directory).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The run whose worktree a `shell` opens in (implied by `sessionId`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Default: `harness-tui` with a `sessionId`, `shell` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<TerminalCommand>,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// A terminal: a process on a pseudo-terminal managed by the daemon.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Terminal {
+    pub terminal_id: String,
+    pub session_id: Option<String>,
+    pub run_id: Option<String>,
+    /// What runs: `harness-tui` only when the harness's TUI was launched,
+    /// `shell` otherwise (including a fallback).
+    pub command: TerminalCommand,
+    /// Why a `harness-tui` request got a shell instead; `null` otherwise.
+    pub fallback: Option<String>,
+    /// The program and its arguments (empty while `waiting`).
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub state: TerminalState,
+    /// Set once `exited`: the exit code, `null` if killed by a signal.
+    pub exit_code: Option<i32>,
+    pub created_at: i64,
+}
+
+/// `waiting`: a `harness-tui` terminal waits for the session's ACP turn in
+/// progress to end before the TUI starts; `running`; `exited`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalState {
+    Waiting,
+    Running,
+    Exited,
+}
+
+/// Params of `terminals.attach`, `terminals.close`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalRef {
+    pub terminal_id: String,
+}
+
+/// Params of `terminals.write`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteTerminal {
+    pub terminal_id: String,
+    /// Bytes for the terminal's input, base64 (standard alphabet, padded).
+    pub data: String,
+}
+
+/// Params of `terminals.resize`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResizeTerminal {
+    pub terminal_id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// Params of `terminals.list`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTerminals {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+}
+
+/// Params of the `terminal_output` notification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalOutput {
+    pub terminal_id: String,
+    /// Bytes the terminal wrote, base64 (standard alphabet, padded).
+    pub data: String,
+}
+
+/// Params of the `terminal_exit` notification.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalExit {
+    pub terminal_id: String,
+    /// The exit code; `null` if the process was killed by a signal (e.g.
+    /// `terminals.close`).
+    pub code: Option<i32>,
 }

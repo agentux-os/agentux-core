@@ -5,6 +5,7 @@ use std::future::Future;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::Arc;
 
 use agentux_api::rpc::{self, code, method};
 use agentux_api::{Event, rpc::Request, rpc::Response};
@@ -17,6 +18,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::engine::{Engine, Error};
+use crate::terminal::{Chunk, Term};
 
 /// Binds `socket` and serves the API until `shutdown` completes.
 ///
@@ -82,6 +84,10 @@ async fn connection(engine: Engine, stream: UnixStream) {
     });
 
     let mut subscription: Option<JoinHandle<()>> = None;
+    // Terminals this connection streams, and those it opened (closed when
+    // it goes away).
+    let mut streams: Vec<JoinHandle<()>> = Vec::new();
+    let mut opened: Vec<Arc<Term>> = Vec::new();
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(line)) = lines.next_line().await {
         if line.trim().is_empty() {
@@ -132,12 +138,39 @@ async fn connection(engine: Engine, stream: UnixStream) {
             continue;
         }
 
+        if request.method == method::TERMINALS_OPEN || request.method == method::TERMINALS_ATTACH {
+            let term = if request.method == method::TERMINALS_OPEN {
+                parse::<rpc::OpenTerminal>(request.params)
+                    .and_then(|params| engine.open_terminal(params).map_err(rpc_error))
+                    .inspect(|term| opened.push(Arc::clone(term)))
+            } else {
+                parse::<rpc::TerminalRef>(request.params)
+                    .and_then(|params| engine.terminal(&params.terminal_id).map_err(rpc_error))
+            };
+            match term {
+                Ok(term) => {
+                    // As for subscriptions: output follows the response.
+                    reply(&tx, request.id, Ok(term.info()));
+                    streams.retain(|s| !s.is_finished());
+                    streams.push(tokio::spawn(stream_terminal(term, tx.clone())));
+                }
+                Err(e) => reply::<()>(&tx, request.id, Err(e)),
+            }
+            continue;
+        }
+
         let result = handle(&engine, &request.method, request.params).await;
         reply(&tx, request.id, result);
     }
 
     if let Some(task) = subscription {
         task.abort();
+    }
+    for stream in streams {
+        stream.abort();
+    }
+    for term in opened {
+        term.close();
     }
     drop(tx);
     let _ = write.await;
@@ -195,6 +228,22 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
         method::REQUESTS_DENY => {
             let params: rpc::Resolve = parse(params)?;
             to_value(engine.deny(&params.request_id, params.answer.as_deref()))
+        }
+        method::TERMINALS_WRITE => {
+            let params: rpc::WriteTerminal = parse(params)?;
+            to_value(engine.write_terminal(&params))
+        }
+        method::TERMINALS_RESIZE => {
+            let params: rpc::ResizeTerminal = parse(params)?;
+            to_value(engine.resize_terminal(&params))
+        }
+        method::TERMINALS_CLOSE => {
+            let params: rpc::TerminalRef = parse(params)?;
+            to_value(engine.close_terminal(&params.terminal_id))
+        }
+        method::TERMINALS_LIST => {
+            let params: rpc::ListTerminals = parse_or_default(params)?;
+            to_value(Ok(engine.terminals(&params)))
         }
         method::BUS_LIST => {
             let params: rpc::ListBus = parse(params)?;
@@ -288,6 +337,70 @@ fn subscribe(
         }
     };
     Ok((rpc::Subscribed { seq: head }, task))
+}
+
+/// Sends a terminal's scrollback, then its output as it comes, as
+/// `terminal_output` notifications, and finally `terminal_exit`.
+async fn stream_terminal(term: Arc<Term>, tx: mpsc::UnboundedSender<String>) {
+    let terminal_id = term.info().terminal_id;
+    let (scrollback, exit, mut live) = term.subscribe();
+    drop(term);
+    if !scrollback.is_empty() && !notify_output(&tx, &terminal_id, &scrollback) {
+        return;
+    }
+    if let Some(code) = exit {
+        notify_exit(&tx, &terminal_id, code);
+        return;
+    }
+    loop {
+        match live.recv().await {
+            Ok(Chunk::Output(bytes)) => {
+                if !notify_output(&tx, &terminal_id, &bytes) {
+                    return;
+                }
+            }
+            Ok(Chunk::Exit(code)) => {
+                notify_exit(&tx, &terminal_id, code);
+                return;
+            }
+            // The client is too slow; what it missed is gone (a terminal
+            // redraws anyway).
+            Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+fn notify_output(tx: &mpsc::UnboundedSender<String>, terminal_id: &str, bytes: &[u8]) -> bool {
+    let params = rpc::TerminalOutput {
+        terminal_id: terminal_id.to_string(),
+        data: agentux_api::encode_bytes(bytes),
+    };
+    send_notification(tx, method::TERMINAL_OUTPUT, &params)
+}
+
+fn notify_exit(tx: &mpsc::UnboundedSender<String>, terminal_id: &str, code: Option<i32>) {
+    let params = rpc::TerminalExit {
+        terminal_id: terminal_id.to_string(),
+        code,
+    };
+    send_notification(tx, method::TERMINAL_EXIT, &params);
+}
+
+fn send_notification<P: Serialize>(
+    tx: &mpsc::UnboundedSender<String>,
+    method: &str,
+    params: &P,
+) -> bool {
+    let notification = rpc::Notification {
+        jsonrpc: rpc::VERSION.into(),
+        method: method.into(),
+        params: serde_json::to_value(params).unwrap_or(Value::Null),
+    };
+    match serde_json::to_string(&notification) {
+        Ok(line) => tx.send(line).is_ok(),
+        Err(_) => true,
+    }
 }
 
 fn notify(tx: &mpsc::UnboundedSender<String>, event: &Event) -> bool {

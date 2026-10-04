@@ -33,6 +33,12 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `events.subscribe` | `{ runId?, since? }` | `{ seq }`, then `event` notifications, with one `replay_done` notification where the replay ends |
 | `bus.list` | `{ runId }` | `BusMessage[]`, the run's agent bus log, oldest first |
 | `bus.post` | `{ runId, to?: BusEndpoint, body, subject?, inReplyTo? }` | `{ messageId, exchange, turn, deliveredTo, queuedForRole }` — a message from the human on the run's bus; see [Agent bus](#agent-bus) |
+| `terminals.open` | `{ sessionId?, runId?, command?: "harness-tui" \| "shell", cols, rows }` | `Terminal`, then `terminal_output` / `terminal_exit` notifications on this connection; see [Terminal mode](#terminal-mode) |
+| `terminals.attach` | `{ terminalId }` | `Terminal`, then the terminal's scrollback and live output on this connection |
+| `terminals.write` | `{ terminalId, data }` — `data` is base64 | `null` |
+| `terminals.resize` | `{ terminalId, cols, rows }` | `null` |
+| `terminals.close` | `{ terminalId }` | `null`; `terminal_exit` follows |
+| `terminals.list` | `{ sessionId?, runId? }` | `Terminal[]`, oldest first |
 | `bus.hello` | `{ sessionToken }` | `{ identity, allowedTools, maxTurnsPerExchange }` — bus bridge only, see [Agent bus](#agent-bus) |
 | `bus.call` | `{ sessionToken, call }` | `{ ok: <tool result> }` or `{ err: <refusal> }` — bus bridge only |
 
@@ -44,7 +50,7 @@ Standard JSON-RPC codes (`-32700` parse error, `-32600` invalid request, `-32601
 
 | Code | Meaning |
 |---|---|
-| `-32001` | Not found: no such project, run or request |
+| `-32001` | Not found: no such project, run, request, session or terminal |
 | `-32002` | Conflict: e.g. approving a request that is no longer pending, cancelling a finished run, prompting a session that has ended, posting on the bus of a finished run |
 | `-32003` | Invalid project: not a git repository, or its `agentux.yaml` is invalid |
 | `-32004` | Unauthorized: `bus.hello` / `bus.call` with an unknown session token, or the token of a session that has ended |
@@ -145,10 +151,29 @@ interface PermissionRequest {
 interface Session {
   id: string; runId: string; projectId: string;
   role: string; harness: string; model: string | null;
-  state: "active" | "idle" | "waiting" | "ended";  // waiting = on a permission request
+  // waiting = on a permission request; attached = open in its harness's TUI
+  // (terminal mode): turns for it wait until the terminal closes
+  state: "active" | "idle" | "waiting" | "attached" | "ended";
   cwd: string;                                      // the run's worktree
   usage: { usedTokens: number; contextTokens: number; costUsd: number | null };
   startedAt: number; updatedAt: number; endedAt: number | null;
+  // The harness's own id of the session: the ACP sessionId, which Claude Code,
+  // Codex and OpenCode share with their CLI. null until the harness started it.
+  vendorSessionId: string | null;
+}
+
+// A process on a pseudo-terminal managed by the daemon (terminal mode).
+interface Terminal {
+  terminalId: string;
+  sessionId: string | null; runId: string | null;
+  command: "harness-tui" | "shell";  // what actually runs (a fallback is "shell")
+  fallback: string | null;           // why a harness-tui request got a shell
+  argv: string[];                    // empty while waiting
+  cwd: string;                       // the run's worktree
+  cols: number; rows: number;
+  state: "waiting" | "running" | "exited";  // waiting = for the session's turn in progress
+  exitCode: number | null;
+  createdAt: number;
 }
 
 // ACP reports context-window usage and cumulative session cost, not
@@ -220,6 +245,45 @@ type BusEndpoint =
 ### Talking to a session
 
 `sessions.prompt { sessionId, text }` sends `text`, as typed, to a live session as an extra ACP turn (`aux say <session-id> <text...>`). Like a bus wake, it is queued behind the turn in progress (a step's or a wake's) and any message queued before it; `queued` in the result says whether the session was in a turn. The message is recorded when it is accepted, as a `session_event` with `{ kind: "message", from: "human", text }` (it is not recorded again as a `user` prompt when it is sent). The turn's events are `session_event`s like a step's; its permission requests are `permission` requests of the run's current step. An empty `text` is `-32602`, an unknown session `-32001`, and a session that has ended (or whose run has finished) `-32002`. If the session ends before the message's turn, a `log` event says the message was not handled.
+
+### Terminal mode
+
+ADR 0004's escape hatch: a session opened in its harness's own TUI, or a shell in the run's worktree, on a pseudo-terminal the daemon manages (`portable-pty`). The cockpit renders it with xterm.js; `aux attach` uses the local terminal.
+
+**Opening.** `terminals.open { sessionId?, runId?, command?, cols, rows }` (`cols` and `rows` at least 1). `command` defaults to `"harness-tui"` with a `sessionId` and `"shell"` with only a `runId` (`"harness_tui"` is accepted too). The working directory is the run's worktree. The process gets the daemon's environment plus `TERM=xterm-256color`, `COLORTERM=truecolor`, `AGENTUX_RUN_ID`, `AGENTUX_WORKTREE` and, for a session, `AGENTUX_SESSION_ID`, `AGENTUX_ROLE`, `AGENTUX_HARNESS`, `AGENTUX_VENDOR_SESSION_ID`. The shell is the daemon's `$SHELL`, else `/bin/sh`. Errors: no `sessionId` or `runId`, `harness-tui` without a session, or a size of 0 `-32602`; an unknown session or run `-32001`; a run without a worktree yet `-32002`.
+
+**`harness-tui`.** The TUI resumes the session's `vendorSessionId`:
+
+| Harness | Command | Same id as ACP |
+|---|---|---|
+| `claude-code` | `claude --resume <id>` | yes: `claude-agent-acp` starts Claude Code with the ACP session id as its session id |
+| `codex` | `codex resume <id>` | yes: `codex-acp` uses the Codex thread id as the ACP session id |
+| `opencode` | `opencode --session <id>` | yes: OpenCode's ACP session id is its own session id |
+| `antigravity` | none | the terminal is a shell |
+
+An ACP session and the vendor's TUI are separate processes, so a live session is handed over, never driven by both:
+
+1. The terminal starts `waiting` and prints a line saying so; the session's turn in progress, if any, ends first (turns queued before the terminal run first too).
+2. The daemon shuts down the session's ACP adapter process and sets the session `attached`, with a `system` message. From then on every turn for the session (the run's next step for that role, bus wakes, `sessions.prompt`) waits; a turn that waits gets a `system` message saying so, and `sessions.prompt` returns `queued: true`.
+3. The TUI starts (`running`) on the same vendor session. The run goes on; only the turns of that session wait.
+4. When the TUI exits (the user quits it, `terminals.close`, or the connection that opened it closes), the daemon reopens the session over ACP with `session/load` and the same id, so the agent continues with whatever was said in the TUI (the history the agent replays while loading is not recorded again), sets it `idle` with a `system` message, and the waiting turns run. If reopening fails, the session ends and the role's next turn starts a new one.
+
+For a session that has ended, or whose run has finished, no ACP adapter holds it: the TUI just resumes it. The agent bus's `agentux` MCP server is not passed to the TUI.
+
+**Fallback.** When the TUI cannot resume the session (the harness has no such command, the session has no `vendorSessionId` yet, the executor cannot hand it over, e.g. with `--fake-agents`, or the TUI does not start, e.g. its CLI is not installed), the terminal is a shell instead: `command` is `"shell"`, `fallback` says why, and the output starts with a banner (`[agentux] <reason>`, then `[agentux] This is a shell in the run's worktree, <path>. ...`). The session is not handed over then.
+
+**Streaming.** The result of `terminals.open` and `terminals.attach` is followed, on the same connection, by notifications:
+
+```json
+{"jsonrpc":"2.0","method":"terminal_output","params":{"terminalId":"5d1c9a02","data":"aGVsbG8NCg=="}}
+{"jsonrpc":"2.0","method":"terminal_exit","params":{"terminalId":"5d1c9a02","code":0}}
+```
+
+`data` is base64 (standard alphabet, padded) of raw terminal bytes, to feed to the terminal emulator as is. `code` is the exit code, or `null` when the process was killed by a signal (as on `terminals.close`); `terminal_exit` is the last notification of a terminal. `terminals.attach` (from another connection, or after a reconnect) first sends the scrollback, the last 256 KiB of output, then live output, without gap or overlap. A connection can stream several terminals; notifications carry `terminalId`. A client too slow to keep up loses output rather than holding up the daemon.
+
+**Input.** `terminals.write { terminalId, data }` (base64) and `terminals.resize { terminalId, cols, rows }` may be sent as JSON-RPC notifications (no `id`): no response, nothing to wait for between keystrokes, and they never wait behind other requests' work. Input sent while a terminal is `waiting` is dropped. Writing to or resizing an exited terminal is `-32002`; an unknown terminal `-32001`.
+
+**Lifetime.** A terminal belongs to the connection that opened it: it is closed when that connection closes, on `terminals.close` (from any connection), when its run ends, or when its process exits. Closing sends SIGHUP (the terminal hangs up); a process still there after 3 s gets SIGKILL, with its process group. An exited terminal is forgotten: `terminals.list` no longer shows it and other calls get `-32001`. Terminals do not survive a daemon restart.
 
 ### Crash safety
 

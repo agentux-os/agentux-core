@@ -108,7 +108,7 @@ impl Launcher for Launch {
             let (transport, _agent) = agentux_fake_agent::spawn(script);
             let options = SessionOptions {
                 mcp_servers: spec.mcp_servers.to_vec(),
-                model: None,
+                ..SessionOptions::default()
             };
             AcpSession::connect_with(transport, spec.cwd, &options, permissions)
                 .await

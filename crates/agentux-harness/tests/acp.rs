@@ -358,3 +358,59 @@ async fn harness_runs_in_cwd_with_env_and_exit_is_an_error() {
     let cwd = dir.path().canonicalize().unwrap();
     assert_eq!(seen, format!("{} hello", cwd.display()));
 }
+
+#[tokio::test]
+async fn sessions_reopen_with_session_load_without_replaying_events() {
+    use agentux_fake_agent::{REPLAYED, Setup};
+    use agentux_harness::SessionOptions;
+
+    let loaded = Arc::new(Mutex::new(Vec::<String>::new()));
+    let agent = script(|turn: Turn| async move {
+        turn.message(&format!("got {}", turn.prompt))?;
+        Ok(acp::StopReason::EndTurn)
+    });
+    let setup = Setup {
+        load_session: true,
+        on_load_session: Box::new({
+            let loaded = Arc::clone(&loaded);
+            move |id| loaded.lock().unwrap().push(id.to_string())
+        }),
+        ..Setup::default()
+    };
+    let (transport, _agent) = agentux_fake_agent::spawn_with(agent, setup);
+    let options = SessionOptions {
+        load: Some("vendor-123".into()),
+        ..SessionOptions::default()
+    };
+    let deny = permission_handler(|_| async { Decision::Deny });
+    let (session, mut events) =
+        AcpSession::connect_with(transport, Path::new("/work"), &options, deny)
+            .await
+            .unwrap();
+    assert_eq!(session.id(), "vendor-123");
+    assert!(session.can_load());
+    assert_eq!(*loaded.lock().unwrap(), ["vendor-123"]);
+    let stop = tokio::time::timeout(TIMEOUT, session.prompt("next"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stop, StopReason::EndTurn);
+    let mut texts = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let Event::AgentMessage(text) = event {
+            texts.push(text);
+        }
+    }
+    assert!(!texts.iter().any(|t| t == REPLAYED), "{texts:?}");
+    assert_eq!(texts, ["got next"]);
+
+    // An agent without loadSession cannot reopen sessions.
+    let (transport, _agent) =
+        agentux_fake_agent::spawn(script(|_turn: Turn| async { Ok(acp::StopReason::EndTurn) }));
+    let deny = permission_handler(|_| async { Decision::Deny });
+    let err = AcpSession::connect_with(transport, Path::new("/work"), &options, deny)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(err, Error::LoadUnsupported), "{err}");
+}

@@ -37,6 +37,7 @@ use crate::executor::{
     AgentOutcome, AgentTask, BoxFuture, OpenedSession, PullRequestOutcome, PullRequestTask,
     StepExecutor, StepHost,
 };
+use crate::terminal::Terminals;
 
 /// Keep at most this much of each check's output.
 const MAX_CHECK_OUTPUT: usize = 8 * 1024;
@@ -85,6 +86,39 @@ pub struct Settings {
     /// How sessions reach the agent bus. `None`: sessions still join their
     /// run's bus (wakes work), but get no `agentux` MCP server.
     pub bus: Option<BusLink>,
+    /// How a harness's TUI resumes a session (`terminals.open`).
+    pub tui: TuiCommands,
+}
+
+/// The command line that opens a harness's own TUI on an existing session:
+/// `(harness id, vendor session id) -> program and arguments`, or `None`
+/// when the harness cannot do that. The default is
+/// [`agentux_harness::HarnessSpec::tui_resume`]; tests plug in their own.
+#[derive(Clone)]
+pub struct TuiCommands(Arc<TuiFn>);
+
+type TuiFn = dyn Fn(&str, &str) -> Option<Vec<String>> + Send + Sync;
+
+impl TuiCommands {
+    pub fn new(f: impl Fn(&str, &str) -> Option<Vec<String>> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub fn resume(&self, harness: &str, vendor_session_id: &str) -> Option<Vec<String>> {
+        (self.0)(harness, vendor_session_id)
+    }
+}
+
+impl Default for TuiCommands {
+    fn default() -> Self {
+        Self::new(|harness, id| agentux_harness::HarnessSpec::find(harness)?.tui_resume(id))
+    }
+}
+
+impl fmt::Debug for TuiCommands {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("TuiCommands(..)")
+    }
 }
 
 /// Owns the store, the executor and one driver task per active run. Cheap to
@@ -104,6 +138,8 @@ pub(crate) struct Inner {
     waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
     /// The agent buses of active runs.
     pub(crate) hub: Hub,
+    /// Terminals (`terminals.*`).
+    pub(crate) terminals: Terminals,
 }
 
 impl Engine {
@@ -124,6 +160,7 @@ impl Engine {
                 tasks: Mutex::new(HashMap::new()),
                 waiters: Mutex::new(HashMap::new()),
                 hub: Hub::default(),
+                terminals: Terminals::default(),
             }),
         }
     }
@@ -597,6 +634,7 @@ impl Engine {
     /// the run's bus.
     fn release(&self, run_id: &str) {
         self.close_bus(run_id);
+        self.inner.terminals.close_run(run_id);
         let executor = Arc::clone(&self.inner.executor);
         let run_id = run_id.to_string();
         tokio::spawn(async move { executor.release(&run_id).await });
@@ -1363,6 +1401,7 @@ impl StepHost for RunHost {
             started_at: now,
             updated_at: now,
             ended_at: None,
+            vendor_session_id: None,
         };
         self.engine
             .inner
@@ -1406,6 +1445,18 @@ impl StepHost for RunHost {
         if state == SessionState::Ended {
             self.engine.bus_leave(session_id);
         }
+    }
+
+    fn session_vendor_id(&self, session_id: &str, vendor_session_id: &str) {
+        self.record("a session's vendor id", |tx| {
+            if let Some(mut session) = tx.session(session_id)?
+                && session.vendor_session_id.as_deref() != Some(vendor_session_id)
+            {
+                session.vendor_session_id = Some(vendor_session_id.to_string());
+                tx.save_session(&mut session)?;
+            }
+            Ok(())
+        });
     }
 
     fn session_event(&self, session_id: &str, event: SessionEvent) {

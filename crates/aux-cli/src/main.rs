@@ -8,6 +8,7 @@ use agentux_config::{Config, ConfigError, FILE_NAME};
 use agentux_worktree::Worktrees;
 use clap::{Args, Parser, Subcommand};
 
+mod attach;
 mod bus_stdio;
 mod exec;
 mod remote;
@@ -135,6 +136,16 @@ enum Command {
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
     },
+    /// Open a live session in its harness's own TUI, in this terminal
+    /// (Claude Code, Codex and OpenCode resume the same session; other
+    /// harnesses get a shell in the run's worktree). Turns the daemon would
+    /// send the session wait meanwhile. Detach with Ctrl-]
+    Attach {
+        session_id: String,
+        /// A shell in the run's worktree instead of the TUI
+        #[arg(long)]
+        shell: bool,
+    },
     /// Cancel a run (its worktree and branch are kept)
     Cancel { run_id: String },
 }
@@ -253,6 +264,9 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
             Command::Bus { run_id, .. } => remote.bus(&run_id).await,
             Command::Say { session_id, text } => remote.say(&session_id, &text.join(" ")).await,
             Command::Cancel { run_id } => remote.cancel(&run_id).await,
+            Command::Attach { session_id, shell } => {
+                attach::attach(remote.socket(), &session_id, shell).await
+            }
             Command::Validate { .. }
             | Command::Worktree(_)
             | Command::Exec { .. }

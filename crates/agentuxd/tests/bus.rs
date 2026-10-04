@@ -124,6 +124,7 @@ impl Launcher for BusLauncher {
             let options = SessionOptions {
                 mcp_servers: spec.mcp_servers.to_vec(),
                 model: spec.model.map(str::to_string),
+                load: spec.load.map(str::to_string),
             };
             AcpSession::connect_with(transport, spec.cwd, &options, permissions)
                 .await

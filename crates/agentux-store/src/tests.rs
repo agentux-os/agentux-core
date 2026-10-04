@@ -243,10 +243,12 @@ fn sessions_round_trip_and_emit_snapshots() {
         started_at: now_ms(),
         updated_at: now_ms(),
         ended_at: None,
+        vendor_session_id: None,
     };
     store.write(|tx| tx.insert_session(&session)).unwrap();
     session.state = SessionState::Idle;
     session.usage.cost_usd = Some(0.5);
+    session.vendor_session_id = Some("ses_123".into());
     store.write(|tx| tx.save_session(&mut session)).unwrap();
 
     let (stored_run, stored) = store

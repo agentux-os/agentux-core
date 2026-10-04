@@ -9,7 +9,7 @@ The orchestration engine of [AgentUX](https://github.com/agentux-os/agentux): th
 | Component | Responsibility |
 |---|---|
 | `agentuxd` | Daemon. Owns runs, git worktrees, harness sessions and workflow state (SQLite). Serves the API used by the cockpit and `aux`. |
-| `aux` | CLI twin of the cockpit: `aux run`, `aux ps`, `aux attach`, `aux approve`. Works over SSH. |
+| `aux` | CLI twin of the cockpit: `aux run`, `aux ps`, `aux attach` (a session in its harness's own TUI), `aux approve`. Works over SSH. |
 | Harness adapters | Drive Claude Code, Codex, OpenCode and Antigravity CLI through the Agent Client Protocol, with each CLI's headless mode as fallback. |
 | Workflow engine | Executes pipelines declared in each project's `agentux.yaml`: plan → implement → test → review → PR, with approval gates and bounded retries. |
 | Agent bus | MCP server exposed to every harness so agents can message each other, request cross-vendor reviews, hand off work and escalate to the human. |
@@ -44,6 +44,7 @@ aux watch <run-id>                  # history, then live events (bus traffic inc
 aux bus <run-id>                    # the run's agent bus log
 aux bus <run-id> --post <to> <text> # post on it as the human (to: role:<name>, session:<id> or run)
 aux say <session-id> <text>         # message a live agent session (after its current turn)
+aux attach <session-id> [--shell]   # open the session in its harness's own TUI here; Ctrl-] detaches
 aux cancel <run-id>
 ```
 
@@ -56,6 +57,7 @@ How agent steps work:
 - **Sessions.** Each role gets one harness session (the role's `harness` from `agentux.yaml`, launched as in the [`agentux-harness` table](crates/agentux-harness/README.md#harnesses)) in the run's worktree, started when the run first reaches the role (or when a bus message wakes the role) and reused by its later steps. Each harness uses the login you set up for it. Sessions end with the run; after a daemon restart, new ones start. A role's `model` is selected through ACP when the harness offers a model choice (a session config option of category `model`); otherwise the session uses the harness's default and its log says so.
 - **Agent bus.** Every session gets the `agentux` MCP server (`aux bus-stdio` with a per-session token) and, before its first prompt, a short prompt saying who it is and how to use the bus. Agents message each other, request reviews, hand off and ask you questions (`question` requests: `aux answer <id> <text>`). A message wakes its recipient with a prompt (after its current turn), or starts the session of a role that has none; exchanges stop at `bus.max_turns_per_exchange`. Everything is logged: `aux bus <run-id>`, `aux watch`. You can post too (`aux bus <run-id> --post role:reviewer <text>`, API `bus.post`), with the same wakes. After a daemon restart, each run's bus is rebuilt from its log: exchange turn counts, reply routing, and mail nobody was woken for yet. Details in [docs/api.md](docs/api.md#agent-bus).
 - **Talking to a session.** `aux say <session-id> <text>` (API `sessions.prompt`) sends your message to a live session as an extra turn, after the turn in progress; it is logged as a `human` message of the session.
+- **Terminal mode.** `aux attach <session-id>` (API `terminals.open`, which the cockpit's xterm.js uses too) opens the session in its harness's own TUI on a pseudo-terminal the daemon manages, resuming the same vendor session: `claude --resume <id>`, `codex resume <id>`, `opencode --session <id>` (for all three the ACP session id is the vendor's id; it is the session's `vendorSessionId`). After the turn in progress, the daemon stops the session's ACP adapter and marks the session `attached`: its turns (steps, bus wakes, `aux say`) wait. When the TUI exits or you detach (Ctrl-]), the daemon reopens the session over ACP with `session/load`, so the agent keeps what was said in the TUI, and the waiting turns run. A harness that cannot resume a session in its TUI (Antigravity), or a TUI that does not start, gets a shell in the run's worktree with a banner saying why; `--shell` asks for the shell. The remote terminal follows the local window size. Details in [docs/api.md](docs/api.md#terminal-mode).
 - **Prompts** ([`prompts.rs`](crates/agentuxd/src/prompts.rs)) are self-contained: the run's prompt or issue, the step, the role, the plan, and the gate output or review comments that sent the run back. The planner's reply is the plan.
 - **Commits.** Agents are told to edit files and not commit; after each `implement` and `custom` step the daemon commits whatever changed in the worktree (`git add --all`, so keep build artifacts such as `__pycache__/` in `.gitignore`: files left by a planner or reviewer running the tests end up in the next commit), with a subject derived from the run (`<title>`, `Fix failing checks: <title>`, `Address review comments: <title>`). Without a git identity it commits as `AgentUX <agentux@localhost>`.
 - **Review verdicts.** The reviewer is asked to end with a fenced JSON block, `{"verdict": "APPROVE" | "CHANGES_REQUESTED", "comments": ...}`. The last such object wins; without one, the last upper-case `APPROVE` / `CHANGES_REQUESTED` keyword does; without either, the reviewer is asked once more, then the step fails.
@@ -114,7 +116,7 @@ Linux is the target. The crate holding `aux` is named `aux-cli` because `aux` is
 - Per-project permission policies in `agentux.yaml`; harness-specific model selection where ACP offers none.
 - Headless fallbacks for the harnesses, behind the same `Harness` trait ([ADR 0002](https://github.com/agentux-os/agentux/blob/main/docs/adr/0002-harness-integration-via-acp.md)).
 - Agent bus: the token budget per run from ADR 0004; logging reads so restored mailboxes are exact.
-- `aux attach` (follow and talk to one session); the cockpit's real `DaemonClient` on top of the sessions API.
+- Terminal mode: the `agentux` bus inside the harness TUI; taking a session over mid-turn. The cockpit's real `DaemonClient` on top of the sessions and terminals API.
 
 ## Relevant ADRs
 

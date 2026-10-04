@@ -14,7 +14,8 @@
 //! are extra turns in the target session, queued behind a turn in progress.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -29,8 +30,8 @@ use agentux_harness::{
 };
 
 use crate::executor::{
-    AgentOutcome, AgentTask, BoxFuture, PullRequestOutcome, PullRequestTask, StepExecutor,
-    StepHost, WakeTask,
+    AgentOutcome, AgentTask, BoxFuture, HeldSession, PullRequestOutcome, PullRequestTask,
+    StepExecutor, StepHost, WakeTask,
 };
 use crate::forge;
 use crate::prompts::{self, Verdict};
@@ -53,6 +54,9 @@ pub struct LaunchSpec<'a> {
     pub model: Option<&'a str>,
     /// The `agentux` bus, to pass in `session/new`.
     pub mcp_servers: &'a [McpServer],
+    /// Reopen this existing session (ACP `session/load`) instead of creating
+    /// one: after the session was open in its harness's TUI.
+    pub load: Option<&'a str>,
 }
 
 /// Starts harness sessions. The daemon uses [`HarnessLauncher`]; tests plug in
@@ -86,6 +90,7 @@ impl Launcher for HarnessLauncher {
             AcpHarness::new(harness)
                 .with_mcp_servers(spec.mcp_servers.to_vec())
                 .with_model(spec.model.map(str::to_string))
+                .with_load(spec.load.map(str::to_string))
                 .start(spec.cwd, permissions)
                 .await
                 .map_err(|e| e.to_string())
@@ -99,7 +104,18 @@ type HostSlot = Arc<Mutex<Option<Arc<dyn StepHost>>>>;
 struct Slot {
     /// The daemon's id of the session.
     id: String,
+    /// The harness's id of the session (ACP), which its TUI resumes.
+    vendor_id: String,
+    role: String,
     harness: String,
+    model: Option<String>,
+    worktree: PathBuf,
+    mcp_servers: Vec<McpServer>,
+    /// The agent can reopen the session with `session/load`.
+    can_load: bool,
+    /// Handed over to the harness's TUI: turns wait (see
+    /// [`StepExecutor::take_over`]).
+    attached: AtomicBool,
     /// The host of the turn currently running in the session (a step's, or
     /// a bus wake's), which permission requests go to. `None` between turns:
     /// requests are then denied.
@@ -107,8 +123,9 @@ struct Slot {
     /// The bus system prompt, prepended to the session's first prompt.
     intro: Mutex<Option<String>>,
     /// Held for a whole turn (or a step's turns): a wake for a session that
-    /// is mid-turn waits here.
-    live: tokio::sync::Mutex<Live>,
+    /// is mid-turn waits here. Held as long as the session is open in its
+    /// TUI, so turns wait for that too.
+    live: Arc<tokio::sync::Mutex<Live>>,
 }
 
 struct Live {
@@ -117,6 +134,26 @@ struct Live {
 }
 
 impl Slot {
+    /// Waits for the session to be free for a turn, telling the session's
+    /// log when it waits because the session is open in its TUI.
+    async fn lock(&self, host: &Arc<dyn StepHost>) -> tokio::sync::MutexGuard<'_, Live> {
+        if let Ok(live) = self.live.try_lock() {
+            return live;
+        }
+        if self.attached.load(Ordering::SeqCst) {
+            host.session_event(
+                &self.id,
+                SessionEvent::Message {
+                    from: MessageFrom::System,
+                    text: "The session is open in its harness's TUI (terminal mode); this turn \
+                           waits until the terminal is closed."
+                        .into(),
+                },
+            );
+        }
+        self.live.lock().await
+    }
+
     /// `text`, preceded by the session prompt the first time.
     fn with_intro(&self, text: &str) -> String {
         match lock(&self.intro).take() {
@@ -201,9 +238,11 @@ impl AcpExecutor {
             cwd: want.worktree,
             model: want.model,
             mcp_servers: &opened.mcp_servers,
+            load: None,
         };
         match self.launcher.launch(spec, handler).await {
             Ok((session, events)) => {
+                host.session_vendor_id(&opened.id, session.id());
                 if let ModelSelection::Unavailable(note) = session.model_selection() {
                     host.session_event(
                         &opened.id,
@@ -215,13 +254,20 @@ impl AcpExecutor {
                 }
                 let slot = Arc::new(Slot {
                     id: opened.id,
+                    vendor_id: session.id().to_string(),
+                    role: want.role.to_string(),
                     harness: want.harness.to_string(),
+                    model: want.model.map(str::to_string),
+                    worktree: want.worktree.to_path_buf(),
+                    mcp_servers: opened.mcp_servers,
+                    can_load: session.can_load(),
+                    attached: AtomicBool::new(false),
                     host: host_slot,
                     intro: Mutex::new(opened.system_prompt),
-                    live: tokio::sync::Mutex::new(Live {
+                    live: Arc::new(tokio::sync::Mutex::new(Live {
                         session: Some(session),
                         events,
-                    }),
+                    })),
                 });
                 if let Some(old) = self.sessions().insert(key, Arc::clone(&slot)) {
                     tokio::spawn(shutdown(old));
@@ -322,7 +368,7 @@ impl StepExecutor for AcpExecutor {
             };
             let slot = self.slot(&want, &host).await?;
             let result = {
-                let mut live = slot.live.lock().await;
+                let mut live = slot.lock(&host).await;
                 let _host = HostGuard::set(&slot, &host);
                 let result = self.work(task, &slot, &mut live, &host).await;
                 // Before the next turn (a queued wake) can start.
@@ -373,7 +419,7 @@ impl StepExecutor for AcpExecutor {
                 }
             };
             let result = {
-                let mut live = slot.live.lock().await;
+                let mut live = slot.lock(&host).await;
                 let _host = HostGuard::set(&slot, &host);
                 let prompt = slot.with_intro(&task.prompt);
                 // The human's message is recorded when it is accepted.
@@ -401,6 +447,100 @@ impl StepExecutor for AcpExecutor {
         Box::pin(forge::open_pull_request(task))
     }
 
+    fn take_over<'a>(
+        &'a self,
+        run_id: &'a str,
+        session_id: &'a str,
+        host: Arc<dyn StepHost>,
+    ) -> BoxFuture<'a, Result<HeldSession, String>> {
+        Box::pin(async move {
+            let (_, slot) = self
+                .find(run_id, session_id)
+                .ok_or("the session is not running in this daemon")?;
+            if !slot.can_load {
+                return Err(format!(
+                    "the {} agent cannot reopen the session over ACP afterwards (no `loadSession`)",
+                    slot.harness
+                ));
+            }
+            let mut live = Arc::clone(&slot.live).lock_owned().await;
+            // Ended while we waited.
+            if self.find(run_id, session_id).is_none() || live.session.is_none() {
+                return Err("the session ended".into());
+            }
+            slot.attached.store(true, Ordering::SeqCst);
+            // One writer at a time: the TUI owns the session until it is
+            // given back, then the session is reopened over ACP.
+            if let Some(session) = live.session.take() {
+                let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, session.shutdown()).await;
+            }
+            host.session_state(&slot.id, SessionState::Attached);
+            Ok(HeldSession {
+                vendor_session_id: slot.vendor_id.clone(),
+                hold: Box::new(Hold { slot, live }),
+            })
+        })
+    }
+
+    fn give_back<'a>(&'a self, held: HeldSession, host: Arc<dyn StepHost>) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let Ok(hold) = held.hold.downcast::<Hold>() else {
+                return;
+            };
+            let Hold { slot, mut live } = *hold;
+            let run_id = self
+                .sessions()
+                .iter()
+                .find(|(_, s)| Arc::ptr_eq(s, &slot))
+                .map(|((run, _), _)| run.clone());
+            let Some(run_id) = run_id else {
+                // Released (the run ended) while the TUI had it.
+                slot.attached.store(false, Ordering::SeqCst);
+                return;
+            };
+            let handler = permissions(
+                Arc::clone(&slot.host),
+                slot.id.clone(),
+                slot.role.clone(),
+                slot.harness.clone(),
+            );
+            let spec = LaunchSpec {
+                harness: &slot.harness,
+                cwd: &slot.worktree,
+                model: slot.model.as_deref(),
+                mcp_servers: &slot.mcp_servers,
+                load: Some(&slot.vendor_id),
+            };
+            let launched = self.launcher.launch(spec, handler).await;
+            slot.attached.store(false, Ordering::SeqCst);
+            match launched {
+                Ok((session, mut events)) => {
+                    // Anything sent while loading is the replayed past.
+                    while events.try_recv().is_ok() {}
+                    live.session = Some(session);
+                    live.events = events;
+                    host.session_state(&slot.id, SessionState::Idle);
+                    drop(live);
+                }
+                Err(e) => {
+                    host.session_event(
+                        &slot.id,
+                        SessionEvent::Message {
+                            from: MessageFrom::System,
+                            text: format!(
+                                "The session could not be reopened after the terminal: {e}. \
+                                 The role's next turn starts a new session."
+                            ),
+                        },
+                    );
+                    drop(live);
+                    let role = slot.role.clone();
+                    self.broken(&run_id, &role, slot, &host);
+                }
+            }
+        })
+    }
+
     fn release<'a>(&'a self, run_id: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let slots: Vec<Arc<Slot>> = {
@@ -413,6 +553,12 @@ impl StepExecutor for AcpExecutor {
             }
         })
     }
+}
+
+/// What [`AcpExecutor::take_over`] keeps while the TUI has the session.
+struct Hold {
+    slot: Arc<Slot>,
+    live: tokio::sync::OwnedMutexGuard<Live>,
 }
 
 async fn shutdown(slot: Arc<Slot>) {

@@ -121,6 +121,9 @@ pub trait StepHost: Send + Sync {
 
     fn session_event(&self, session_id: &str, event: SessionEvent);
 
+    /// Records the harness's own id of a session (the ACP session id).
+    fn session_vendor_id(&self, _session_id: &str, _vendor_session_id: &str) {}
+
     /// Asks whether the agent may run a tool call. Resolves to `true` when
     /// allowed. Dropping the future withdraws the question.
     fn ask_permission(
@@ -183,6 +186,45 @@ pub trait StepExecutor: Send + Sync + 'static {
     /// as harness sessions.
     fn release<'a>(&'a self, _run_id: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async {})
+    }
+
+    /// Hands a live session over to its harness's own TUI (terminal mode):
+    /// waits for the turn in progress, if any, then stops driving the
+    /// session, so the TUI can resume it by its vendor id. Until
+    /// [`StepExecutor::give_back`], turns for the session (steps, wakes, the
+    /// human's messages) wait. An error means the session cannot be handed
+    /// over (the caller falls back to a plain shell).
+    fn take_over<'a>(
+        &'a self,
+        _run_id: &'a str,
+        _session_id: &'a str,
+        _host: Arc<dyn StepHost>,
+    ) -> BoxFuture<'a, Result<HeldSession, String>> {
+        Box::pin(async { Err("these agents cannot be opened in their own TUI".into()) })
+    }
+
+    /// Takes back a session handed over by [`StepExecutor::take_over`]:
+    /// reopens it over ACP (with everything the TUI added to it) and lets
+    /// the waiting turns run.
+    fn give_back<'a>(&'a self, _held: HeldSession, _host: Arc<dyn StepHost>) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
+}
+
+/// A session handed over to its TUI by [`StepExecutor::take_over`].
+pub struct HeldSession {
+    /// The harness's own id of the session, which its TUI resumes.
+    pub vendor_session_id: String,
+    /// The executor's hold on the session; hand it back to
+    /// [`StepExecutor::give_back`].
+    pub hold: Box<dyn std::any::Any + Send>,
+}
+
+impl std::fmt::Debug for HeldSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeldSession")
+            .field("vendor_session_id", &self.vendor_session_id)
+            .finish_non_exhaustive()
     }
 }
 
