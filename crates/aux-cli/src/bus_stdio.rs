@@ -2,8 +2,9 @@
 //! session. The daemon puts this command in the MCP server list of ACP
 //! `session/new`, and the agent launches it.
 //!
-//! With `--session-token`, tool calls go to `agentuxd` over its socket (the
-//! global `--socket`) as the session the token was issued to; see the
+//! With a session token (`$AGENTUX_BUS_SESSION_TOKEN`, which is how agentuxd
+//! passes it, or `--session-token`), tool calls go to `agentuxd` over its
+//! socket (the global `--socket`) as the session the token was issued to; see the
 //! `agentux-bus` README. `--standalone` serves an in-memory bus with this one
 //! session on it instead, for trying the tools from a harness by hand.
 
@@ -12,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agentux_bus::{
-    Bus, BusConfig, BusServer, DaemonEndpoint, LocalEndpoint, MemoryBackend, RunId, SessionId,
-    SessionIdentity,
+    Bus, BusConfig, BusServer, DaemonEndpoint, LocalEndpoint, MemoryBackend, RunId,
+    SESSION_TOKEN_ENV, SessionId, SessionIdentity,
 };
 use agentux_config::Config;
 use clap::Args;
@@ -22,8 +23,10 @@ use crate::Result;
 
 #[derive(Args)]
 pub struct BusStdioArgs {
-    /// Token identifying the session, issued by agentuxd
-    #[arg(long, required_unless_present = "standalone")]
+    /// Token identifying the session, issued by agentuxd [default:
+    /// $AGENTUX_BUS_SESSION_TOKEN]. Prefer the variable: command lines are
+    /// visible to other local users
+    #[arg(long)]
     session_token: Option<String>,
     /// Serve an in-memory bus with only this session on it instead of
     /// agentuxd's (development aid). Bus events are printed to stderr as JSON
@@ -45,7 +48,19 @@ pub struct BusStdioArgs {
 
 /// `socket` is the global `--socket` of the daemon to forward calls to.
 pub fn bus_stdio(socket: Option<PathBuf>, args: BusStdioArgs) -> Result {
-    if let Some(token) = args.session_token {
+    let token = if args.standalone {
+        None
+    } else {
+        let token = args.session_token.or_else(|| {
+            std::env::var(SESSION_TOKEN_ENV)
+                .ok()
+                .filter(|t| !t.is_empty())
+        });
+        Some(token.ok_or(
+            "no session token: agentuxd passes it as $AGENTUX_BUS_SESSION_TOKEN              (or give --session-token); use --standalone for an in-memory bus",
+        )?)
+    };
+    if let Some(token) = token {
         let socket = socket.or_else(agentux_api::default_socket_path).ok_or(
             "cannot find the agentuxd socket: XDG_RUNTIME_DIR is not set; \
              pass --socket or set AGENTUX_SOCKET",

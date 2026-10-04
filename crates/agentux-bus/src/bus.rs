@@ -485,6 +485,42 @@ impl State {
     }
 }
 
+/// The prompt that wakes a role whose messages were queued again after a
+/// daemon restart.
+pub fn restored_prompt(count: usize) -> String {
+    format!(
+        "[agentux bus] {count} message(s) sent to your role before AgentUX restarted are waiting for you.          Call read_messages to read them; some may already have been handled by the session that          played your role before. Act on what is still relevant."
+    )
+}
+
+/// What [`Bus::restore`] takes from a run's persisted log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Restore {
+    /// Turns used per exchange.
+    pub exchanges: Vec<(u64, u32)>,
+    /// Every message sent in the run, for replies.
+    pub sent: Vec<RestoredSent>,
+    /// Messages waiting for a role, oldest first.
+    pub queued: Vec<(String, Message)>,
+    /// Sessions of the previous daemon that never left the bus.
+    pub gone: Vec<GoneSession>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoredSent {
+    pub message: u64,
+    pub exchange: u64,
+    pub from: Participant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoneSession {
+    pub session: SessionId,
+    pub role: String,
+    /// How many of `Restore::queued` were delivered to it.
+    pub requeued: usize,
+}
+
 /// The prompt that wakes a session for `message`.
 pub fn wake_prompt(message: &Message, max_turns: u32) -> String {
     let id = message.id;
@@ -561,6 +597,71 @@ impl Bus {
         state.next_question = state.next_question.max(question);
     }
 
+    /// Picks up a run's state from its persisted log after a daemon restart
+    /// (call it after [`Bus::open_run`], before sessions join): turns used
+    /// per exchange, who sent each message (so replies route and count), and
+    /// the messages waiting for a role. Sessions of the previous daemon are
+    /// gone: each in `restore.gone` is reported as having left, with the
+    /// messages queued again for its role. Each role with waiting messages
+    /// gets a [`Wake`], so the daemon starts a session for it.
+    pub fn restore(&self, run: &RunId, restore: Restore) -> Result<(), BusError> {
+        let mut state = self.lock();
+        state.run(run)?;
+        for (exchange, turns) in restore.exchanges {
+            let used = state.exchanges.entry(exchange).or_insert(0);
+            *used = (*used).max(turns);
+        }
+        for sent in restore.sent {
+            state.next_message = state.next_message.max(sent.message);
+            state.next_exchange = state.next_exchange.max(sent.exchange);
+            state.sent.insert(
+                sent.message,
+                Sent {
+                    run: run.clone(),
+                    exchange: sent.exchange,
+                    from: sent.from,
+                },
+            );
+        }
+        for gone in restore.gone {
+            state.emit(
+                run,
+                EventKind::SessionLeft {
+                    session: gone.session,
+                    unread: gone.requeued,
+                    requeued_for: Some(gone.role),
+                },
+            );
+        }
+        let mut roles: Vec<String> = Vec::new();
+        for (role, message) in restore.queued {
+            if !roles.contains(&role) {
+                roles.push(role.clone());
+            }
+            state
+                .role_queues
+                .entry((run.clone(), role))
+                .or_default()
+                .push_back(message);
+        }
+        for role in roles {
+            let queue = &state.role_queues[&(run.clone(), role.clone())];
+            let (count, last) = (queue.len(), queue.back().cloned());
+            let Some(last) = last else { continue };
+            state.emit(
+                run,
+                EventKind::Wake(Wake {
+                    run: run.clone(),
+                    target: WakeTarget::Role(role),
+                    message: last.id,
+                    reason: last.kind,
+                    prompt: restored_prompt(count),
+                }),
+            );
+        }
+        Ok(())
+    }
+
     /// Removes a run, its sessions, queues and pending questions.
     pub fn close_run(&self, run: &RunId) {
         let mut state = self.lock();
@@ -621,6 +722,7 @@ impl Bus {
                 EventKind::SessionLeft {
                     session: session.clone(),
                     unread: entry.mailbox.len(),
+                    requeued_for: None,
                 },
             );
         }

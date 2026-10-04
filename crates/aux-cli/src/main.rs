@@ -114,8 +114,27 @@ enum Command {
     },
     /// Follow a run's events, bus traffic included, until it finishes
     Watch { run_id: String },
-    /// Print a run's agent bus log
-    Bus { run_id: String },
+    /// Print a run's agent bus log, or post on it as the human with --post
+    Bus {
+        run_id: String,
+        /// Post a message as the human to `role:<name>`, `session:<id>` or
+        /// `run` (wakes the recipients, except for `run`)
+        #[arg(long, value_name = "TO", requires = "text")]
+        post: Option<String>,
+        /// Answer this bus message id (with --post)
+        #[arg(long, value_name = "MESSAGE_ID", requires = "post")]
+        reply_to: Option<u64>,
+        /// The message (with --post)
+        #[arg(num_args = 0.., requires = "post")]
+        text: Vec<String>,
+    },
+    /// Send a message to a live agent session as the human; it is handled
+    /// after the session's current turn
+    Say {
+        session_id: String,
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+    },
     /// Cancel a run (its worktree and branch are kept)
     Cancel { run_id: String },
 }
@@ -225,7 +244,14 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
                     .await
             }
             Command::Watch { run_id } => remote.watch(&run_id).await,
-            Command::Bus { run_id } => remote.bus(&run_id).await,
+            Command::Bus {
+                run_id,
+                post: Some(to),
+                reply_to,
+                text,
+            } => remote.post(&run_id, &to, reply_to, &text.join(" ")).await,
+            Command::Bus { run_id, .. } => remote.bus(&run_id).await,
+            Command::Say { session_id, text } => remote.say(&session_id, &text.join(" ")).await,
             Command::Cancel { run_id } => remote.cancel(&run_id).await,
             Command::Validate { .. }
             | Command::Worktree(_)

@@ -1,4 +1,4 @@
-//! `aux bus-stdio --session-token` against a daemon: a fake ACP agent
+//! `aux bus-stdio` (session token in `$AGENTUX_BUS_SESSION_TOKEN`) against a daemon: a fake ACP agent
 //! launches the MCP server the daemon gave it in `session/new` (the real `aux`
 //! binary) and calls bus tools through it, the way a harness does.
 
@@ -42,7 +42,7 @@ impl Launcher for Launch {
                 let notes = Arc::clone(&notes);
                 async move {
                     let mut command = tokio::process::Command::new(&server.command);
-                    command.args(&server.args);
+                    command.args(&server.args).envs(server.env.iter().cloned());
                     let (transport, _stderr) = TokioChildProcess::builder(command)
                         .stderr(Stdio::inherit())
                         .spawn()

@@ -161,6 +161,32 @@ impl Client {
         self.call(method::BUS_LIST, &params).await
     }
 
+    /// Sends a message to a live session as the human (`sessions.prompt`).
+    pub async fn prompt_session(
+        &mut self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<rpc::Prompted, ClientError> {
+        let params = rpc::PromptSession {
+            session_id: session_id.into(),
+            text: text.into(),
+        };
+        self.call(method::SESSIONS_PROMPT, &params).await
+    }
+
+    /// Posts a message on a run's bus as the human (`bus.post`).
+    pub async fn post_bus(&mut self, params: &rpc::BusPost) -> Result<rpc::BusPosted, ClientError> {
+        self.call(method::BUS_POST, params).await
+    }
+
+    /// One page of a run's stored events (`runs.events`).
+    pub async fn run_events(
+        &mut self,
+        params: &rpc::RunEventsParams,
+    ) -> Result<rpc::RunEvents, ClientError> {
+        self.call(method::RUNS_EVENTS, params).await
+    }
+
     /// Turns the connection into an event stream.
     pub async fn subscribe(mut self, params: &rpc::Subscribe) -> Result<Subscription, ClientError> {
         let _: rpc::Subscribed = self.call(method::EVENTS_SUBSCRIBE, params).await?;
@@ -172,15 +198,48 @@ pub struct Subscription {
     client: Client,
 }
 
+/// What a subscription delivers.
+#[derive(Debug, Clone, PartialEq)]
+// Like `EventBody`: short-lived, boxing would only add noise.
+#[allow(clippy::large_enum_variant)]
+pub enum Notice {
+    Event(Event),
+    /// The replayed history is complete; later events are live.
+    ReplayDone {
+        seq: i64,
+    },
+}
+
 impl Subscription {
     /// The next event, or `None` when the daemon closes the connection.
+    /// Skips the `replay_done` marker; see [`Subscription::next_notice`].
     pub async fn next(&mut self) -> Result<Option<Event>, ClientError> {
+        loop {
+            match self.next_notice().await? {
+                Some(Notice::Event(event)) => return Ok(Some(event)),
+                Some(Notice::ReplayDone { .. }) => continue,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// The next event or `replay_done` marker, or `None` when the daemon
+    /// closes the connection.
+    pub async fn next_notice(&mut self) -> Result<Option<Notice>, ClientError> {
         while let Some(line) = self.client.lines.next_line().await? {
             let notification: rpc::Notification = serde_json::from_str(&line).map_err(protocol)?;
-            if notification.method == method::EVENT {
-                return serde_json::from_value(notification.params)
-                    .map(Some)
-                    .map_err(protocol);
+            match notification.method.as_str() {
+                method::EVENT => {
+                    return serde_json::from_value(notification.params)
+                        .map(|event| Some(Notice::Event(event)))
+                        .map_err(protocol);
+                }
+                method::REPLAY_DONE => {
+                    let done: rpc::ReplayDone =
+                        serde_json::from_value(notification.params).map_err(protocol)?;
+                    return Ok(Some(Notice::ReplayDone { seq: done.seq }));
+                }
+                _ => {}
             }
         }
         Ok(None)

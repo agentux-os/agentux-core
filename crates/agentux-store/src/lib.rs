@@ -248,11 +248,23 @@ impl Tx<'_> {
 
     /// Persisted events with `seq > since`, optionally only those of one run.
     pub fn events_since(&self, since: i64, run_id: Option<&str>) -> Result<Vec<Event>> {
+        self.events_page(since, run_id, None)
+    }
+
+    /// Like [`Tx::events_since`], at most `limit` events.
+    pub fn events_page(
+        &self,
+        since: i64,
+        run_id: Option<&str>,
+        limit: Option<u32>,
+    ) -> Result<Vec<Event>> {
+        // SQLite: a negative LIMIT means no limit.
+        let limit = limit.map_or(-1, i64::from);
         let mut stmt = self.tx.prepare(
             "SELECT seq, at, run_id, body FROM events
-             WHERE seq > ?1 AND (?2 IS NULL OR run_id = ?2) ORDER BY seq",
+             WHERE seq > ?1 AND (?2 IS NULL OR run_id = ?2) ORDER BY seq LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![since, run_id], |row| {
+        let rows = stmt.query_map(params![since, run_id, limit], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,

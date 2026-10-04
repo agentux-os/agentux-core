@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use agentux_api::rpc::{StartRun, Subscribe};
+use agentux_api::rpc::{BusPost, StartRun, Subscribe};
 use agentux_api::{
     BusEndpoint, BusMessage, BusMessageKind, Client, Event, EventBody, MessageFrom, RequestKind,
     RequestStatus, Run, RunStatus, SessionEvent, SessionState, ToolStatus,
@@ -159,6 +159,71 @@ impl Remote {
         Ok(())
     }
 
+    /// Posts a message on a run's bus as the human.
+    pub async fn post(&self, run_id: &str, to: &str, reply_to: Option<u64>, text: &str) -> Result {
+        let to = match to.parse::<agentux_bus::Target>()? {
+            agentux_bus::Target::Session(id) => BusEndpoint::Session {
+                session_id: id.0,
+                role: String::new(),
+                vendor: String::new(),
+            },
+            agentux_bus::Target::Role(role) => BusEndpoint::Role { role },
+            agentux_bus::Target::Run => BusEndpoint::Run,
+            agentux_bus::Target::Human => {
+                return Err(
+                    "you are the human: post to `role:<name>`, `session:<id>` or `run`".into(),
+                );
+            }
+        };
+        let posted = self
+            .connect()
+            .await?
+            .post_bus(&BusPost {
+                run_id: run_id.into(),
+                to: Some(to),
+                body: text.into(),
+                subject: None,
+                in_reply_to: reply_to,
+            })
+            .await?;
+        let mut line = format!(
+            "posted #{} (exchange {})",
+            posted.message_id, posted.exchange
+        );
+        if !posted.delivered_to.is_empty() {
+            line.push_str(&format!(
+                " to session(s) {}",
+                posted.delivered_to.join(", ")
+            ));
+        }
+        if let Some(role) = posted.queued_for_role {
+            line.push_str(&format!(
+                "; queued for {role}, whose session is being started"
+            ));
+        }
+        println!("{line}");
+        Ok(())
+    }
+
+    /// Sends a message to a live session as the human.
+    pub async fn say(&self, session_id: &str, text: &str) -> Result {
+        let prompted = self
+            .connect()
+            .await?
+            .prompt_session(session_id, text)
+            .await?;
+        let session = &prompted.session;
+        if prompted.queued {
+            println!(
+                "queued for the {} ({}): it gets your message after its current turn",
+                session.role, session.harness
+            );
+        } else {
+            println!("sent to the {} ({})", session.role, session.harness);
+        }
+        Ok(())
+    }
+
     pub async fn cancel(&self, run_id: &str) -> Result {
         let run = self.connect().await?.cancel_run(run_id).await?;
         println!("{} {}", run.id, run.status);
@@ -293,6 +358,14 @@ impl Printer {
                 from: MessageFrom::User,
                 ..
             } => println!("  {role} <- prompt"),
+            SessionEvent::Message {
+                from: MessageFrom::Human,
+                text,
+            } => {
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    println!("  {role} <- you | {line}");
+                }
+            }
             SessionEvent::Message { text, .. } => {
                 for line in text.lines().filter(|l| !l.trim().is_empty()) {
                     println!("  {role} | {line}");

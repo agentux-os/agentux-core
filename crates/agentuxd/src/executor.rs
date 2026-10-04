@@ -104,6 +104,10 @@ pub struct WakeTask {
     /// if it has none.
     pub session_id: Option<String>,
     pub prompt: String,
+    /// The human typed `prompt` (`sessions.prompt`): it is already recorded
+    /// as a `human` message, and a session that ended meanwhile is an error
+    /// rather than mail gone with it.
+    pub human: bool,
 }
 
 /// What the daemon offers an executor while one agent step runs: recording

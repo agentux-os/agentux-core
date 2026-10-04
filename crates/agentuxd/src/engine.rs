@@ -186,6 +186,7 @@ impl Engine {
             Ok::<_, Error>(ids)
         })?;
         for id in &ids {
+            self.reopen_bus(id);
             self.spawn(id);
         }
         Ok(ids.len())

@@ -256,16 +256,26 @@ async fn rpc<P: Serialize, R: DeserializeOwned>(
     }
 }
 
+/// The environment variable carrying the session token to `aux bus-stdio`.
+/// The token travels in the environment rather than on the command line,
+/// where other local users could read it (`/proc/<pid>/cmdline`).
+pub const SESSION_TOKEN_ENV: &str = "AGENTUX_BUS_SESSION_TOKEN";
+
 /// The arguments that make `aux` serve the bus for one session over stdio,
-/// for the stdio MCP server spec the daemon passes in ACP `session/new`.
-pub fn bus_stdio_args(socket: &Path, session_token: &str) -> Vec<String> {
+/// for the stdio MCP server spec the daemon passes in ACP `session/new`. The
+/// token goes in the spec's environment: see [`bus_stdio_env`].
+pub fn bus_stdio_args(socket: &Path) -> Vec<String> {
     vec![
         "bus-stdio".into(),
         "--socket".into(),
         socket.display().to_string(),
-        "--session-token".into(),
-        session_token.into(),
     ]
+}
+
+/// The environment of the stdio MCP server spec: the session token, as
+/// [`SESSION_TOKEN_ENV`].
+pub fn bus_stdio_env(session_token: &str) -> Vec<(String, String)> {
+    vec![(SESSION_TOKEN_ENV.to_string(), session_token.to_string())]
 }
 
 #[cfg(test)]
