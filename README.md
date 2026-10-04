@@ -25,6 +25,7 @@ A Cargo workspace. What exists today:
 | [`agentux-worktree`](crates/agentux-worktree) | Creates, lists and removes the git worktree of a run: branch `aux/<run-id>`, checked out under a configurable base directory. Shells out to `git`. |
 | [`agentux-store`](crates/agentux-store) | SQLite persistence (bundled SQLite): projects, runs, step attempts, approval requests and the event log, with schema migrations. Every change is one transaction; events are broadcast only after commit. |
 | [`agentux-api`](crates/agentux-api) | API types, the JSON-RPC envelope and an async client, shared by the daemon, `aux` and the cockpit backend. |
+| [`agentux-bus`](crates/agentux-bus) | The agent bus ([ADR 0004](https://github.com/agentux-os/agentux/blob/main/docs/adr/0004-unified-interface-and-agent-bus.md)): sessions with a scoped identity (run, project, role, vendor), mailboxes, routing to a session, a role, the run or the human, `request_review`, `handoff`, `get_run_state` and `ask_human`, with the `bus` limits from `agentux.yaml` (allowed tools, turns per exchange). Every exchange is an audit event; delivery is a wake event the daemon turns into an ACP prompt. Served to each session as the `agentux` MCP server (rmcp), with the session system prompt. Not wired into `agentuxd` yet. |
 | [`agentuxd`](crates/agentuxd) | The daemon: run state machine ([ADR 0003](https://github.com/agentux-os/agentux/blob/main/docs/adr/0003-workflow-engine.md)) and the API on a Unix socket ([docs/api.md](docs/api.md)). Also a library, so `aux daemon` runs the same code. |
 | [`aux-cli`](crates/aux-cli) | The `aux` binary. |
 
@@ -53,9 +54,12 @@ aux exec --harness <id> [--cwd <dir>] "<prompt>"
 aux worktree create <run-id> [--from <ref>] [--base-dir <dir>] [--repo <dir>]
 aux worktree list [--repo <dir>]
 aux worktree remove <run-id> [--force] [--delete-branch] [--repo <dir>]
+aux bus-stdio --standalone [--project <dir>] [--role <r>]   # the agentux MCP server over stdio, on an in-memory bus
 ```
 
 `aux worktree` and `aux exec` are development aids: `agentuxd` manages run worktrees itself, and `aux exec` runs one prompt against a harness (`claude-code`, `codex`, `opencode`, `antigravity`), streams what it does and asks y/n for each permission request; Ctrl-C cancels the turn.
+
+`aux bus-stdio` is the stdio MCP server harnesses will launch to reach the bus (passed in ACP `session/new`, which `agentux-harness` now supports). Until `agentuxd` serves the bus it only runs with `--standalone`; see the [`agentux-bus` README](crates/agentux-bus/README.md#transport-and-the-daemon-bridge) for the integration plan.
 
 ## Install
 
@@ -89,7 +93,7 @@ Linux is the target. The crate holding `aux` is named `aux-cli` because `aux` is
 
 - An ACP-backed step executor for `agentuxd` on top of `agentux-harness`, and usage reporting so budgets can be enforced.
 - Headless fallbacks for the harnesses, behind the same `Harness` trait ([ADR 0002](https://github.com/agentux-os/agentux/blob/main/docs/adr/0002-harness-integration-via-acp.md)).
-- Agent bus as an MCP server ([ADR 0004](https://github.com/agentux-os/agentux/blob/main/docs/adr/0004-unified-interface-and-agent-bus.md)).
+- Agent bus in `agentuxd`: the bridge behind `aux bus-stdio`, a `BusBackend` over run state and the approvals inbox, wakes turned into prompts, and bus events in the event log ([`agentux-bus`](crates/agentux-bus/README.md#transport-and-the-daemon-bridge)).
 - Sessions, permission requests from harnesses and `aux attach` in the API; the cockpit's real `DaemonClient` on top of it.
 
 ## Relevant ADRs

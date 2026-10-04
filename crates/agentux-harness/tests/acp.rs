@@ -9,8 +9,8 @@ use agent_client_protocol::schema::v1 as acp;
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
 use agentux_harness::{
     AcpHarness, AcpSession, Decision, Error, Event, Events, FileDiff, Harness, HarnessSession,
-    HarnessSpec, PermissionHandler, PermissionRequest, PlanEntry, PlanStatus, StopReason, ToolCall,
-    ToolCallUpdate, ToolKind, ToolStatus, permission_handler,
+    HarnessSpec, McpServer, PermissionHandler, PermissionRequest, PlanEntry, PlanStatus,
+    StopReason, ToolCall, ToolCallUpdate, ToolKind, ToolStatus, permission_handler,
 };
 use tokio::task::JoinHandle;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -55,6 +55,7 @@ fn permission(tool_call_id: &str) -> acp::RequestPermissionRequest {
 #[derive(Default)]
 struct Seen {
     cwd: Option<PathBuf>,
+    mcp_servers: Vec<acp::McpServer>,
     permission_outcomes: Vec<String>,
 }
 
@@ -152,15 +153,20 @@ async fn turn(
     Ok(acp::StopReason::EndTurn)
 }
 
-/// Starts the fake agent and connects a session to it.
-async fn connect(
-    permissions: PermissionHandler,
-) -> (
+type Connected = (
     AcpSession,
     Events,
     Arc<Mutex<Seen>>,
     JoinHandle<agent_client_protocol::Result<()>>,
-) {
+);
+
+/// Starts the fake agent and connects a session to it.
+async fn connect(permissions: PermissionHandler) -> Connected {
+    connect_with(permissions, &[]).await
+}
+
+/// Like [`connect`], attaching `mcp_servers` to the session.
+async fn connect_with(permissions: PermissionHandler, mcp_servers: &[McpServer]) -> Connected {
     let (client_io, agent_io) = tokio::io::duplex(64 * 1024);
     let (agent_read, agent_write) = tokio::io::split(agent_io);
     let (client_read, client_write) = tokio::io::split(client_io);
@@ -180,7 +186,9 @@ async fn connect(
             {
                 let seen = Arc::clone(&seen);
                 async move |request: acp::NewSessionRequest, responder, _cx| {
-                    seen.lock().unwrap().cwd = Some(request.cwd);
+                    let mut seen = seen.lock().unwrap();
+                    seen.cwd = Some(request.cwd);
+                    seen.mcp_servers = request.mcp_servers;
                     responder.respond(acp::NewSessionResponse::new(SESSION))
                 }
             },
@@ -221,7 +229,12 @@ async fn connect(
     let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
     let (session, events) = tokio::time::timeout(
         TIMEOUT,
-        AcpSession::connect(transport, Path::new("/work/tree"), permissions),
+        AcpSession::connect_with_mcp_servers(
+            transport,
+            Path::new("/work/tree"),
+            mcp_servers,
+            permissions,
+        ),
     )
     .await
     .expect("connect timed out")
@@ -320,6 +333,36 @@ async fn prompt_streams_events_and_asks_for_permission() {
         .expect("agent did not stop")
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn mcp_servers_are_passed_in_session_new() {
+    let bus = McpServer {
+        name: "agentux".into(),
+        command: "/usr/bin/aux".into(),
+        args: vec!["bus-stdio".into(), "--session-token".into(), "t1".into()],
+        env: vec![("AGENTUX_LOG".into(), "debug".into())],
+    };
+    let (session, _events, seen, _agent) = connect_with(
+        permission_handler(|_| async { Decision::Deny }),
+        std::slice::from_ref(&bus),
+    )
+    .await;
+    assert_eq!(
+        seen.lock().unwrap().mcp_servers,
+        [acp::McpServer::Stdio(
+            acp::McpServerStdio::new("agentux", "/usr/bin/aux")
+                .args(bus.args.clone())
+                .env(vec![acp::EnvVariable::new("AGENTUX_LOG", "debug")])
+        )]
+    );
+    session.shutdown().await.unwrap();
+
+    // Without servers the list is empty, as before.
+    let (session, _events, seen, _agent) =
+        connect(permission_handler(|_| async { Decision::Deny })).await;
+    assert!(seen.lock().unwrap().mcp_servers.is_empty());
+    session.shutdown().await.unwrap();
 }
 
 #[tokio::test]

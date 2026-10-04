@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Cost, Decision, Error, Event, Events, FileDiff, Harness, HarnessSession, HarnessSpec,
-    PermissionHandler, PermissionRequest, PlanEntry, PlanStatus, StopReason, ToolCall,
+    McpServer, PermissionHandler, PermissionRequest, PlanEntry, PlanStatus, StopReason, ToolCall,
     ToolCallUpdate, ToolKind, ToolStatus, Usage,
 };
 
@@ -30,11 +30,22 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct AcpHarness {
     spec: HarnessSpec,
+    mcp_servers: Vec<McpServer>,
 }
 
 impl AcpHarness {
     pub fn new(spec: HarnessSpec) -> Self {
-        Self { spec }
+        Self {
+            spec,
+            mcp_servers: Vec::new(),
+        }
+    }
+
+    /// MCP servers to attach to every session this harness starts, e.g. the
+    /// `agentux` bus.
+    pub fn with_mcp_servers(mut self, servers: Vec<McpServer>) -> Self {
+        self.mcp_servers = servers;
+        self
     }
 
     pub fn spec(&self) -> &HarnessSpec {
@@ -55,7 +66,9 @@ impl Harness for AcpHarness {
         let (process, stdin, stdout) = AgentProcess::spawn(&self.spec, cwd)?;
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         // On error `process` is dropped, which kills the harness.
-        let (mut session, events) = AcpSession::connect(transport, cwd, permissions).await?;
+        let (mut session, events) =
+            AcpSession::connect_with_mcp_servers(transport, cwd, &self.mcp_servers, permissions)
+                .await?;
         session.process = Some(process);
         Ok((session, events))
     }
@@ -81,6 +94,17 @@ impl AcpSession {
     pub async fn connect(
         transport: impl ConnectTo<Client> + 'static,
         cwd: &Path,
+        permissions: PermissionHandler,
+    ) -> Result<(Self, Events), Error> {
+        Self::connect_with_mcp_servers(transport, cwd, &[], permissions).await
+    }
+
+    /// Like [`AcpSession::connect`], with `mcp_servers` passed to the agent in
+    /// `session/new`.
+    pub async fn connect_with_mcp_servers(
+        transport: impl ConnectTo<Client> + 'static,
+        cwd: &Path,
+        mcp_servers: &[McpServer],
         permissions: PermissionHandler,
     ) -> Result<(Self, Events), Error> {
         let (events_tx, events) = mpsc::unbounded_channel();
@@ -146,7 +170,7 @@ impl AcpSession {
             .block_task()
             .await?;
         let session = connection
-            .send_request(acp::NewSessionRequest::new(cwd))
+            .send_request(new_session_request(cwd, mcp_servers))
             .block_task()
             .await?;
 
@@ -264,6 +288,26 @@ impl Drop for AgentProcess {
         }
         let _ = self.child.start_kill();
     }
+}
+
+/// The `session/new` request for `cwd`, with `mcp_servers` as stdio servers.
+fn new_session_request(cwd: &Path, mcp_servers: &[McpServer]) -> acp::NewSessionRequest {
+    let servers = mcp_servers
+        .iter()
+        .map(|server| {
+            let env = server
+                .env
+                .iter()
+                .map(|(name, value)| acp::EnvVariable::new(name.clone(), value.clone()))
+                .collect();
+            acp::McpServer::Stdio(
+                acp::McpServerStdio::new(server.name.clone(), server.command.clone())
+                    .args(server.args.clone())
+                    .env(env),
+            )
+        })
+        .collect();
+    acp::NewSessionRequest::new(cwd).mcp_servers(servers)
 }
 
 fn events_from(update: acp::SessionUpdate) -> Vec<Event> {
