@@ -4,8 +4,10 @@ use std::collections::{BTreeMap, HashSet};
 
 use serde::Deserialize;
 
+use crate::isolation::{image_issue, parse_timeout};
 use crate::{
-    Budget, Bus, Check, Config, ConfigError, Issue, Loop, Role, SUPPORTED_VERSION, Step, StepKind,
+    Budget, Bus, Check, Config, ConfigError, DEFAULT_CHECK_TIMEOUT, Isolation, IsolationMode,
+    Issue, Loop, Role, SUPPORTED_VERSION, Step, StepKind,
 };
 
 #[derive(Deserialize)]
@@ -15,12 +17,30 @@ pub(crate) struct RawConfig {
     #[serde(default)]
     roles: BTreeMap<String, Role>,
     #[serde(default)]
-    checks: Vec<Check>,
+    checks: Vec<RawCheck>,
+    isolation: Option<RawIsolation>,
     pipeline: Option<Vec<RawStep>>,
     #[serde(default)]
     bus: Bus,
     #[serde(default)]
     budget: Budget,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCheck {
+    name: String,
+    run: String,
+    /// `90s`, `30m`, `2h`.
+    timeout: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIsolation {
+    mode: IsolationMode,
+    image: Option<String>,
+    network: Option<bool>,
 }
 
 /// Every field any step type may use; which ones are allowed depends on
@@ -88,6 +108,7 @@ impl RawConfig {
         }
 
         let mut check_names = HashSet::new();
+        let mut checks = Vec::with_capacity(self.checks.len());
         for (i, check) in self.checks.iter().enumerate() {
             if check.name.trim().is_empty() {
                 issues.push(format!("checks[{i}].name"), "must not be empty");
@@ -100,7 +121,25 @@ impl RawConfig {
             if check.run.trim().is_empty() {
                 issues.push(format!("checks[{i}].run"), "must not be empty");
             }
+            let timeout = match check.timeout.as_deref().map(parse_timeout) {
+                None => DEFAULT_CHECK_TIMEOUT,
+                Some(Ok(timeout)) => timeout,
+                Some(Err(message)) => {
+                    issues.push(format!("checks[{i}].timeout"), message);
+                    DEFAULT_CHECK_TIMEOUT
+                }
+            };
+            checks.push(Check {
+                name: check.name.clone(),
+                run: check.run.clone(),
+                timeout,
+            });
         }
+
+        let isolation = self
+            .isolation
+            .map(|raw| raw.validate(&mut issues))
+            .unwrap_or_default();
 
         let raw_steps = match self.pipeline {
             Some(steps) if !steps.is_empty() => steps,
@@ -116,7 +155,7 @@ impl RawConfig {
         let kinds: Vec<StepKind> = raw_steps.iter().map(|s| s.step).collect();
         let cx = Context {
             roles: &self.roles,
-            checks: &self.checks,
+            checks: &checks,
             kinds: &kinds,
         };
         let pipeline: Vec<Step> = raw_steps
@@ -151,11 +190,40 @@ impl RawConfig {
         Ok(Config {
             version: SUPPORTED_VERSION,
             roles: self.roles,
-            checks: self.checks,
+            checks,
+            isolation,
             pipeline,
             bus: self.bus,
             budget: self.budget,
         })
+    }
+}
+
+impl RawIsolation {
+    fn validate(self, issues: &mut Issues) -> Isolation {
+        if self.mode == IsolationMode::None {
+            for (field, set) in [
+                ("image", self.image.is_some()),
+                ("network", self.network.is_some()),
+            ] {
+                if set {
+                    issues.push(
+                        format!("isolation.{field}"),
+                        "has no effect with `mode: none`; remove it or use `mode: podman`",
+                    );
+                }
+            }
+        }
+        if let Some(image) = &self.image
+            && let Err(message) = image_issue(image)
+        {
+            issues.push("isolation.image", message);
+        }
+        Isolation {
+            mode: self.mode,
+            image: self.image,
+            network: self.network.unwrap_or(false),
+        }
     }
 }
 

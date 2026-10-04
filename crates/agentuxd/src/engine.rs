@@ -26,21 +26,19 @@ use agentux_api::{
     AttemptStatus, CheckResult, CheckStatus, EventBody, PermissionRequest, Project, RequestKind,
     RequestStatus, Run, RunStatus, Session, SessionEvent, SessionState, StepAttempt, StepKind,
 };
-use agentux_config::{Config, FILE_NAME, Loop, Step};
+use agentux_config::{Config, DEVCONTAINER_FILES, FILE_NAME, IsolationMode, Loop, Step};
 use agentux_store::{NewRequest, Phase, RunRecord, Store, Tx, new_id, now_ms};
 use agentux_worktree::Worktrees;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::bus::{BusLink, Hub};
+use crate::checks::{self, CheckCommand, Container, Outcome};
 use crate::executor::{
     AgentOutcome, AgentTask, BoxFuture, OpenedSession, PullRequestOutcome, PullRequestTask,
     StepExecutor, StepHost,
 };
 use crate::terminal::Terminals;
-
-/// Keep at most this much of each check's output.
-const MAX_CHECK_OUTPUT: usize = 8 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -670,8 +668,9 @@ impl Engine {
             Ok((record.run, cancelled))
         })?;
         // The cancellation is committed first; aborting the driver also kills
-        // a running check (`kill_on_drop`). Agents waiting for permission get
-        // a refusal as their waiters are dropped.
+        // a running check with its process group and container (see
+        // `checks::run`). Agents waiting for permission get a refusal as
+        // their waiters are dropped.
         if let Some(task) = self.tasks().remove(run_id) {
             task.abort();
         }
@@ -1035,12 +1034,15 @@ impl Engine {
         let index = record.run.step_index;
         let attempt_number = record.loops.get(&index).copied().unwrap_or(0) + 1;
         let limit = on_fail.map_or(1, |l| l.limit);
-        let checks: Vec<(String, String)> = names
+        let checks: Vec<&agentux_config::Check> = names
             .iter()
             .filter_map(|name| config.checks.iter().find(|c| &c.name == name))
-            .map(|c| (c.name.clone(), c.run.clone()))
             .collect();
         let worktree = worktree_of(&record)?;
+        let isolation = match config.isolation.mode {
+            IsolationMode::None => Ok(None),
+            IsolationMode::Podman => isolation_of(&record, config, &worktree).await.map(Some),
+        };
 
         let Some(attempt) = self.transition(&run_id, |tx, record| {
             let attempt = tx.start_attempt(&run_id, index, StepKind::Gate)?;
@@ -1048,21 +1050,38 @@ impl Engine {
             record.run.gate_max_attempts = limit;
             record.run.checks = checks
                 .iter()
-                .map(|(name, command)| CheckResult {
-                    name: name.clone(),
-                    command: command.clone(),
+                .map(|check| CheckResult {
+                    name: check.name.clone(),
+                    command: check.run.clone(),
                     status: CheckStatus::Pending,
                 })
                 .collect();
             record.run.activity = format!("gate: attempt {attempt_number}/{limit}");
+            if let Ok(Some((image, _))) = &isolation {
+                let network = if config.isolation.network {
+                    "with network"
+                } else {
+                    "without network"
+                };
+                tx.log(&run_id, format!("checks run in podman, {network}: {image}"))?;
+            }
             Ok(attempt)
         })?
         else {
             return Ok(false);
         };
+        let isolation = match isolation {
+            Ok(isolation) => isolation,
+            Err(reason) => {
+                let reason = format!("checks cannot run in podman: {reason}");
+                return self.gate_error(&run_id, attempt.id, None, reason);
+            }
+        };
 
         let mut failures = String::new();
-        for (i, (name, command)) in checks.iter().enumerate() {
+        for (i, check) in checks.iter().enumerate() {
+            let name = &check.name;
+            let command = &check.run;
             let started = self.transition(&run_id, |_, record| {
                 record.run.checks[i].status = CheckStatus::Running;
                 record.run.activity = format!("gate: running {name}");
@@ -1071,14 +1090,39 @@ impl Engine {
             if started.is_none() {
                 return Ok(false);
             }
-            let (passed, output) = run_check(&worktree, command).await;
+            let container = isolation.as_ref().map(|(image, git_dir)| Container {
+                image: image.reference.clone(),
+                network: config.isolation.network,
+                name: Container::name_for(&run_id, i),
+                git_dir: git_dir.clone(),
+            });
+            let outcome = checks::run(&CheckCommand {
+                worktree: &worktree,
+                command,
+                timeout: check.timeout,
+                container,
+            })
+            .await;
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(reason) => {
+                    let reason = format!("check {name} could not run: {reason}");
+                    return self.gate_error(&run_id, attempt.id, Some(i), reason);
+                }
+            };
+            let passed = outcome.passed();
+            let output = outcome.output();
             let recorded = self.transition(&run_id, |tx, record| {
                 record.run.checks[i].status = if passed {
                     CheckStatus::Passed
                 } else {
                     CheckStatus::Failed
                 };
-                let verdict = if passed { "passed" } else { "failed" };
+                let verdict = match outcome {
+                    Outcome::Passed(_) => "passed",
+                    Outcome::Failed(_) => "failed",
+                    Outcome::TimedOut(_) => "timed out",
+                };
                 tx.log(&run_id, format!("check {name} {verdict}\n{output}"))?;
                 Ok(())
             })?;
@@ -1117,6 +1161,29 @@ impl Engine {
                     format!("gate failed after {attempt_number} of {limit} attempts"),
                 ),
             }
+            Ok(())
+        })?;
+        Ok(done.is_some())
+    }
+
+    /// Fails the run because its checks could not run at all (Podman
+    /// missing, an image that cannot be pulled, an unreadable dev container
+    /// file). Looping back to an agent would not help: the code is not at
+    /// fault.
+    fn gate_error(
+        &self,
+        run_id: &str,
+        attempt: i64,
+        check: Option<usize>,
+        reason: String,
+    ) -> Result<bool> {
+        let done = self.transition(run_id, |tx, record| {
+            if let Some(i) = check {
+                record.run.checks[i].status = CheckStatus::Failed;
+            }
+            tx.log(run_id, reason.clone())?;
+            tx.finish_attempt(attempt, AttemptStatus::Failed, Some(&reason))?;
+            fail(record, reason);
             Ok(())
         })?;
         Ok(done.is_some())
@@ -1291,6 +1358,49 @@ pub(crate) fn project_root(tx: &Tx<'_>, record: &RunRecord) -> Result<PathBuf> {
     tx.project(&record.run.project_id)?
         .map(|p| PathBuf::from(p.path))
         .ok_or_else(|| Error::Internal(format!("project {} vanished", record.run.project_id)))
+}
+
+/// The image isolated checks run in, and the repository's git directory to
+/// mount next to the worktree.
+///
+/// The dev container file is read from the commit the run started from, not
+/// from the worktree, so an agent editing it cannot change where the checks
+/// run, just as it cannot change the run's `agentux.yaml`.
+async fn isolation_of(
+    record: &RunRecord,
+    config: &Config,
+    worktree: &Path,
+) -> std::result::Result<(agentux_config::Image, Option<PathBuf>), String> {
+    let mut files = HashMap::new();
+    for path in DEVCONTAINER_FILES {
+        let text = match &record.base_commit {
+            Some(base) => {
+                let object = format!("{base}:{path}");
+                match git(worktree, &["cat-file", "-e", &object]).await {
+                    Ok(_) => Some(git(worktree, &["show", &object]).await?),
+                    Err(_) => None,
+                }
+            }
+            None => match fs::read_to_string(worktree.join(path)) {
+                Ok(text) => Some(text),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("cannot read {path}: {e}")),
+            },
+        };
+        files.insert(path, text);
+    }
+    let image = config
+        .isolation
+        .image(|path| Ok(files.get(path).cloned().flatten()))?;
+    let git_dir = git(
+        worktree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await
+    .ok()
+    .map(|dir| PathBuf::from(dir.trim()))
+    .filter(|dir| dir.is_absolute() && !dir.starts_with(worktree));
+    Ok((image, git_dir))
 }
 
 fn worktree_of(record: &RunRecord) -> Result<PathBuf> {
@@ -1660,36 +1770,4 @@ async fn git(dir: &Path, args: &[&str]) -> std::result::Result<String, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
-}
-
-/// Runs one check command with `sh -c` in the worktree. Returns whether it
-/// passed and the tail of its stdout and stderr.
-async fn run_check(dir: &Path, command: &str) -> (bool, String) {
-    let output = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await;
-    match output {
-        Ok(output) => {
-            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            (output.status.success(), tail(text.trim_end()))
-        }
-        Err(e) => (false, format!("cannot run `sh -c {command}`: {e}")),
-    }
-}
-
-fn tail(text: &str) -> String {
-    if text.len() <= MAX_CHECK_OUTPUT {
-        return text.to_string();
-    }
-    let mut start = text.len() - MAX_CHECK_OUTPUT;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("[…]{}", &text[start..])
 }

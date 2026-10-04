@@ -232,7 +232,7 @@ type BusEndpoint =
 1. **Setup.** The daemon creates branch `aux/<run-id>` and its worktree (`<repo>.worktrees/<run-id>`) from the project's `HEAD`.
 2. **Steps**, in pipeline order:
    - `plan`, `implement`, `review`, `custom` prompt the role's harness session (see the README for prompts, the review verdict format and the commit after each `implement` or `custom` step). A review may request changes.
-   - `gate` runs each listed check with `sh -c` in the worktree; all checks run, and the failures' output becomes feedback.
+   - `gate` runs each listed check with `sh -c` in the worktree, on the host or, with `isolation.mode: podman`, in a rootless Podman container (see the README); all checks run, and the failures' output becomes feedback. A check that exceeds its `timeout` (default 30 minutes) fails, and everything it started is killed. When checks cannot run at all (Podman missing, the container cannot start), the run fails with that reason and does not loop back.
    - `pull_request` pushes the branch and opens (or finds) its pull request with `gh` when `origin` is on GitHub and `gh` is logged in; otherwise it succeeds with `PR skipped: <reason>` and the branch stays.
 3. **Loops.** A failing gate goes back to its `on_fail` step with the failure output, up to `max_attempts` consecutive gate attempts; a passing gate resets the count. A review requesting changes goes back to `on_changes_requested` with the comments, up to `max_rounds` reviews per run. When a limit is reached the run fails. A gate without `on_fail` fails the run on its first failure.
 4. **Approvals.** `approve: true` on an agent step pauses the run after the step (e.g. to approve the plan); on `pull_request` it pauses before opening it. The run is `waiting` until `requests.approve` (continue) or `requests.deny` (fail).
@@ -287,7 +287,7 @@ For a session that has ended, or whose run has finished, no ACP adapter holds it
 
 ### Crash safety
 
-Every transition is committed to SQLite before the side effect it leads to, and each step attempt is recorded as `running` before it starts. If the daemon stops mid-step, on restart that attempt is marked `interrupted` and the step runs again from the run's last committed state, in a new harness session (the old sessions are marked `ended`); runs waiting for approval keep waiting. Steps must therefore be idempotent: the worktree is reused if it exists, checks are re-run, and harness adapters must tolerate a repeated prompt and find an existing pull request instead of opening a second one. `runs.cancel` commits first, then stops the step (killing a running check).
+Every transition is committed to SQLite before the side effect it leads to, and each step attempt is recorded as `running` before it starts. If the daemon stops mid-step, on restart that attempt is marked `interrupted` and the step runs again from the run's last committed state, in a new harness session (the old sessions are marked `ended`); runs waiting for approval keep waiting. Steps must therefore be idempotent: the worktree is reused if it exists, checks are re-run, and harness adapters must tolerate a repeated prompt and find an existing pull request instead of opening a second one. `runs.cancel` commits first, then stops the step (killing a running check's whole process group and removing its container).
 
 ## Agent bus
 

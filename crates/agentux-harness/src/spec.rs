@@ -36,7 +36,7 @@ impl HarnessSpec {
             Self::new("opencode", "opencode", &["acp"]),
             Self {
                 experimental: true,
-                ..Self::new("antigravity", "agy_acp_server.par", &["--uid="])
+                ..Self::new("antigravity", "agy-acp-server", &["--uid="])
             },
         ]
     }

@@ -19,7 +19,7 @@ How each harness is launched as an ACP agent, as of 2026-10-03. Versions are pin
 | `claude-code` | `npx -y @agentclientprotocol/claude-agent-acp@0.85.1` | Adapter (Claude Agent SDK), maintained under the ACP org. It replaces `@zed-industries/claude-code-acp`, which is deprecated. | [registry entry](https://github.com/agentclientprotocol/registry/blob/main/claude-acp/agent.json), [repo](https://github.com/agentclientprotocol/claude-agent-acp) |
 | `codex` | `npx -y @agentclientprotocol/codex-acp@2.1.1` | Adapter around Codex, maintained under the ACP org. It replaces `@zed-industries/codex-acp`, which is deprecated. | [registry entry](https://github.com/agentclientprotocol/registry/blob/main/codex-acp/agent.json), [repo](https://github.com/agentclientprotocol/codex-acp) |
 | `opencode` | `opencode acp` | Native | [registry entry](https://github.com/agentclientprotocol/registry/blob/main/opencode/agent.json), [docs](https://opencode.ai/docs/acp/) |
-| `antigravity` (experimental) | `agy_acp_server.par --uid=` | Separate ACP server binary from Google (`agy-acp-server`, proprietary), downloaded from `dl.google.com`. It is not the `agy` CLI and must be put on `PATH` by hand. | [registry entry](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json) |
+| `antigravity` (experimental) | `agy-acp-server --uid=` | Separate ACP server binary from Google (`agy_acp_server.par`, proprietary), downloaded from `dl.google.com`; it is not the `agy` CLI. On AgentUX OS, first-login installs it and links it as `~/.local/bin/agy-acp-server`; elsewhere, put it on `PATH` under that name. | [registry entry](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json) |
 
 ### Vendor session ids and the TUI
 

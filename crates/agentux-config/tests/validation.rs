@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::time::Duration;
 
 use agentux_config::{
-    Budget, Bus, BusTool, Check, Config, ConfigError, FILE_NAME, Loop, Role, Step, StepKind,
+    Budget, Bus, BusTool, Check, Config, ConfigError, DEFAULT_CHECK_TIMEOUT, DEFAULT_IMAGE,
+    FILE_NAME, ImageSource, Isolation, IsolationMode, Loop, Role, Step, StepKind,
 };
 
 /// The full example from ADR 0005, which the built-in default is built from.
@@ -81,15 +83,10 @@ fn adr_example_parses_into_the_expected_config() {
     let expected = Config {
         version: 1,
         roles,
+        isolation: Isolation::default(),
         checks: vec![
-            Check {
-                name: "lint".into(),
-                run: "just lint".into(),
-            },
-            Check {
-                name: "test".into(),
-                run: "just test".into(),
-            },
+            Check::new("lint", "just lint"),
+            Check::new("test", "just test"),
         ],
         pipeline: vec![
             Step::Plan {
@@ -177,14 +174,8 @@ fn default_gates_on_the_detected_checks() {
     assert_eq!(
         default.checks,
         [
-            Check {
-                name: "lint".into(),
-                run: "go vet ./...".into()
-            },
-            Check {
-                name: "test".into(),
-                run: "go test ./...".into()
-            }
+            Check::new("lint", "go vet ./..."),
+            Check::new("test", "go test ./...")
         ]
     );
     assert_eq!(
@@ -635,5 +626,144 @@ fn all_issues_are_reported_at_once() {
     assert!(
         rendered.contains("\n  - version: unsupported version 3"),
         "{rendered}"
+    );
+}
+
+const GATE_PIPELINE: &str = "  - step: implement
+    role: implementer
+  - step: gate
+    checks: [test]
+";
+
+fn with_isolation(isolation: &str) -> String {
+    format!("{PREAMBLE}{isolation}pipeline:\n{GATE_PIPELINE}")
+}
+
+#[test]
+fn isolation_defaults_to_none() {
+    let config = Config::from_yaml(&with_isolation("")).unwrap();
+    assert_eq!(config.isolation, Isolation::default());
+    assert_eq!(config.isolation.mode, IsolationMode::None);
+    assert!(!config.isolation.network);
+}
+
+#[test]
+fn isolation_podman_with_image_and_network() {
+    let config = Config::from_yaml(&with_isolation(
+        "isolation:\n  mode: podman\n  image: docker.io/library/rust:1\n  network: true\n",
+    ))
+    .unwrap();
+    assert_eq!(
+        config.isolation,
+        Isolation {
+            mode: IsolationMode::Podman,
+            image: Some("docker.io/library/rust:1".into()),
+            network: true,
+        }
+    );
+
+    let config = Config::from_yaml(&with_isolation("isolation:\n  mode: podman\n")).unwrap();
+    assert_eq!(config.isolation.image, None);
+    assert!(!config.isolation.network, "network is off by default");
+}
+
+#[test]
+fn isolation_rejects_unknown_modes_and_keys() {
+    let message = parse_error(&with_isolation("isolation:\n  mode: docker\n"));
+    assert!(
+        message.contains("docker") && message.contains("podman"),
+        "{message}"
+    );
+    let message = parse_error(&with_isolation(
+        "isolation:\n  mode: podman\n  volumes: [/home]\n",
+    ));
+    assert!(message.contains("volumes"), "{message}");
+    let message = parse_error(&with_isolation("isolation:\n  image: x\n"));
+    assert!(message.contains("mode"), "{message}");
+}
+
+#[test]
+fn isolation_fields_that_need_podman() {
+    assert_issue(
+        &with_isolation("isolation:\n  mode: none\n  image: x\n"),
+        "isolation.image",
+        "no effect with `mode: none`",
+    );
+    assert_issue(
+        &with_isolation("isolation:\n  mode: none\n  network: false\n"),
+        "isolation.network",
+        "no effect with `mode: none`",
+    );
+}
+
+#[test]
+fn isolation_image_must_be_a_plain_reference() {
+    for (image, needle) in [
+        ("\"\"", "must not be empty"),
+        ("--privileged", "must not start with `-`"),
+        ("\"a b\"", "must not contain spaces"),
+    ] {
+        assert_issue(
+            &with_isolation(&format!("isolation:\n  mode: podman\n  image: {image}\n")),
+            "isolation.image",
+            needle,
+        );
+    }
+}
+
+#[test]
+fn check_timeouts() {
+    let yaml = format!(
+        "version: 1
+roles:
+  implementer:
+    harness: claude-code
+checks:
+  - name: test
+    run: just test
+    timeout: 45m
+  - name: lint
+    run: just lint
+pipeline:
+{GATE_PIPELINE}"
+    );
+    let config = Config::from_yaml(&yaml).unwrap();
+    assert_eq!(config.checks[0].timeout, Duration::from_secs(45 * 60));
+    assert_eq!(config.checks[1].timeout, DEFAULT_CHECK_TIMEOUT);
+    assert_eq!(DEFAULT_CHECK_TIMEOUT, Duration::from_secs(30 * 60));
+
+    let bad = yaml.replace("timeout: 45m", "timeout: 45");
+    assert_issue(
+        &bad,
+        "checks[0].timeout",
+        "use a whole number with s, m or h",
+    );
+    let bad = yaml.replace("timeout: 45m", "timeout: 0m");
+    assert_issue(&bad, "checks[0].timeout", "longer than zero");
+}
+
+#[test]
+fn isolation_image_resolves_from_the_devcontainer() {
+    let config = Config::from_yaml(&with_isolation("isolation:\n  mode: podman\n")).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+
+    let image = config.isolation.image_in(dir.path()).unwrap();
+    assert_eq!(image.reference, DEFAULT_IMAGE);
+    assert_eq!(image.source, ImageSource::Default(None));
+
+    fs::create_dir(dir.path().join(".devcontainer")).unwrap();
+    fs::write(
+        dir.path().join(".devcontainer/devcontainer.json"),
+        "{\n  // comment\n  \"image\": \"mcr.microsoft.com/devcontainers/base:ubuntu\",\n}\n",
+    )
+    .unwrap();
+    let image = config.isolation.image_in(dir.path()).unwrap();
+    assert_eq!(
+        image.reference,
+        "mcr.microsoft.com/devcontainers/base:ubuntu"
+    );
+    assert_eq!(
+        image.to_string(),
+        "mcr.microsoft.com/devcontainers/base:ubuntu (from .devcontainer/devcontainer.json)"
     );
 }

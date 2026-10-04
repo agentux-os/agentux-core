@@ -36,10 +36,7 @@ pub fn detect_checks(root: &Path) -> Vec<Check> {
         .enumerate()
         .filter_map(|(i, name)| {
             let run = found.iter().find_map(|commands| commands[i].clone())?;
-            Some(Check {
-                name: (*name).to_string(),
-                run,
-            })
+            Some(Check::new(*name, run))
         })
         .collect()
 }

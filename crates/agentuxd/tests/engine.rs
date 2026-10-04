@@ -380,3 +380,157 @@ async fn registering_requires_a_git_repository_with_a_valid_pipeline() {
         Err(Error::InvalidParams(_))
     ));
 }
+
+/// `pipeline(check)` with the check's timeout set and one gate attempt.
+fn with_timeout(check: &str, timeout: &str, attempts: u32) -> String {
+    pipeline(check)
+        .replace(
+            &format!("    run: {check}\n"),
+            &format!("    run: {check}\n    timeout: {timeout}\n"),
+        )
+        .replace("max_attempts: 3", &format!("max_attempts: {attempts}"))
+}
+
+/// Whether `pid` runs (a zombie, waiting to be reaped, does not count).
+fn alive(pid: i32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        let state = stat.rsplit(')').next().unwrap_or("").trim_start();
+        !state.starts_with('Z')
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_check_that_times_out_fails_with_its_output() {
+    let f = fixture(&with_timeout("echo slow; sleep 60", "1s", 2));
+    let executor = Arc::new(FakeExecutor::default());
+    let engine = f.engine(executor.clone());
+    let run = f.start(&engine).await;
+    let run = wait_until_settled(&engine, &run.id).await;
+
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(
+        run.error.as_deref(),
+        Some("gate failed after 2 of 2 attempts")
+    );
+    let feedback = executor.calls()[2].feedback.clone().unwrap();
+    assert!(feedback.contains("slow"), "{feedback}");
+    assert!(
+        feedback.contains("the check timed out after 1s and was killed"),
+        "{feedback}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancelling_a_running_check_kills_everything_it_started() {
+    let f = fixture(&pipeline("sleep 300 & echo $! > check.pid; wait"));
+    let executor = Arc::new(FakeExecutor::default());
+    let engine = f.engine(executor.clone());
+    let run = f.start(&engine).await;
+    let run = wait_for(&engine, &run.id, |r| r.activity == "gate: running check").await;
+    let pid_file = Path::new(run.worktree.as_deref().unwrap()).join("check.pid");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let pid: i32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .filter(|s| s.ends_with('\n'))
+            .and_then(|s| s.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the check did not start"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(alive(pid));
+
+    engine.cancel(&run.id).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while alive(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the check's `sleep` outlived the cancelled run"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether rootless Podman works here. `AGENTUX_REQUIRE_PODMAN=1` (set in
+/// CI) turns a skip into a failure.
+fn podman_available() -> bool {
+    let works = std::process::Command::new("podman")
+        .args(["info", "--format", "{{.Host.Security.Rootless}}"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !works {
+        assert!(
+            std::env::var_os("AGENTUX_REQUIRE_PODMAN").is_none(),
+            "AGENTUX_REQUIRE_PODMAN is set but podman does not work here"
+        );
+        eprintln!("skipped: podman is not available");
+    }
+    works
+}
+
+fn isolated(check: &str, image: &str) -> String {
+    format!(
+        "{}isolation:\n  mode: podman\n  image: {image}\n",
+        pipeline(check)
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn isolated_checks_run_in_a_podman_container() {
+    if !podman_available() {
+        return;
+    }
+    // Only loopback inside, the worktree at its own path, and a file the
+    // check writes is the user's.
+    let f = fixture(&isolated(
+        "test \"$(ls /sys/class/net)\" = lo && test -f agentux.yaml && touch made-in-container",
+        "docker.io/library/busybox:1.37",
+    ));
+    let executor = Arc::new(FakeExecutor::default());
+    let engine = f.engine(executor.clone());
+    let run = f.start(&engine).await;
+    // Pulling the image can take a while on a fresh machine.
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let run = loop {
+        let (run, _, _) = engine.run(&run.id).unwrap();
+        if run.status != RunStatus::Running {
+            break run;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the run did not finish"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+    let made = Path::new(run.worktree.as_deref().unwrap()).join("made-in-container");
+    use std::os::unix::fs::MetadataExt;
+    let uid = std::fs::metadata(&made).unwrap().uid();
+    assert_eq!(uid, std::fs::metadata(&f.repo).unwrap().uid());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_container_that_cannot_start_fails_the_run_without_looping() {
+    if !podman_available() {
+        return;
+    }
+    let f = fixture(&isolated("true", "localhost/agentux-no-such-image:0"));
+    let executor = Arc::new(FakeExecutor::default());
+    let engine = f.engine(executor.clone());
+    let run = f.start(&engine).await;
+    let run = wait_until_settled(&engine, &run.id).await;
+
+    assert_eq!(run.status, RunStatus::Failed);
+    let error = run.error.unwrap();
+    assert!(
+        error.starts_with("check check could not run: podman could not run the check container"),
+        "{error}"
+    );
+    // Not the agent's fault, so no attempt to fix it.
+    assert_eq!(kinds(&executor), [StepKind::Plan, StepKind::Implement]);
+}
