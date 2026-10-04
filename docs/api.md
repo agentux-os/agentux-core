@@ -147,7 +147,7 @@ type ToolKind = "read" | "edit" | "delete" | "move" | "search" | "execute" | "th
 
 1. **Setup.** The daemon creates branch `aux/<run-id>` and its worktree (`<repo>.worktrees/<run-id>`) from the project's `HEAD`.
 2. **Steps**, in pipeline order:
-   - `plan`, `implement`, `review`, `custom` prompt the role's harness session (see the README for prompts, the review verdict format and the commit after each agent step). A review may request changes.
+   - `plan`, `implement`, `review`, `custom` prompt the role's harness session (see the README for prompts, the review verdict format and the commit after each `implement` or `custom` step). A review may request changes.
    - `gate` runs each listed check with `sh -c` in the worktree; all checks run, and the failures' output becomes feedback.
    - `pull_request` pushes the branch and opens (or finds) its pull request with `gh` when `origin` is on GitHub and `gh` is logged in; otherwise it succeeds with `PR skipped: <reason>` and the branch stays.
 3. **Loops.** A failing gate goes back to its `on_fail` step with the failure output, up to `max_attempts` consecutive gate attempts; a passing gate resets the count. A review requesting changes goes back to `on_changes_requested` with the comments, up to `max_rounds` reviews per run. When a limit is reached the run fails. A gate without `on_fail` fails the run on its first failure.

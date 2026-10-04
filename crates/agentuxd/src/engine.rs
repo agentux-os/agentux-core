@@ -12,8 +12,8 @@
 //! While an agent step runs, the executor reports sessions and their events
 //! through a [`StepHost`] the engine hands it, and asks it before tool calls.
 //! Such a permission request pauses the run (`waiting`) without leaving the
-//! step: the agent waits for the answer. After each agent step the daemon
-//! commits whatever the agent changed in the worktree.
+//! step: the agent waits for the answer. After implement and custom steps the
+//! daemon commits whatever changed in the worktree.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -875,8 +875,12 @@ impl Engine {
         let outcome = self.inner.executor.run_agent(&task, host).await;
         // Questions the agent left open die with its turn.
         self.withdraw_permissions(&run_id, None);
-        // Agents edit; the daemon commits.
+        // Implementers (and custom steps) edit; the daemon commits. Planners
+        // and reviewers are not meant to change files: what they leave behind
+        // (e.g. caches from running tests) is not committed under their name.
+        let commits = matches!(kind, StepKind::Implement | StepKind::Custom);
         let (outcome, commit) = match outcome {
+            Ok(outcome) if !commits => (Ok(outcome), None),
             Ok(outcome) => match commit_changes(&task).await {
                 Ok(commit) => (Ok(outcome), commit),
                 Err(e) => (Err(format!("cannot commit the agent's changes: {e}")), None),
@@ -1473,7 +1477,7 @@ fn end_sessions(tx: &mut Tx<'_>, run_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Commits everything that changed in the worktree during an agent step.
+/// Commits everything that changed in the worktree since the last commit.
 /// Returns `<short sha> <subject>`, or `None` when nothing changed.
 async fn commit_changes(task: &AgentTask) -> std::result::Result<Option<String>, String> {
     let dir = &task.worktree;

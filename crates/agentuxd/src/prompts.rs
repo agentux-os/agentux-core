@@ -3,7 +3,8 @@
 //! works the same in a fresh session after a restart as in a reused one.
 //!
 //! Commit policy: agents edit files but do not commit; the daemon commits
-//! whatever changed after each agent step (see `engine::commit_changes`).
+//! whatever changed after each implement or custom step (see
+//! `engine::commit_changes`).
 
 use agentux_api::StepKind;
 use serde_json::Value;
