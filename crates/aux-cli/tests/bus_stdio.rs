@@ -101,7 +101,7 @@ fn without_standalone_it_needs_the_daemon() {
         .args([
             "bus-stdio",
             "--socket",
-            "/run/agentux.sock",
+            "/nonexistent/agentuxd.sock",
             "--session-token",
             "t",
         ])
@@ -109,7 +109,10 @@ fn without_standalone_it_needs_the_daemon() {
         .unwrap();
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("--standalone"), "{stderr}");
+    assert!(
+        stderr.contains("cannot reach agentuxd at /nonexistent/agentuxd.sock"),
+        "{stderr}"
+    );
 
     let output = Command::new(env!("CARGO_BIN_EXE_aux"))
         .args(["bus-stdio"])

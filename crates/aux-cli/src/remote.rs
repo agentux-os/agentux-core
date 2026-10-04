@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 
 use agentux_api::rpc::{StartRun, Subscribe};
 use agentux_api::{
-    Client, Event, EventBody, MessageFrom, RequestStatus, Run, RunStatus, SessionEvent,
-    SessionState, ToolStatus,
+    BusEndpoint, BusMessage, BusMessageKind, Client, Event, EventBody, MessageFrom, RequestKind,
+    RequestStatus, Run, RunStatus, SessionEvent, SessionState, ToolStatus,
 };
 
 use crate::Result;
@@ -122,7 +122,10 @@ impl Remote {
                     request.title
                 );
             }
-            println!("\napprove with `aux approve <id>`, deny with `aux deny <id>`");
+            println!(
+                "\napprove with `aux approve <id>`, deny with `aux deny <id>`; \
+                 answer an agent's question with `aux answer <id> <text>`"
+            );
         }
         Ok(())
     }
@@ -135,6 +138,24 @@ impl Remote {
             client.deny(request_id, answer).await?
         };
         println!("{} {}: {}", request.id, request.status, request.title);
+        Ok(())
+    }
+
+    /// Prints a run's bus log: messages between agents, wakes, questions to
+    /// the human and their answers, refusals.
+    pub async fn bus(&self, run_id: &str) -> Result {
+        let messages = self.connect().await?.list_bus(run_id).await?;
+        if messages.is_empty() {
+            println!("no bus traffic in run {run_id}");
+        }
+        for message in &messages {
+            println!("{}", bus_line(message));
+            if message.body != message.subject {
+                for line in message.body.lines() {
+                    println!("    | {line}");
+                }
+            }
+        }
         Ok(())
     }
 
@@ -206,6 +227,16 @@ impl Printer {
                 return Some(run.status);
             }
             EventBody::Request { request } => match request.status {
+                RequestStatus::Pending if request.kind == RequestKind::Question => {
+                    println!("  question for you: {}", request.title);
+                    for line in request.detail.lines() {
+                        println!("  | {line}");
+                    }
+                    println!(
+                        "  -> aux answer {} <answer> / aux deny {}",
+                        request.id, request.id
+                    );
+                }
                 RequestStatus::Pending => {
                     println!("  approval needed: {}", request.title);
                     for line in request.detail.lines() {
@@ -250,6 +281,7 @@ impl Printer {
                     .to_string();
                 self.session_event(session_id, &role, event);
             }
+            EventBody::BusMessage { message } => println!("  {}", bus_line(message)),
             EventBody::Project { .. } => {}
         }
         None
@@ -307,6 +339,58 @@ impl Printer {
             // The request event itself is printed.
             SessionEvent::Permission { .. } => {}
         }
+    }
+}
+
+/// One line for a bus log entry.
+fn bus_line(message: &BusMessage) -> String {
+    let (from, to) = (endpoint(&message.from), endpoint(&message.to));
+    match message.kind {
+        BusMessageKind::Message
+        | BusMessageKind::ReviewRequest
+        | BusMessageKind::Handoff
+        | BusMessageKind::HumanAnswer => {
+            let mut line = format!("[bus] {from} -> {to}");
+            if let Some(id) = message.message_id {
+                line.push_str(&format!(" #{id}"));
+            }
+            if message.kind != BusMessageKind::Message {
+                line.push_str(&format!(" {}", message.kind));
+            }
+            if message.max_turns > 0 && message.turn > 0 {
+                line.push_str(&format!(" (turn {}/{})", message.turn, message.max_turns));
+            }
+            if let Some(role) = &message.queued_for_role {
+                line.push_str(&format!(" [queued for {role}]"));
+            }
+            format!("{line}: {}", message.subject)
+        }
+        BusMessageKind::Question => format!(
+            "[bus] {from} asks the human: {}{}",
+            message.subject,
+            message
+                .request_id
+                .as_ref()
+                .map_or_else(String::new, |id| format!(" (aux answer {id} <answer>)"))
+        ),
+        BusMessageKind::Answer => format!("[bus] the human answered {to}: {}", message.subject),
+        BusMessageKind::Wake => format!("[bus] {}", message.subject),
+        BusMessageKind::TurnLimit | BusMessageKind::ToolDenied => {
+            format!("[bus] refused for {from}: {}", message.subject)
+        }
+        BusMessageKind::Joined | BusMessageKind::Left => format!("[bus] {}", message.subject),
+    }
+}
+
+fn endpoint(endpoint: &BusEndpoint) -> String {
+    match endpoint {
+        BusEndpoint::Session {
+            session_id, role, ..
+        } => format!("{role}({session_id})"),
+        BusEndpoint::Role { role } => format!("role:{role}"),
+        BusEndpoint::Run => "run".into(),
+        BusEndpoint::Human => "human".into(),
+        BusEndpoint::Daemon => "agentuxd".into(),
     }
 }
 

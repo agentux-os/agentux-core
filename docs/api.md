@@ -5,7 +5,7 @@
 ## Transport
 
 - **Unix domain socket** at `$XDG_RUNTIME_DIR/agentux/agentuxd.sock`. `$AGENTUX_SOCKET`, or `--socket` on `agentuxd`/`aux`, overrides it. The directory is created with mode `0700` and the socket with `0600`: only the user who runs the daemon can talk to it. Nothing listens on the network.
-- **Newline-delimited JSON-RPC 2.0.** Each line is one JSON object: a request, a response or a notification. Requests on one connection are answered in order. A request without `id` is a notification and gets no response.
+- **Newline-delimited JSON-RPC 2.0.** Each line is one JSON object: a request, a response or a notification. Requests on one connection are answered in order, so a slow request (a `bus.call` waiting for the human) holds up the ones after it: use another connection for those. A request without `id` is a notification and gets no response.
 - Field names are `camelCase`; enum values are `snake_case`; timestamps are milliseconds since the Unix epoch.
 
 Why JSON-RPC over a raw socket rather than HTTP: the API is a handful of commands plus one event stream, both directions fit on one connection, and a client is a couple hundred lines on top of tokio (see `agentux-api/src/client.rs`) with no HTTP stack in the daemon or `aux`. ADR 0006 mentions server-sent events; an event subscription on a JSON-RPC connection gives the same push semantics. Talking to it by hand:
@@ -26,9 +26,12 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `runs.cancel` | `{ runId }` | `Run` |
 | `sessions.list` | `{ runId? }` | `Session[]`, oldest first |
 | `requests.list` | `{ pending? }` — `true` for the approvals inbox | `PermissionRequest[]`, newest first |
-| `requests.approve` | `{ requestId, answer? }` | `PermissionRequest` |
-| `requests.deny` | `{ requestId, answer? }` | `PermissionRequest` (the run fails, except for `permission` requests: the agent is told no and goes on) |
+| `requests.approve` | `{ requestId, answer? }` — `answer` is required for `question` requests | `PermissionRequest` |
+| `requests.deny` | `{ requestId, answer? }` | `PermissionRequest` (the run fails, except for `permission` requests, where the agent is told no and goes on, and `question` requests, where the agent is told the human declined) |
 | `events.subscribe` | `{ runId?, since? }` | `{ seq }`, then `event` notifications |
+| `bus.list` | `{ runId }` | `BusMessage[]`, the run's agent bus log, oldest first |
+| `bus.hello` | `{ sessionToken }` | `{ identity, allowedTools, maxTurnsPerExchange }` — bus bridge only, see [Agent bus](#agent-bus) |
+| `bus.call` | `{ sessionToken, call }` | `{ ok: <tool result> }` or `{ err: <refusal> }` — bus bridge only |
 
 `runs.start` reads the project's `agentux.yaml` at that moment and stores it with the run; editing the file later does not affect a run in progress. Without the file, the built-in default pipeline applies.
 
@@ -41,6 +44,7 @@ Standard JSON-RPC codes (`-32700` parse error, `-32600` invalid request, `-32601
 | `-32001` | Not found: no such project, run or request |
 | `-32002` | Conflict: e.g. approving a request that is no longer pending, cancelling a finished run |
 | `-32003` | Invalid project: not a git repository, or its `agentux.yaml` is invalid |
+| `-32004` | Unauthorized: `bus.hello` / `bus.call` with an unknown session token, or the token of a session that has ended |
 
 ## Events
 
@@ -59,6 +63,7 @@ Every state change is stored as an event in the same transaction as the change, 
 | `log` | `text` | Check output, agent summaries, commits, notes such as a resume after restart |
 | `session` | `session: Session` | A session started or changed state or usage (full snapshot) |
 | `session_event` | `sessionId`, `event: SessionEvent` | Something happened in a session |
+| `bus_message` | `message: BusMessage` | Traffic on the run's agent bus (see [Agent bus](#agent-bus)) |
 
 Session events are stored in the event log like the others, so `events.subscribe` with `since: 0` replays a run's sessions. Agent message chunks are coalesced (up to about 4 KB, or 750 ms); reasoning chunks are not recorded; tool output and diff texts are cut at 16 KB.
 
@@ -107,11 +112,13 @@ interface StepAttempt {
 interface PermissionRequest {
   id: string;
   // plan = approve the plan; step = any other approve: true step;
-  // permission = an agent asks before a tool call; budget = the run is over budget
-  kind: "plan" | "step" | "permission" | "budget";
+  // permission = an agent asks before a tool call; budget = the run is over budget;
+  // question = an agent asks the human through the bus (ask_human)
+  kind: "plan" | "step" | "permission" | "budget" | "question";
   runId: string; projectId: string; stepIndex: number; step: StepKind;
-  sessionId: string | null;  // the session that asked, for permission requests
+  sessionId: string | null;  // the session that asked, for permission and question requests
   title: string; detail: string;
+  options: string[];         // suggested answers of a question (free text is fine too); [] otherwise
   status: "pending" | "approved" | "denied" | "cancelled";
   answer: string | null;
   createdAt: number; resolvedAt: number | null;
@@ -141,6 +148,43 @@ type SessionEvent =
   | { kind: "usage"; usage: Session["usage"] };
 
 type ToolKind = "read" | "edit" | "delete" | "move" | "search" | "execute" | "think" | "fetch" | "other";
+
+// One entry of a run's agent bus log. Close to the cockpit's BusMessage
+// (id, runId, projectId, tool, from, to, subject, body, at, turn, maxTurns);
+// the fields after maxTurns are additions, and BusEndpoint has two more kinds.
+interface BusMessage {
+  id: string;                  // unique id of the log entry
+  runId: string; projectId: string;
+  kind: BusMessageKind;
+  tool: string | null;         // post_message | request_review | handoff | ask_human | ..., when a tool call caused it
+  from: BusEndpoint; to: BusEndpoint;
+  subject: string;             // one line
+  body: string;                // the message text; for a wake, the prompt sent
+  at: number;
+  turn: number; maxTurns: number;  // turn within the exchange (messages; 0 otherwise), and the run's limit
+  messageId: number | null;    // the bus's message id (agents pass it as in_reply_to); also on the wake it caused
+  exchange: number | null;
+  inReplyTo: number | null;
+  questionId: number | null;   // question and answer
+  requestId: string | null;    // the `question` request holding a question
+  deliveredTo: string[];       // session ids whose mailbox received a message
+  queuedForRole: string | null;  // no session played the target role: the message waits for one
+}
+
+type BusMessageKind =
+  | "message" | "review_request" | "handoff"  // routed messages (post_message, request_review, handoff)
+  | "human_answer"                            // an answer that outlived the ask_human call, delivered as mail
+  | "question" | "answer"                     // ask_human and the human's answer
+  | "wake"                                    // the daemon prompts a session (or starts one for a role) for new mail
+  | "turn_limit" | "tool_denied"              // refusals
+  | "joined" | "left";                        // sessions entering and leaving the bus
+
+type BusEndpoint =
+  | { kind: "session"; sessionId: string; role: string; vendor: string }  // vendor = harness
+  | { kind: "role"; role: string }   // every session playing the role
+  | { kind: "run" }                  // the run's channel (no wake)
+  | { kind: "human" }
+  | { kind: "daemon" };              // agentuxd: wakes, refusals
 ```
 
 ## Run lifecycle
@@ -155,6 +199,41 @@ type ToolKind = "read" | "edit" | "delete" | "move" | "search" | "execute" | "th
 5. **Permissions.** An agent asking before a tool call creates a `permission` request and the run is `waiting` while the agent waits (the step does not end). `requests.approve` lets the tool run; `requests.deny` tells the agent no and the step goes on. Requests still pending when the agent's turn ends, the run is cancelled or the daemon restarts become `cancelled`. With `--auto-approve-permissions` no request is created and a `log` event records each allowed call.
 6. **Budget.** Before each agent step, a run whose `costUsd` exceeds `budgetUsd` pauses on a `budget` request. Approving raises `budgetUsd` to `costUsd + budget.max_usd_per_run`; denying fails the run.
 
+7. **Agent bus.** Agents talk to each other and to the human through the `agentux` MCP server; see [Agent bus](#agent-bus).
+
 ### Crash safety
 
 Every transition is committed to SQLite before the side effect it leads to, and each step attempt is recorded as `running` before it starts. If the daemon stops mid-step, on restart that attempt is marked `interrupted` and the step runs again from the run's last committed state, in a new harness session (the old sessions are marked `ended`); runs waiting for approval keep waiting. Steps must therefore be idempotent: the worktree is reused if it exists, checks are re-run, and harness adapters must tolerate a repeated prompt and find an existing pull request instead of opening a second one. `runs.cancel` commits first, then stops the step (killing a running check).
+
+## Agent bus
+
+Each active run has its own agent bus ([`agentux-bus`](../crates/agentux-bus), ADR 0004), opened when its first session starts, with the `bus` section, roles and review step of the run's `agentux.yaml`, and closed when the run ends. Everything on it is a `bus_message` event and is returned by `bus.list`.
+
+**Sessions.** Every harness session the daemon starts joins its run's bus with an identity (run, project, role, harness as vendor, session id) and gets, in ACP `session/new`, one stdio MCP server:
+
+```text
+name: agentux
+command: <aux>             # this process if it is `aux daemon`, else the `aux` next to `agentuxd`, else `aux` from PATH
+args: bus-stdio --socket <the daemon's socket> --session-token <token>
+```
+
+Its first prompt starts with the session prompt from `agentux-bus` (its role and run, the tools it may call, the turn limit, the etiquette), then `---`, then the step's prompt.
+
+**Session tokens.** 32 random bytes from `/dev/urandom`, hex-encoded, one per session, kept only in the daemon's memory. A token stands for exactly one session: the daemon takes the caller's identity from the token, never from the request, so a session cannot act as another one or reach another run. A token stops working when its session ends, when the run ends, and when the daemon restarts (sessions do not survive a restart). The socket's `0600` mode remains the outer boundary: tokens appear in the harness's command line, which other local users can read, but only the daemon's user can connect.
+
+**The bridge.** `aux bus-stdio` serves the MCP server over its stdio and forwards each tool call to the daemon:
+
+1. At startup, `bus.hello { sessionToken }` returns `{ identity, allowedTools, maxTurnsPerExchange }` (the MCP server lists only the allowed tools and builds its `instructions` from them), or error `-32004`.
+2. Each tool call is `bus.call { sessionToken, call: { tool, arguments } }`. The result is `{ "ok": <tool result> }` or `{ "err": <refusal> }`: refusals (turn limit, unknown role, ...) are results the agent reads as tool errors, not JSON-RPC errors. `tool` and `arguments` are the MCP tool name and arguments, snake_case as agents see them.
+
+Requests on one connection are answered in order, and `ask_human` keeps its call open for up to two minutes, so **the bridge opens one connection per call** (connect, one request, one response, close). Calls in flight at the same time never wait for each other, and the daemon needs no out-of-order responses. A connect per tool call costs little on a local socket.
+
+**Wakes.** A message to a session or role wakes its recipients (messages to `run` do not): the daemon sends the bus's wake prompt (`[agentux bus] New message from ...`) to the session through ACP. A session in the middle of a turn (a step or another wake) gets it after that turn. A message to a role nobody plays yet is queued for the role, and the daemon starts the role's session (the role's harness and model, in the run's worktree) unless the run has ended or has no worktree yet; the new session finds the message in its mailbox. That session is then the role's session for later steps too. A wake turn's events are `session_event`s like a step's; its permission requests are `permission` requests of the run's current step. Wakes that cannot be delivered are logged (`log` event, `bus: ...`).
+
+**Turn limits.** Each message uses one turn of its exchange (a message and its replies). Once an exchange has used `bus.max_turns_per_exchange` turns, further posts in it are refused with a `turn_limit` entry, so they wake nobody: two agents cannot ping-pong past the limit. The human is never cut off.
+
+**Questions.** `ask_human` creates a `question` request (title `<role> (<harness>) asks: <question>`, detail with context and options, `options`, `sessionId`) and a `question` bus entry with its `requestId`. It does not pause the run. `requests.approve { requestId, answer }` answers it (free text or one of the options; an empty answer is `-32602`); `requests.deny` tells the agent the human declined. The agent's tool call waits up to two minutes; an answer after that arrives as a `human_answer` message in its mailbox, with a wake. Questions still pending when the run ends or the daemon restarts are cancelled.
+
+**Restarts.** The log is in the event store, so `bus.list` and `events.subscribe { since: 0 }` return it after a restart. Mailboxes, queued messages and exchange turn counts live in memory and are lost with the sessions; a reopened run's bus continues message, exchange and question ids after the highest ones in its log.
+
+**Models.** A role's `model` is selected over ACP when the harness offers it: ACP has no model field in `session/new`, but agents that let clients pick one list a session config option of category `model`; the daemon sets it with `session/set_config_option` (matching the option's value or name). When the harness offers no such option or not that model, the session starts with its default and gets a `system` message saying so.

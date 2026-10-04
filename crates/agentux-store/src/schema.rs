@@ -109,6 +109,10 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX sessions_by_run ON sessions (run_id);
     ",
+    // 3: suggested answers of `question` requests (agent bus `ask_human`).
+    "
+    ALTER TABLE requests ADD COLUMN options TEXT NOT NULL DEFAULT '[]';
+    ",
 ];
 
 /// The schema version this build writes.

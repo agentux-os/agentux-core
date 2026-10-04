@@ -23,6 +23,11 @@ pub mod method {
     pub const REQUESTS_APPROVE: &str = "requests.approve";
     pub const REQUESTS_DENY: &str = "requests.deny";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
+    pub const BUS_LIST: &str = "bus.list";
+    /// Used by `aux bus-stdio` (the bus bridge), not by the cockpit.
+    pub const BUS_HELLO: &str = "bus.hello";
+    /// Used by `aux bus-stdio` (the bus bridge), not by the cockpit.
+    pub const BUS_CALL: &str = "bus.call";
     /// Server-to-client notification carrying one [`crate::Event`].
     pub const EVENT: &str = "event";
 }
@@ -41,6 +46,9 @@ pub mod code {
     pub const CONFLICT: i64 = -32002;
     /// The project directory or its `agentux.yaml` is unusable.
     pub const INVALID_PROJECT: i64 = -32003;
+    /// A bus bridge request with an unknown session token, or the token of a
+    /// session that has ended.
+    pub const UNAUTHORIZED: i64 = -32004;
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -195,6 +203,12 @@ pub struct Subscribe {
     /// receive only new events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListBus {
+    pub run_id: String,
 }
 
 /// Result of `events.subscribe`.

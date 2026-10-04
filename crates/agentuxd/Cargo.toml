@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 agentux-api.workspace = true
+agentux-bus.workspace = true
 agentux-config.workspace = true
 agentux-harness.workspace = true
 agentux-store.workspace = true
