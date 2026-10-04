@@ -1,24 +1,21 @@
 [package]
-name = "aux-cli"
-description = "aux, the AgentUX command-line interface"
+name = "agentuxd"
+description = "The AgentUX daemon: runs pipelines and serves the local API"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[[bin]]
-name = "aux"
-path = "src/main.rs"
-
 [dependencies]
 agentux-api.workspace = true
 agentux-config.workspace = true
-agentux-harness.workspace = true
+agentux-store.workspace = true
 agentux-worktree.workspace = true
-agentuxd.workspace = true
 clap.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
 tempfile.workspace = true

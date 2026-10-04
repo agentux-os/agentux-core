@@ -135,17 +135,6 @@ fn validate_fails_on_a_missing_file() {
 }
 
 #[test]
-fn run_is_not_implemented_yet() {
-    let output = aux(&["run", "issue-42"]);
-    assert!(!output.status.success());
-    assert!(
-        stderr(&output).contains("not implemented yet"),
-        "{}",
-        stderr(&output)
-    );
-}
-
-#[test]
 fn exec_rejects_unknown_harnesses() {
     let output = aux(&["exec", "--harness", "nope", "hello"]);
     assert!(!output.status.success());
