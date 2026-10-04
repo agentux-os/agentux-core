@@ -12,6 +12,10 @@
 [Unit]
 Description=AgentUX daemon
 Documentation=https://github.com/agentux-os/agentux-core
+# Enabled globally, the unit would also start in the user managers of system
+# users that get a session, like Fedora's plasma-setup (the first-boot
+# wizard). The daemon is for people only.
+ConditionUser=!@system
 
 [Service]
 Type=exec
