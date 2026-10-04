@@ -16,6 +16,7 @@ tokio-util = { workspace = true, features = ["compat"] }
 rustix = { version = "1", default-features = false, features = ["std", "process"] }
 
 [dev-dependencies]
+agentux-fake-agent.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "rt-multi-thread"] }
 

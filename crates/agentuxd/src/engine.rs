@@ -8,6 +8,12 @@
 //! afterwards, so after a crash the daemon finds the run exactly where its
 //! last commit left it and runs the interrupted step again. Steps are
 //! therefore required to be idempotent (see [`StepExecutor`]).
+//!
+//! While an agent step runs, the executor reports sessions and their events
+//! through a [`StepHost`] the engine hands it, and asks it before tool calls.
+//! Such a permission request pauses the run (`waiting`) without leaving the
+//! step: the agent waits for the answer. After implement and custom steps the
+//! daemon commits whatever changed in the worktree.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,15 +23,18 @@ use std::{fmt, fs, io};
 
 use agentux_api::rpc::StartRun;
 use agentux_api::{
-    AttemptStatus, CheckResult, CheckStatus, PermissionRequest, Project, RequestKind,
-    RequestStatus, Run, RunStatus, StepAttempt, StepKind,
+    AttemptStatus, CheckResult, CheckStatus, EventBody, PermissionRequest, Project, RequestKind,
+    RequestStatus, Run, RunStatus, Session, SessionEvent, SessionState, StepAttempt, StepKind,
 };
 use agentux_config::{Config, FILE_NAME, Loop, Step};
 use agentux_store::{NewRequest, Phase, RunRecord, Store, Tx, new_id, now_ms};
 use agentux_worktree::Worktrees;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-use crate::executor::{AgentOutcome, AgentTask, PullRequestTask, StepExecutor};
+use crate::executor::{
+    AgentOutcome, AgentTask, BoxFuture, PullRequestOutcome, PullRequestTask, StepExecutor, StepHost,
+};
 
 /// Keep at most this much of each check's output.
 const MAX_CHECK_OUTPUT: usize = 8 * 1024;
@@ -62,6 +71,14 @@ impl From<agentux_store::Error> for Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// Engine behavior chosen when the daemon starts.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Settings {
+    /// Allow every tool call agents ask about, without asking the human.
+    /// Dangerous: agents can then run any command in the worktree.
+    pub auto_approve_permissions: bool,
+}
+
 /// Owns the store, the executor and one driver task per active run. Cheap to
 /// clone.
 #[derive(Clone)]
@@ -72,17 +89,30 @@ pub struct Engine {
 struct Inner {
     store: Store,
     executor: Arc<dyn StepExecutor>,
+    settings: Settings,
     /// Driver task per run. A run has at most one.
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
+    /// Agents waiting for the answer to a permission request, by request id.
+    waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
 }
 
 impl Engine {
     pub fn new(store: Store, executor: Arc<dyn StepExecutor>) -> Self {
+        Self::with_settings(store, executor, Settings::default())
+    }
+
+    pub fn with_settings(
+        store: Store,
+        executor: Arc<dyn StepExecutor>,
+        settings: Settings,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
                 executor,
+                settings,
                 tasks: Mutex::new(HashMap::new()),
+                waiters: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -93,7 +123,9 @@ impl Engine {
 
     /// Picks up every unfinished run after a (re)start. Attempts left
     /// `running` by a previous process are marked `interrupted`; their step
-    /// runs again. Returns how many runs were resumed.
+    /// runs again. The previous process's sessions are gone, so their
+    /// permission requests are cancelled and the sessions marked ended.
+    /// Returns how many runs were resumed.
     pub fn resume(&self) -> Result<usize> {
         let ids = self.inner.store.write(|tx| {
             let ids = tx.active_run_ids()?;
@@ -113,6 +145,23 @@ impl Engine {
                             ),
                         )?;
                     }
+                }
+                for request in tx.requests(Some(id), Some(RequestStatus::Pending))? {
+                    if request.kind == RequestKind::Permission {
+                        tx.resolve_request(
+                            &request.id,
+                            RequestStatus::Cancelled,
+                            Some("agentuxd restarted; the session that asked is gone"),
+                        )?;
+                    }
+                }
+                end_sessions(tx, id)?;
+                if let Some(mut record) = tx.run(id)?
+                    && record.run.status == RunStatus::Waiting
+                    && record.phase != Phase::Approval
+                {
+                    record.run.status = RunStatus::Running;
+                    tx.save_run(&mut record)?;
                 }
             }
             Ok::<_, Error>(ids)
@@ -239,11 +288,14 @@ impl Engine {
                 pull_request: None,
                 activity: "creating the worktree".into(),
                 error: None,
+                cost_usd: 0.0,
+                sessions: Default::default(),
             },
             phase: Phase::Setup,
             loops: Default::default(),
             feedback: None,
             config_yaml: yaml,
+            base_commit: None,
         };
         self.inner.store.write(|tx| tx.insert_run(&record))?;
         self.spawn(&record.run.id);
@@ -271,21 +323,52 @@ impl Engine {
         Ok(self.inner.store.read(|tx| tx.requests(None, status))?)
     }
 
-    /// Approves a pending request and resumes its run.
+    /// Sessions, oldest first, optionally only those of one run.
+    pub fn sessions(&self, run_id: Option<&str>) -> Result<Vec<Session>> {
+        Ok(self.inner.store.read(|tx| tx.sessions(run_id))?)
+    }
+
+    fn request_kind(&self, request_id: &str) -> Result<RequestKind> {
+        self.inner
+            .store
+            .read(|tx| tx.request(request_id))?
+            .map(|r| r.kind)
+            .ok_or_else(|| Error::NotFound(format!("no request {request_id}")))
+    }
+
+    /// Approves a pending request. An agent waiting for permission gets to
+    /// run its tool call; a paused run resumes.
     pub fn approve(&self, request_id: &str, answer: Option<&str>) -> Result<PermissionRequest> {
+        if self.request_kind(request_id)? == RequestKind::Permission {
+            return self.answer_permission(request_id, true, answer);
+        }
         let request = self.inner.store.write(|tx| {
             let (request, mut record) = pending_request(tx, request_id)?;
             let config = config_of(&record, &project_root(tx, &record)?)?;
             let request = tx.resolve_request(&request.id, RequestStatus::Approved, answer)?;
             record.run.status = RunStatus::Running;
-            match config.pipeline.get(request.step_index) {
-                // Steps that ask before acting now get to act.
-                Some(Step::PullRequest { .. }) => {
-                    record.phase = Phase::Approved;
-                    record.run.activity = "approved; opening the pull request".into();
+            if request.kind == RequestKind::Budget {
+                // Another round of the configured budget; the step that was
+                // about to start runs.
+                let raise = config
+                    .budget
+                    .max_usd_per_run
+                    .or(record.run.budget_usd)
+                    .unwrap_or(0.0);
+                let budget = record.run.cost_usd + raise;
+                record.run.budget_usd = Some(budget);
+                record.phase = Phase::Step;
+                record.run.activity = format!("budget raised to ${budget:.2}; continuing");
+            } else {
+                match config.pipeline.get(request.step_index) {
+                    // Steps that ask before acting now get to act.
+                    Some(Step::PullRequest { .. }) => {
+                        record.phase = Phase::Approved;
+                        record.run.activity = "approved; opening the pull request".into();
+                    }
+                    // Steps that ask after acting are done.
+                    _ => advance(&mut record),
                 }
-                // Steps that ask after acting are done.
-                _ => advance(&mut record),
             }
             tx.save_run(&mut record)?;
             Ok::<_, Error>(request)
@@ -294,24 +377,207 @@ impl Engine {
         Ok(request)
     }
 
-    /// Denies a pending request; the run fails.
+    /// Denies a pending request. An agent asking for permission is told no
+    /// and carries on; any other denial fails the run.
     pub fn deny(&self, request_id: &str, answer: Option<&str>) -> Result<PermissionRequest> {
-        self.inner.store.write(|tx| {
+        if self.request_kind(request_id)? == RequestKind::Permission {
+            return self.answer_permission(request_id, false, answer);
+        }
+        let (request, run_id) = self.inner.store.write(|tx| {
             let (request, mut record) = pending_request(tx, request_id)?;
             let request = tx.resolve_request(&request.id, RequestStatus::Denied, answer)?;
+            let what = if request.kind == RequestKind::Budget {
+                format!(
+                    "over budget (${:.2} spent, budget ${:.2}) and going on",
+                    record.run.cost_usd,
+                    record.run.budget_usd.unwrap_or(0.0)
+                )
+            } else {
+                request.step.to_string()
+            };
             let reason = match answer {
-                Some(answer) => format!("{} not approved: {answer}", request.step),
-                None => format!("{} not approved", request.step),
+                Some(answer) => format!("{what} not approved: {answer}"),
+                None => format!("{what} not approved"),
             };
             fail(&mut record, reason);
+            end_sessions(tx, &record.run.id)?;
             tx.save_run(&mut record)?;
+            Ok::<_, Error>((request, record.run.id))
+        })?;
+        self.release(&run_id);
+        Ok(request)
+    }
+
+    /// Records the answer to a permission request and passes it to the agent.
+    fn answer_permission(
+        &self,
+        request_id: &str,
+        allow: bool,
+        answer: Option<&str>,
+    ) -> Result<PermissionRequest> {
+        let request = self.inner.store.write(|tx| {
+            let request = tx
+                .request(request_id)?
+                .ok_or_else(|| Error::NotFound(format!("no request {request_id}")))?;
+            if request.status != RequestStatus::Pending {
+                return Err(Error::Conflict(format!(
+                    "request {request_id} is already {}",
+                    request.status
+                )));
+            }
+            let status = if allow {
+                RequestStatus::Approved
+            } else {
+                RequestStatus::Denied
+            };
+            let request = tx.resolve_request(request_id, status, answer)?;
+            if !allow {
+                tx.log(
+                    &request.run_id,
+                    format!(
+                        "permission denied: {}; the agent was told no",
+                        request.title
+                    ),
+                )?;
+            }
+            resume_after_permission(tx, &request.run_id, request.session_id.as_deref())?;
             Ok(request)
+        })?;
+        if let Some(waiter) = self.waiters().remove(&request.id) {
+            let _ = waiter.send(allow);
+        }
+        Ok(request)
+    }
+
+    /// Creates a permission request for the agent of `host`'s step and
+    /// returns a future that resolves with the human's answer.
+    fn ask_permission(
+        &self,
+        host: &RunHost,
+        session_id: &str,
+        title: String,
+        detail: String,
+    ) -> BoxFuture<'static, bool> {
+        if self.inner.settings.auto_approve_permissions {
+            let logged = self.inner.store.write(|tx| {
+                tx.log(
+                    &host.run_id,
+                    format!("permission auto-approved (--auto-approve-permissions): {title}"),
+                )
+            });
+            if let Err(e) = logged {
+                eprintln!("agentuxd: run {}: {e}", host.run_id);
+            }
+            return Box::pin(async { true });
+        }
+        let (answer, answered) = oneshot::channel();
+        // Held until the waiter is registered, so an answer committed in
+        // between finds it.
+        let mut waiters = self.waiters();
+        let created = self.inner.store.write(|tx| {
+            let Some(mut record) = tx.run(&host.run_id)? else {
+                return Ok(None);
+            };
+            if record.run.status.is_terminal() {
+                return Ok(None);
+            }
+            let request = tx.create_request(NewRequest {
+                kind: RequestKind::Permission,
+                run_id: host.run_id.clone(),
+                project_id: host.project_id.clone(),
+                step_index: host.step_index,
+                step: host.step,
+                title,
+                detail,
+                session_id: Some(session_id.to_string()),
+            })?;
+            tx.emit(
+                Some(&host.run_id),
+                EventBody::SessionEvent {
+                    session_id: session_id.to_string(),
+                    event: SessionEvent::Permission {
+                        request_id: request.id.clone(),
+                    },
+                },
+            )?;
+            set_session_state(tx, session_id, SessionState::Waiting)?;
+            record.run.status = RunStatus::Waiting;
+            record.run.activity =
+                format!("waiting for permission ({}): {}", request.id, request.title);
+            tx.save_run(&mut record)?;
+            Ok::<_, Error>(Some(request.id))
+        });
+        let id = match created {
+            Ok(Some(id)) => id,
+            Ok(None) => return Box::pin(async { false }),
+            Err(e) => {
+                eprintln!(
+                    "agentuxd: run {}: cannot record a permission request: {e}",
+                    host.run_id
+                );
+                return Box::pin(async { false });
+            }
+        };
+        waiters.insert(id.clone(), answer);
+        drop(waiters);
+        let mut pending = PendingPermission {
+            engine: self.clone(),
+            request_id: Some(id),
+        };
+        Box::pin(async move {
+            // A dropped sender (cancelled run) is a refusal.
+            let allow = answered.await.unwrap_or(false);
+            pending.answered();
+            allow
         })
+    }
+
+    /// Cancels pending permission requests of a run (or just `only`): the
+    /// agent stopped waiting, or its step ended.
+    fn withdraw_permissions(&self, run_id: &str, only: Option<&str>) {
+        let withdrawn = self.inner.store.write(|tx| {
+            let mut ids = Vec::new();
+            for request in tx.requests(Some(run_id), Some(RequestStatus::Pending))? {
+                if request.kind != RequestKind::Permission
+                    || only.is_some_and(|id| id != request.id)
+                {
+                    continue;
+                }
+                tx.resolve_request(
+                    &request.id,
+                    RequestStatus::Cancelled,
+                    Some("withdrawn: the agent stopped waiting"),
+                )?;
+                resume_after_permission(tx, run_id, request.session_id.as_deref())?;
+                ids.push(request.id);
+            }
+            Ok::<_, Error>(ids)
+        });
+        match withdrawn {
+            Ok(ids) => {
+                let mut waiters = self.waiters();
+                for id in ids {
+                    waiters.remove(&id);
+                }
+            }
+            Err(e) => eprintln!("agentuxd: run {run_id}: cannot withdraw permission requests: {e}"),
+        }
+    }
+
+    fn waiters(&self) -> MutexGuard<'_, HashMap<String, oneshot::Sender<bool>>> {
+        self.inner.waiters.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lets the executor stop what it keeps for a finished run.
+    fn release(&self, run_id: &str) {
+        let executor = Arc::clone(&self.inner.executor);
+        let run_id = run_id.to_string();
+        tokio::spawn(async move { executor.release(&run_id).await });
     }
 
     /// Cancels a run that has not finished. Its worktree and branch are kept.
     pub fn cancel(&self, run_id: &str) -> Result<Run> {
-        let run = self.inner.store.write(|tx| {
+        let (run, cancelled) = self.inner.store.write(|tx| {
             let mut record = tx
                 .run(run_id)?
                 .ok_or_else(|| Error::NotFound(format!("no run {run_id}")))?;
@@ -321,25 +587,36 @@ impl Engine {
                     record.run.status
                 )));
             }
+            let mut cancelled = Vec::new();
             for request in tx.requests(Some(run_id), Some(RequestStatus::Pending))? {
                 tx.resolve_request(&request.id, RequestStatus::Cancelled, None)?;
+                cancelled.push(request.id);
             }
             for attempt in tx.attempts(run_id)? {
                 if attempt.status == AttemptStatus::Running {
                     tx.finish_attempt(attempt.id, AttemptStatus::Cancelled, None)?;
                 }
             }
+            end_sessions(tx, run_id)?;
             record.run.status = RunStatus::Cancelled;
             record.run.finished_at = Some(now_ms());
             record.run.activity = "cancelled".into();
             tx.save_run(&mut record)?;
-            Ok(record.run)
+            Ok((record.run, cancelled))
         })?;
         // The cancellation is committed first; aborting the driver also kills
-        // a running check (`kill_on_drop`).
+        // a running check (`kill_on_drop`). Agents waiting for permission get
+        // a refusal as their waiters are dropped.
         if let Some(task) = self.tasks().remove(run_id) {
             task.abort();
         }
+        {
+            let mut waiters = self.waiters();
+            for id in &cancelled {
+                waiters.remove(id);
+            }
+        }
+        self.release(run_id);
         Ok(run)
     }
 
@@ -385,15 +662,23 @@ impl Engine {
             // committed meanwhile either is seen here or finds no driver and
             // spawns a new one.
             let mut tasks = self.tasks();
-            let running = self
+            let status = self
                 .inner
                 .store
                 .read(|tx| tx.run(&run_id))
                 .ok()
                 .flatten()
-                .is_some_and(|r| r.run.status == RunStatus::Running);
-            if !running {
+                .map(|r| r.run.status);
+            if status != Some(RunStatus::Running) {
                 tasks.remove(&run_id);
+                drop(tasks);
+                if status.is_none_or(RunStatus::is_terminal) {
+                    let ended = self.inner.store.write(|tx| end_sessions(tx, &run_id));
+                    if let Err(e) = ended {
+                        eprintln!("agentuxd: run {run_id}: cannot end its sessions: {e}");
+                    }
+                    self.release(&run_id);
+                }
                 return;
             }
         }
@@ -470,8 +755,20 @@ impl Engine {
         .await
         .map_err(|e| Error::Internal(e.to_string()))?
         .map_err(|e| Error::Internal(format!("cannot create the run's worktree: {e}")))?;
+        // What reviewers diff against. The worktree is fresh here (or reused
+        // from an interrupted setup, before any step changed it).
+        let base = match record.base_commit {
+            Some(_) => None,
+            None => git(&worktree.path, &["rev-parse", "HEAD"])
+                .await
+                .ok()
+                .map(|sha| sha.trim().to_string()),
+        };
 
         let done = self.transition(&run_id, |tx, record| {
+            if base.is_some() {
+                record.base_commit = base.clone();
+            }
             let path = worktree.path.to_string_lossy().into_owned();
             tx.log(
                 &run_id,
@@ -503,24 +800,53 @@ impl Engine {
         };
         let role = &config.roles[role_name];
 
-        let Some((attempt, number, plan)) = self.transition(&run_id, |tx, record| {
-            let attempts = tx.attempts(&run_id)?;
-            let number = attempts.iter().filter(|a| a.step_index == index).count() as u32 + 1;
-            let plan = attempts
-                .iter()
-                .rev()
-                .find(|a| a.step == StepKind::Plan && a.status == AttemptStatus::Succeeded)
-                .and_then(|a| a.output.clone());
-            let attempt = tx.start_attempt(&run_id, index, kind)?;
-            record.run.activity = format!("{kind}: {role_name} ({}) is working", role.harness);
-            Ok((attempt, number, plan))
-        })?
+        // Spending is checked between agent steps: a run over its budget
+        // pauses before the next agent starts.
+        if let Some(budget) = record.run.budget_usd
+            && record.run.cost_usd > budget
+        {
+            let raise = config.budget.max_usd_per_run.unwrap_or(budget);
+            let done = self.transition(&run_id, |tx, record| {
+                let detail = format!(
+                    "The run has cost ${:.2}, more than its budget of ${budget:.2}. \
+                     Approve to continue with another ${raise:.2}; deny to stop the run.",
+                    record.run.cost_usd
+                );
+                ask(tx, record, RequestKind::Budget, detail)
+            })?;
+            return Ok(done.is_some());
+        }
+
+        let Some((attempt, number, plan, feedback_from)) =
+            self.transition(&run_id, |tx, record| {
+                let attempts = tx.attempts(&run_id)?;
+                let number = attempts.iter().filter(|a| a.step_index == index).count() as u32 + 1;
+                let plan = latest_output(&attempts, StepKind::Plan);
+                // The gate or review that sent the run back here.
+                let feedback_from = record.feedback.as_ref().and_then(|_| {
+                    attempts
+                        .iter()
+                        .rev()
+                        .find(|a| {
+                            matches!(
+                                a.status,
+                                AttemptStatus::Failed | AttemptStatus::ChangesRequested
+                            )
+                        })
+                        .map(|a| a.step)
+                });
+                let attempt = tx.start_attempt(&run_id, index, kind)?;
+                record.run.activity = format!("{kind}: {role_name} ({}) is working", role.harness);
+                Ok((attempt, number, plan, feedback_from))
+            })?
         else {
             return Ok(false);
         };
 
+        let worktree = worktree_of(&record)?;
         let task = AgentTask {
             run_id: run_id.clone(),
+            title: record.run.title.clone(),
             step_index: index,
             step: kind,
             role: role_name.clone(),
@@ -531,10 +857,36 @@ impl Engine {
             instructions,
             plan,
             feedback: record.feedback.clone(),
-            worktree: worktree_of(&record)?,
+            feedback_from,
+            branch: record.run.branch.clone(),
+            base_commit: record.base_commit.clone(),
+            worktree: worktree.clone(),
             attempt: number,
         };
-        let outcome = self.inner.executor.run_agent(&task).await;
+        let host = Arc::new(RunHost {
+            engine: self.clone(),
+            run_id: run_id.clone(),
+            project_id: record.run.project_id.clone(),
+            role: role_name.clone(),
+            step_index: index,
+            step: kind,
+            cwd: worktree.to_string_lossy().into_owned(),
+        });
+        let outcome = self.inner.executor.run_agent(&task, host).await;
+        // Questions the agent left open die with its turn.
+        self.withdraw_permissions(&run_id, None);
+        // Implementers (and custom steps) edit; the daemon commits. Planners
+        // and reviewers are not meant to change files: what they leave behind
+        // (e.g. caches from running tests) is not committed under their name.
+        let commits = matches!(kind, StepKind::Implement | StepKind::Custom);
+        let (outcome, commit) = match outcome {
+            Ok(outcome) if !commits => (Ok(outcome), None),
+            Ok(outcome) => match commit_changes(&task).await {
+                Ok(commit) => (Ok(outcome), commit),
+                Err(e) => (Err(format!("cannot commit the agent's changes: {e}")), None),
+            },
+            Err(e) => (Err(e), None),
+        };
 
         let changes_loop = match step {
             Step::Review {
@@ -544,6 +896,9 @@ impl Engine {
             _ => None,
         };
         let done = self.transition(&run_id, |tx, record| {
+            if let Some(commit) = &commit {
+                tx.log(&run_id, format!("committed {commit}"))?;
+            }
             if kind == StepKind::Review {
                 let round = record.loops.get(&index).copied().unwrap_or(0) + 1;
                 record.loops.insert(index, round);
@@ -724,18 +1079,31 @@ impl Engine {
         else {
             return Ok(false);
         };
+        let attempts = self.inner.store.read(|tx| tx.attempts(&run_id))?;
         let task = PullRequestTask {
             run_id: run_id.clone(),
             title: record.run.title.clone(),
             branch: record.run.branch.clone().unwrap_or_default(),
             worktree: worktree_of(&record)?,
             draft,
+            prompt: record.run.prompt.clone(),
             issue: record.run.issue,
+            plan: latest_output(&attempts, StepKind::Plan),
+            review: latest_output(&attempts, StepKind::Review),
         };
         let result = self.inner.executor.open_pull_request(&task).await;
         let done = self.transition(&run_id, |tx, record| {
             match result {
-                Ok(pr) => {
+                Ok(PullRequestOutcome::Skipped(reason)) => {
+                    let note = format!("PR skipped: {reason}");
+                    tx.finish_attempt(attempt.id, AttemptStatus::Succeeded, Some(&note))?;
+                    tx.log(
+                        &run_id,
+                        format!("{note}; the branch {} is kept", task.branch),
+                    )?;
+                    advance(record);
+                }
+                Ok(PullRequestOutcome::Opened(pr)) => {
                     tx.finish_attempt(attempt.id, AttemptStatus::Succeeded, Some(&pr.url))?;
                     tx.log(&run_id, format!("pull request #{} {}", pr.number, pr.url))?;
                     record.run.pull_request = Some(pr);
@@ -787,6 +1155,8 @@ fn ask(tx: &mut Tx<'_>, record: &mut RunRecord, kind: RequestKind, detail: Strin
     let title = match kind {
         RequestKind::Plan => format!("Approve the plan for \"{}\"", record.run.title),
         RequestKind::Step => format!("Approve the {step} step of \"{}\"", record.run.title),
+        RequestKind::Budget => format!("\"{}\" is over its budget", record.run.title),
+        RequestKind::Permission => format!("Permission for \"{}\"", record.run.title),
     };
     let request = tx.create_request(NewRequest {
         kind,
@@ -796,6 +1166,7 @@ fn ask(tx: &mut Tx<'_>, record: &mut RunRecord, kind: RequestKind, detail: Strin
         step,
         title,
         detail,
+        session_id: None,
     })?;
     record.run.status = RunStatus::Waiting;
     record.phase = Phase::Approval;
@@ -899,10 +1270,288 @@ fn first_limit(config: &Config, kind: StepKind) -> u32 {
 }
 
 fn first_line(text: &str) -> String {
+    cut_line(text, 80)
+}
+
+/// The first line of `text`, cut to `max` characters.
+fn cut_line(text: &str, max: usize) -> String {
     let line = text.trim().lines().next().unwrap_or_default();
-    match line.char_indices().nth(80) {
+    match line.char_indices().nth(max) {
         Some((i, _)) => format!("{}…", &line[..i]),
         None => line.to_string(),
+    }
+}
+
+/// Output of the most recent successful attempt of a step kind.
+fn latest_output(attempts: &[StepAttempt], kind: StepKind) -> Option<String> {
+    attempts
+        .iter()
+        .rev()
+        .find(|a| a.step == kind && a.status == AttemptStatus::Succeeded)
+        .and_then(|a| a.output.clone())
+}
+
+// ---- agent steps: the host, permissions, sessions and commits ----
+
+/// The engine's side of one agent step, handed to the executor.
+struct RunHost {
+    engine: Engine,
+    run_id: String,
+    project_id: String,
+    role: String,
+    step_index: usize,
+    step: StepKind,
+    cwd: String,
+}
+
+impl RunHost {
+    fn record(&self, what: &str, f: impl FnOnce(&mut Tx<'_>) -> Result<()>) {
+        if let Err(e) = self.engine.inner.store.write(f) {
+            eprintln!("agentuxd: run {}: cannot record {what}: {e}", self.run_id);
+        }
+    }
+}
+
+impl StepHost for RunHost {
+    fn open_session(
+        &self,
+        harness: &str,
+        model: Option<&str>,
+    ) -> std::result::Result<String, String> {
+        let now = now_ms();
+        let session = Session {
+            id: new_id(),
+            run_id: self.run_id.clone(),
+            project_id: self.project_id.clone(),
+            role: self.role.clone(),
+            harness: harness.to_string(),
+            model: model.map(str::to_string),
+            state: SessionState::Active,
+            cwd: self.cwd.clone(),
+            usage: Default::default(),
+            started_at: now,
+            updated_at: now,
+            ended_at: None,
+        };
+        self.engine
+            .inner
+            .store
+            .write(|tx| {
+                tx.insert_session(&session)?;
+                if let Some(mut record) = tx.run(&self.run_id)? {
+                    record
+                        .run
+                        .sessions
+                        .insert(self.role.clone(), session.id.clone());
+                    tx.save_run(&mut record)?;
+                }
+                Ok::<_, Error>(())
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(session.id)
+    }
+
+    fn session_state(&self, session_id: &str, state: SessionState) {
+        self.record("a session state", |tx| {
+            set_session_state(tx, session_id, state)
+        });
+    }
+
+    fn session_event(&self, session_id: &str, event: SessionEvent) {
+        self.record("a session event", |tx| {
+            if let SessionEvent::Usage { usage } = &event
+                && let Some(mut session) = tx.session(session_id)?
+            {
+                session.usage = usage.clone();
+                tx.save_session(&mut session)?;
+                if let Some(mut record) = tx.run(&self.run_id)? {
+                    // Harnesses report each session's cumulative cost.
+                    let cost: f64 = tx
+                        .sessions(Some(&self.run_id))?
+                        .iter()
+                        .filter_map(|s| s.usage.cost_usd)
+                        .sum();
+                    if cost != record.run.cost_usd {
+                        record.run.cost_usd = cost;
+                        tx.save_run(&mut record)?;
+                    }
+                }
+            }
+            tx.emit(
+                Some(&self.run_id),
+                EventBody::SessionEvent {
+                    session_id: session_id.to_string(),
+                    event,
+                },
+            )?;
+            Ok(())
+        });
+    }
+
+    fn ask_permission(
+        &self,
+        session_id: &str,
+        title: String,
+        detail: String,
+    ) -> BoxFuture<'static, bool> {
+        self.engine.ask_permission(self, session_id, title, detail)
+    }
+}
+
+/// Withdraws its permission request if the agent stops waiting before the
+/// answer.
+struct PendingPermission {
+    engine: Engine,
+    request_id: Option<String>,
+}
+
+impl PendingPermission {
+    fn answered(&mut self) {
+        self.request_id = None;
+    }
+}
+
+impl Drop for PendingPermission {
+    fn drop(&mut self) {
+        if let Some(id) = self.request_id.take() {
+            let run_id = self
+                .engine
+                .inner
+                .store
+                .read(|tx| tx.request(&id))
+                .ok()
+                .flatten()
+                .map(|r| r.run_id);
+            if let Some(run_id) = run_id {
+                self.engine.withdraw_permissions(&run_id, Some(&id));
+            }
+        }
+    }
+}
+
+/// After a permission request is resolved: the session works again, and the
+/// run runs again once nothing else is pending.
+fn resume_after_permission(tx: &mut Tx<'_>, run_id: &str, session_id: Option<&str>) -> Result<()> {
+    let pending = tx.requests(Some(run_id), Some(RequestStatus::Pending))?;
+    if let Some(session_id) = session_id
+        && !pending
+            .iter()
+            .any(|r| r.session_id.as_deref() == Some(session_id))
+        && tx
+            .session(session_id)?
+            .is_some_and(|s| s.state == SessionState::Waiting)
+    {
+        set_session_state(tx, session_id, SessionState::Active)?;
+    }
+    if let Some(mut record) = tx.run(run_id)?
+        && record.run.status == RunStatus::Waiting
+        && record.phase == Phase::Step
+        && pending.is_empty()
+    {
+        record.run.status = RunStatus::Running;
+        record.run.activity = format!("{}: the agent is working", record.run.step);
+        tx.save_run(&mut record)?;
+    }
+    Ok(())
+}
+
+fn set_session_state(tx: &mut Tx<'_>, session_id: &str, state: SessionState) -> Result<()> {
+    if let Some(mut session) = tx.session(session_id)?
+        && session.state != state
+        && session.state != SessionState::Ended
+    {
+        session.state = state;
+        if state == SessionState::Ended {
+            session.ended_at = Some(now_ms());
+        }
+        tx.save_session(&mut session)?;
+    }
+    Ok(())
+}
+
+/// Marks every session of a run ended.
+fn end_sessions(tx: &mut Tx<'_>, run_id: &str) -> Result<()> {
+    for session in tx.sessions(Some(run_id))? {
+        set_session_state(tx, &session.id, SessionState::Ended)?;
+    }
+    Ok(())
+}
+
+/// Commits everything that changed in the worktree since the last commit.
+/// Returns `<short sha> <subject>`, or `None` when nothing changed.
+async fn commit_changes(task: &AgentTask) -> std::result::Result<Option<String>, String> {
+    let dir = &task.worktree;
+    if git(dir, &["status", "--porcelain"])
+        .await?
+        .trim()
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    git(dir, &["add", "--all"]).await?;
+    let (subject, body) = commit_message(task);
+    let mut args: Vec<&str> = Vec::new();
+    // A daemon cannot ask for an identity; use a neutral one if git has none.
+    if !git(dir, &["config", "user.email"])
+        .await
+        .is_ok_and(|email| !email.trim().is_empty())
+    {
+        args.extend([
+            "-c",
+            "user.name=AgentUX",
+            "-c",
+            "user.email=agentux@localhost",
+        ]);
+    }
+    args.extend(["commit", "--quiet", "-m", &subject, "-m", &body]);
+    git(dir, &args).await?;
+    let sha = git(dir, &["rev-parse", "--short", "HEAD"]).await?;
+    Ok(Some(format!("{} {subject}", sha.trim())))
+}
+
+/// Subject and body of the commit after an agent step.
+fn commit_message(task: &AgentTask) -> (String, String) {
+    let title = &task.title;
+    let subject = match (task.step, task.feedback_from) {
+        (StepKind::Implement, Some(StepKind::Gate)) => format!("Fix failing checks: {title}"),
+        (StepKind::Implement, Some(StepKind::Review)) => {
+            format!("Address review comments: {title}")
+        }
+        (StepKind::Implement, _) => title.clone(),
+        (kind, _) => format!("{title} ({kind} step)"),
+    };
+    let mut body = format!(
+        "Changes made by the {} ({}) in AgentUX run {}, {} step, attempt {}.",
+        task.role, task.harness, task.run_id, task.step, task.attempt
+    );
+    if let Some(prompt) = &task.prompt {
+        body.push_str(&format!("\n\nRequest: {}", cut_line(prompt, 200)));
+    }
+    if let Some(issue) = task.issue {
+        body.push_str(&format!("\n\nRefs #{issue}"));
+    }
+    (cut_line(&subject, 72), body)
+}
+
+/// Runs git in `dir` and returns its stdout.
+async fn git(dir: &Path, args: &[&str]) -> std::result::Result<String, String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 

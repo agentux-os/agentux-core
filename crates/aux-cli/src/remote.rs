@@ -5,7 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agentux_api::rpc::{StartRun, Subscribe};
-use agentux_api::{Client, Event, EventBody, RequestStatus, Run, RunStatus};
+use agentux_api::{
+    Client, Event, EventBody, MessageFrom, RequestStatus, Run, RunStatus, SessionEvent,
+    SessionState, ToolStatus,
+};
 
 use crate::Result;
 
@@ -98,8 +101,8 @@ impl Remote {
                     "{:<10} {:<10} {:<10} {:<13} {:<16} {} — {}",
                     run.id,
                     truncate(project, 10),
-                    run.status,
-                    run.step,
+                    run.status.as_str(),
+                    run.step.as_str(),
                     loops,
                     run.title,
                     run.activity
@@ -112,8 +115,11 @@ impl Remote {
             println!("\nWAITING FOR YOU");
             for request in pending {
                 println!(
-                    "{:<10} run {:<10} {}",
-                    request.id, request.run_id, request.title
+                    "{:<10} run {:<10} {:<11} {}",
+                    request.id,
+                    request.run_id,
+                    request.kind.as_str(),
+                    request.title
                 );
             }
             println!("\napprove with `aux approve <id>`, deny with `aux deny <id>`");
@@ -171,6 +177,12 @@ impl Remote {
 #[derive(Default)]
 struct Printer {
     last: Option<(RunStatus, String, String)>,
+    /// Session id to (role, last state).
+    sessions: HashMap<String, (String, SessionState)>,
+    /// Tool call id to title.
+    tools: HashMap<String, String>,
+    /// Last cost printed per session.
+    costs: HashMap<String, f64>,
 }
 
 impl Printer {
@@ -213,9 +225,88 @@ impl Printer {
                     println!("  {line}");
                 }
             }
+            EventBody::Session { session } => {
+                let previous = self
+                    .sessions
+                    .insert(session.id.clone(), (session.role.clone(), session.state));
+                match previous {
+                    None => println!(
+                        "  session {} started: {} ({}) in {}",
+                        session.id, session.role, session.harness, session.cwd
+                    ),
+                    Some((_, state))
+                        if state != SessionState::Ended && session.state == SessionState::Ended =>
+                    {
+                        println!("  session {} ({}) ended", session.id, session.role)
+                    }
+                    Some(_) => {}
+                }
+            }
+            EventBody::SessionEvent { session_id, event } => {
+                let role = self
+                    .sessions
+                    .get(session_id)
+                    .map_or("agent", |(role, _)| role.as_str())
+                    .to_string();
+                self.session_event(session_id, &role, event);
+            }
             EventBody::Project { .. } => {}
         }
         None
+    }
+
+    fn session_event(&mut self, session_id: &str, role: &str, event: &SessionEvent) {
+        match event {
+            SessionEvent::Message {
+                from: MessageFrom::User,
+                ..
+            } => println!("  {role} <- prompt"),
+            SessionEvent::Message { text, .. } => {
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    println!("  {role} | {line}");
+                }
+            }
+            SessionEvent::ToolCall {
+                tool_call_id,
+                tool,
+                title,
+                status,
+                ..
+            } => {
+                if let Some(title) = title {
+                    self.tools.insert(tool_call_id.clone(), title.clone());
+                }
+                let name = self
+                    .tools
+                    .get(tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| tool_call_id.clone());
+                if let Some(tool) = tool {
+                    println!("  {role} [{tool}] {name}");
+                } else if let Some(status @ (ToolStatus::Ok | ToolStatus::Error)) = status {
+                    println!("  {role} [{status}] {name}");
+                }
+            }
+            SessionEvent::Diff { path, .. } => println!("  {role} [diff] {path}"),
+            SessionEvent::Plan { items } => {
+                println!("  {role} [plan]");
+                for item in items {
+                    println!("  {role}   - [{}] {}", item.status, item.text);
+                }
+            }
+            SessionEvent::Usage { usage } => {
+                if let Some(cost) = usage.cost_usd
+                    && self.costs.insert(session_id.to_string(), cost) != Some(cost)
+                {
+                    println!(
+                        "  {role} [usage] ${cost:.2}, {}/{} tokens in context",
+                        usage.used_tokens, usage.context_tokens
+                    );
+                }
+            }
+            // The request event itself is printed.
+            SessionEvent::Permission { .. } => {}
+        }
     }
 }
 

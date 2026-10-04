@@ -11,7 +11,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::rpc::{self, method};
-use crate::{Event, PermissionRequest, Project, Run};
+use crate::{Event, PermissionRequest, Project, Run, Session};
 
 pub struct Client {
     lines: Lines<BufReader<OwnedReadHalf>>,
@@ -108,6 +108,17 @@ impl Client {
             run_id: run_id.into(),
         };
         self.call(method::RUNS_CANCEL, &params).await
+    }
+
+    /// Sessions, optionally only those of one run.
+    pub async fn list_sessions(
+        &mut self,
+        run_id: Option<&str>,
+    ) -> Result<Vec<Session>, ClientError> {
+        let params = rpc::ListSessions {
+            run_id: run_id.map(str::to_string),
+        };
+        self.call(method::SESSIONS_LIST, &params).await
     }
 
     pub async fn list_requests(

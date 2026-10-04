@@ -85,6 +85,30 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX events_by_run ON events (run_id, seq);
     ",
+    // 2: harness sessions, run cost and base commit, the session behind a
+    // permission request.
+    "
+    ALTER TABLE runs ADD COLUMN sessions TEXT NOT NULL DEFAULT '{}';
+    ALTER TABLE runs ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0;
+    ALTER TABLE runs ADD COLUMN base_commit TEXT;
+    ALTER TABLE requests ADD COLUMN session_id TEXT;
+
+    CREATE TABLE sessions (
+        id              TEXT PRIMARY KEY,
+        run_id          TEXT NOT NULL REFERENCES runs(id),
+        project_id      TEXT NOT NULL REFERENCES projects(id),
+        role            TEXT NOT NULL,
+        harness         TEXT NOT NULL,
+        model           TEXT,
+        state           TEXT NOT NULL,
+        cwd             TEXT NOT NULL,
+        usage           TEXT NOT NULL,
+        started_at      INTEGER NOT NULL,
+        updated_at      INTEGER NOT NULL,
+        ended_at        INTEGER
+    );
+    CREATE INDEX sessions_by_run ON sessions (run_id);
+    ",
 ];
 
 /// The schema version this build writes.
