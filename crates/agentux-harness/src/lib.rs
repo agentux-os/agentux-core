@@ -53,6 +53,18 @@ pub trait HarnessSession {
     fn shutdown(self) -> impl Future<Output = Result<(), Error>> + Send;
 }
 
+/// An MCP server the agent connects to for the session, such as the
+/// `agentux` bus (ADR 0004). Launched by the agent as a subprocess speaking
+/// MCP over stdio, the one transport every ACP agent must support.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServer {
+    /// Name the agent shows the server's tools under.
+    pub name: String,
+    pub command: PathBuf,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+}
+
 /// Receives the events of a session.
 pub type Events = mpsc::UnboundedReceiver<Event>;
 

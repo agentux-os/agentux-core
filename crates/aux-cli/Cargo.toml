@@ -13,14 +13,17 @@ path = "src/main.rs"
 
 [dependencies]
 agentux-api.workspace = true
+agentux-bus.workspace = true
 agentux-config.workspace = true
 agentux-harness.workspace = true
 agentux-worktree.workspace = true
 agentuxd.workspace = true
 clap.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
 
 [dev-dependencies]
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
 tempfile.workspace = true
 
 [lints]

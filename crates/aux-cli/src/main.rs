@@ -8,6 +8,7 @@ use agentux_config::{Config, ConfigError, FILE_NAME};
 use agentux_worktree::Worktrees;
 use clap::{Args, Parser, Subcommand};
 
+mod bus_stdio;
 mod exec;
 mod remote;
 
@@ -46,6 +47,9 @@ enum Command {
         cwd: PathBuf,
         prompt: String,
     },
+    /// Serve the agentux bus as a stdio MCP server for one harness session
+    /// (only --standalone works until agentuxd serves the bus)
+    BusStdio(bus_stdio::BusStdioArgs),
     /// Run the daemon in the foreground
     Daemon {
         /// SQLite database [default: $XDG_STATE_HOME/agentux/agentuxd.db, else
@@ -150,6 +154,7 @@ fn main() -> ExitCode {
             cwd,
             prompt,
         } => exec::exec(&harness, &cwd, &prompt),
+        Command::BusStdio(args) => bus_stdio::bus_stdio(cli.socket, args),
         Command::Daemon {
             database,
             fake_agents,
@@ -201,6 +206,7 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
             Command::Validate { .. }
             | Command::Worktree(_)
             | Command::Exec { .. }
+            | Command::BusStdio(_)
             | Command::Daemon { .. } => {
                 unreachable!("handled locally")
             }
