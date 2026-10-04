@@ -9,17 +9,26 @@
 //!
 //! Without a file, [`Config::default_for`] builds the built-in pipeline with
 //! checks detected from the project (see [`detect_checks`]).
+//!
+//! `isolation` (ADR 0009) says whether gate steps run their checks on the
+//! host or in a rootless Podman container; see [`Isolation`].
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use std::{fmt, fs, io};
 
 use serde::Deserialize;
 
 mod detect;
+mod isolation;
 mod validate;
 
 pub use detect::detect_checks;
+pub use isolation::{
+    DEFAULT_CHECK_TIMEOUT, DEFAULT_IMAGE, DEVCONTAINER_FILES, Image, ImageSource, Isolation,
+    IsolationMode, devcontainer_image, format_timeout,
+};
 
 /// Name of the pipeline file at the root of a project.
 pub const FILE_NAME: &str = "agentux.yaml";
@@ -40,6 +49,8 @@ pub struct Config {
     pub roles: BTreeMap<String, Role>,
     /// Commands that gate steps run inside the run's worktree.
     pub checks: Vec<Check>,
+    /// Where those commands run (ADR 0009).
+    pub isolation: Isolation,
     pub pipeline: Vec<Step>,
     pub bus: Bus,
     pub budget: Budget,
@@ -53,11 +64,25 @@ pub struct Role {
     pub model: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Check {
     pub name: String,
+    /// Run with `sh -c`.
     pub run: String,
+    /// The check fails, and everything it started is killed, when it runs
+    /// longer than this. [`DEFAULT_CHECK_TIMEOUT`] unless set.
+    pub timeout: Duration,
+}
+
+impl Check {
+    /// A check with the default timeout.
+    pub fn new(name: impl Into<String>, run: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            run: run.into(),
+            timeout: DEFAULT_CHECK_TIMEOUT,
+        }
+    }
 }
 
 /// The fixed set of step types. New types are added by ADR, not by users.

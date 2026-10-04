@@ -4,7 +4,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use agentux_config::{Config, ConfigError, FILE_NAME};
+use agentux_config::{Config, ConfigError, FILE_NAME, IsolationMode, format_timeout};
 use agentux_worktree::Worktrees;
 use clap::{Args, Parser, Subcommand};
 
@@ -310,6 +310,26 @@ fn validate(path: &Path) -> Result {
         println!("checks:");
         print_checks(&config);
     }
+    let root = file.parent().unwrap_or(Path::new("."));
+    print_isolation(&config, root)?;
+    Ok(())
+}
+
+/// Where the checks run (ADR 0009). The image is resolved against the
+/// working tree here; runs resolve it against the commit they start from.
+fn print_isolation(config: &Config, root: &Path) -> Result {
+    let isolation = &config.isolation;
+    match isolation.mode {
+        IsolationMode::None => println!("isolation: none (checks run on the host)"),
+        IsolationMode::Podman => {
+            let image = isolation.image_in(root).map_err(|e| {
+                format!("isolation: cannot tell which image the checks would use: {e}")
+            })?;
+            let network = if isolation.network { "on" } else { "off" };
+            println!("isolation: podman, network {network}");
+            println!("  image: {image}");
+        }
+    }
     Ok(())
 }
 
@@ -320,7 +340,12 @@ fn summary(config: &Config) -> String {
 
 fn print_checks(config: &Config) {
     for check in &config.checks {
-        println!("  {}: {}", check.name, check.run);
+        println!(
+            "  {}: {} (timeout {})",
+            check.name,
+            check.run,
+            format_timeout(check.timeout)
+        );
     }
 }
 

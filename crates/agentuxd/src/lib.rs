@@ -15,6 +15,7 @@ use clap::Args;
 
 pub mod acp;
 pub mod bus;
+mod checks;
 pub mod engine;
 pub mod executor;
 pub mod forge;

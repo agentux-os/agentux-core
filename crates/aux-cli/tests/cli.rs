@@ -73,6 +73,65 @@ fn validate_reports_every_issue_and_fails() {
 }
 
 #[test]
+fn validate_shows_isolation_and_timeouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("agentux.yaml");
+    let checks = "checks:\n  - name: test\n    run: just test\n    timeout: 2h\n";
+    fs::write(&file, format!("{VALID}{checks}")).unwrap();
+    let output = aux(&["validate", path(&file)]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("  test: just test (timeout 2h)\n"), "{out}");
+    assert!(
+        out.contains("isolation: none (checks run on the host)"),
+        "{out}"
+    );
+
+    fs::write(
+        &file,
+        format!("{VALID}{checks}isolation:\n  mode: podman\n"),
+    )
+    .unwrap();
+    let output = aux(&["validate", path(dir.path())]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(out.contains("isolation: podman, network off\n"), "{out}");
+    assert!(
+        out.contains("  image: registry.fedoraproject.org/fedora-toolbox:44 (default)\n"),
+        "{out}"
+    );
+
+    fs::create_dir(dir.path().join(".devcontainer")).unwrap();
+    fs::write(
+        dir.path().join(".devcontainer/devcontainer.json"),
+        "{ // comment\n \"image\": \"mcr.microsoft.com/devcontainers/rust:1\", }",
+    )
+    .unwrap();
+    let output = aux(&["validate", path(dir.path())]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let out = stdout(&output);
+    assert!(
+        out.contains(
+            "  image: mcr.microsoft.com/devcontainers/rust:1 (from .devcontainer/devcontainer.json)"
+        ),
+        "{out}"
+    );
+
+    fs::write(
+        &file,
+        format!("{VALID}isolation:\n  mode: none\n  network: true\n"),
+    )
+    .unwrap();
+    let output = aux(&["validate", path(&file)]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("isolation.network: has no effect with `mode: none`"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
 fn validate_reports_unknown_keys() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("agentux.yaml");
@@ -115,7 +174,7 @@ fn validate_without_a_file_shows_the_effective_default_pipeline() {
     );
     assert!(
         out.contains(
-            "  test: cargo test
+            "  test: cargo test (timeout 30m)
 "
         ),
         "{out}"
