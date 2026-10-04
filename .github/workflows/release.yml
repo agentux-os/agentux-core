@@ -1,0 +1,165 @@
+name: release
+
+# Builds aux and agentuxd as the `agentux` RPM for the AgentUX image (Fedora
+# Kinoite 44). The build runs inside a Fedora 44 container so the binaries link
+# against the glibc the image ships, not Ubuntu's; the RPM is then installed
+# with dnf in a fresh Fedora 44 container and smoke-tested before it is
+# published anywhere.
+#
+# - push of a `v*` tag: build, verify and attach the .rpm to a GitHub release
+#   for that tag (the tag must match the workspace version in Cargo.toml)
+# - workflow_dispatch: build, verify and upload the .rpm as a workflow artifact
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rpm:
+    name: build rpm (fedora 44)
+    runs-on: ubuntu-latest
+    container:
+      image: registry.fedoraproject.org/fedora:44
+    outputs:
+      name: ${{ steps.rpm.outputs.name }}
+    steps:
+      # Installed before checkout so actions/checkout can use git.
+      - name: Install build dependencies
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            git rustup gcc rpm-build systemd-rpm-macros jq cpio
+
+      - uses: actions/checkout@v5
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup-init -y --profile minimal --default-toolchain none --no-modify-path
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # rust-toolchain.toml pins the channel; rustup installs it on demand.
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version
+        id: version
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "aux-cli") | .version')
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "version ${version}"
+
+      - name: Check tag matches workspace version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if [ "v${{ steps.version.outputs.version }}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${{ steps.version.outputs.version }}"
+            exit 1
+          fi
+
+      - name: Build binaries
+        run: cargo build --release --locked --bin aux --bin agentuxd
+
+      - name: Build RPM
+        run: |
+          rpmbuild -bb packaging/agentux.spec \
+            --define "_topdir ${GITHUB_WORKSPACE}/target/rpmbuild" \
+            --define "srcroot ${GITHUB_WORKSPACE}" \
+            --define "version_ ${{ steps.version.outputs.version }}"
+
+      - name: Inspect RPM
+        id: rpm
+        run: |
+          rpm_path=$(ls target/rpmbuild/RPMS/*/agentux-*.rpm)
+          echo "path=${rpm_path}" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "${rpm_path}")" >> "$GITHUB_OUTPUT"
+          ls -l "${rpm_path}"
+          rpm -qip "${rpm_path}"
+          rpm -qlp "${rpm_path}"
+          rpm -qp --requires --recommends "${rpm_path}"
+          {
+            echo '### RPM'
+            echo '```'
+            ls -lh "${rpm_path}"
+            rpm -qip "${rpm_path}"
+            echo
+            rpm -qlp "${rpm_path}"
+            echo
+            echo 'Requires:'
+            rpm -qp --requires "${rpm_path}"
+            echo 'Recommends:'
+            rpm -qp --recommends "${rpm_path}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentux-rpm
+          path: ${{ steps.rpm.outputs.path }}
+          if-no-files-found: error
+
+  verify:
+    name: verify rpm (fedora 44)
+    needs: rpm
+    runs-on: ubuntu-latest
+    container:
+      image: registry.fedoraproject.org/fedora:44
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: agentux-rpm
+
+      - name: Install with dnf
+        run: |
+          # Weak deps on, so the Recommends (gh) is resolved too.
+          dnf -y install --setopt=install_weak_deps=True "./${{ needs.rpm.outputs.name }}" systemd
+          rpm -q agentux git gh
+
+      - name: Smoke test
+        run: |
+          aux --version
+          aux --help
+          agentuxd --version
+          agentuxd --help
+          test -f /usr/lib/systemd/user/agentuxd.service
+          systemd-analyze verify /usr/lib/systemd/user/agentuxd.service
+          {
+            echo '### Installed RPM'
+            echo '```'
+            rpm -qi agentux
+            echo
+            aux --version
+            agentuxd --version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: attach to GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [rpm, verify]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release on tag pushes
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: agentux-rpm
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ needs.rpm.outputs.name }}
+          fail_on_unmatched_files: true

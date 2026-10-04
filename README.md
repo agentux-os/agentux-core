@@ -57,6 +57,19 @@ aux worktree remove <run-id> [--force] [--delete-branch] [--repo <dir>]
 
 `aux worktree` and `aux exec` are development aids: `agentuxd` manages run worktrees itself, and `aux exec` runs one prompt against a harness (`claude-code`, `codex`, `opencode`, `antigravity`), streams what it does and asks y/n for each permission request; Ctrl-C cancels the turn.
 
+## Install
+
+The AgentUX image ships `aux` and `agentuxd` preinstalled from the `agentux` RPM. On another Fedora 44 system, download the `.rpm` from the [releases](https://github.com/agentux-os/agentux-core/releases) and install it:
+
+```sh
+sudo dnf install ./agentux-<version>-1.fc44.x86_64.rpm
+systemctl --user enable --now agentuxd.service   # optional: run the daemon as a user service
+```
+
+It installs `/usr/bin/aux`, `/usr/bin/agentuxd` and the user unit `/usr/lib/systemd/user/agentuxd.service`, requires `git` and recommends `gh`. On an rpm-ostree system, use `rpm-ostree install` instead of `dnf`.
+
+The RPM is built by [`.github/workflows/release.yml`](.github/workflows/release.yml) in a Fedora 44 container from [`packaging/agentux.spec`](packaging/agentux.spec): pushing a `v<version>` tag that matches the workspace version in `Cargo.toml` builds it, installs and smoke-tests it in a clean container, and attaches it to the GitHub release; running the workflow manually leaves it as a workflow artifact.
+
 ## Build and test
 
 Needs `git` and a Rust toolchain; [`rust-toolchain.toml`](rust-toolchain.toml) pins the version, and `rustup` picks it up.
