@@ -1,55 +1,23 @@
-//! Drives `AcpSession` against a fake ACP agent built with the SDK's agent
-//! side, running in-process over a byte pipe. No vendor CLI or network needed.
+//! Drives `AcpSession` against the fake ACP agent from `agentux-fake-agent`,
+//! running in-process over a byte pipe. No vendor CLI or network needed.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agent_client_protocol::schema::v1 as acp;
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo};
+use agentux_fake_agent::{SESSION, Turn, acp, script};
 use agentux_harness::{
     AcpHarness, AcpSession, Decision, Error, Event, Events, FileDiff, Harness, HarnessSession,
     HarnessSpec, McpServer, PermissionHandler, PermissionRequest, PlanEntry, PlanStatus,
     StopReason, ToolCall, ToolCallUpdate, ToolKind, ToolStatus, permission_handler,
 };
 use tokio::task::JoinHandle;
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-use tokio_util::sync::CancellationToken;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-const SESSION: &str = "fake-session";
 
 /// Prompts the fake agent understands.
 const WORK: &str = "edit the file";
 const WAIT_FOR_PERMISSION: &str = "ask and wait";
-
-fn send(
-    cx: &ConnectionTo<Client>,
-    update: acp::SessionUpdate,
-) -> agent_client_protocol::Result<()> {
-    cx.send_notification(acp::SessionNotification::new(SESSION, update))
-}
-
-fn text(s: &str) -> acp::ContentBlock {
-    acp::ContentBlock::Text(acp::TextContent::new(s))
-}
-
-fn permission(tool_call_id: &str) -> acp::RequestPermissionRequest {
-    use acp::PermissionOptionKind::*;
-    acp::RequestPermissionRequest::new(
-        SESSION,
-        acp::ToolCallUpdate::new(
-            tool_call_id.to_string(),
-            acp::ToolCallUpdateFields::new()
-                .title("Write src/lib.rs")
-                .kind(acp::ToolKind::Edit),
-        ),
-        vec![
-            acp::PermissionOption::new("allow".to_string(), "Allow", AllowOnce),
-            acp::PermissionOption::new("deny".to_string(), "Deny", RejectOnce),
-        ],
-    )
-}
 
 /// What the fake agent saw, for assertions.
 #[derive(Default)]
@@ -62,64 +30,32 @@ struct Seen {
 /// One prompt turn of the fake agent. `WORK` streams a message, a plan and a
 /// file edit that needs permission, then usage. `WAIT_FOR_PERMISSION` asks
 /// for permission and ends the turn as cancelled once the client cancels.
-async fn turn(
-    prompt: String,
-    cx: ConnectionTo<Client>,
-    cancelled: CancellationToken,
-    seen: Arc<Mutex<Seen>>,
-) -> agent_client_protocol::Result<acp::StopReason> {
-    let outcome = |response: acp::RequestPermissionResponse| match response.outcome {
-        acp::RequestPermissionOutcome::Selected(selected) => selected.option_id.0.to_string(),
-        _ => "cancelled".to_string(),
-    };
-    if prompt == WAIT_FOR_PERMISSION {
-        let response = cx.send_request(permission("t9")).block_task().await?;
-        seen.lock()
-            .unwrap()
-            .permission_outcomes
-            .push(outcome(response));
-        cancelled.cancelled().await;
+async fn turn(turn: Turn, seen: Arc<Mutex<Seen>>) -> agent_client_protocol::Result<acp::StopReason> {
+    seen.lock().unwrap().cwd = Some(turn.cwd.clone());
+    if turn.prompt == WAIT_FOR_PERMISSION {
+        let outcome = turn
+            .request_permission("t9", "Write src/lib.rs", acp::ToolKind::Edit)
+            .await?;
+        seen.lock().unwrap().permission_outcomes.push(outcome);
+        turn.cancelled().await;
         return Ok(acp::StopReason::Cancelled);
     }
 
-    send(
-        &cx,
-        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(text("Editing "))),
+    turn.message("Editing ")?;
+    turn.thought("hmm")?;
+    turn.plan(&[
+        ("Write the file", acp::PlanEntryStatus::InProgress),
+        ("Run tests", acp::PlanEntryStatus::Pending),
+    ])?;
+    turn.tool_call(
+        "t1",
+        "Write src/lib.rs",
+        acp::ToolKind::Edit,
+        Some(("src/lib.rs", Some("old"), "new")),
     )?;
-    send(
-        &cx,
-        acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(text("hmm"))),
-    )?;
-    send(
-        &cx,
-        acp::SessionUpdate::Plan(acp::Plan::new(vec![
-            acp::PlanEntry::new(
-                "Write the file",
-                acp::PlanEntryPriority::High,
-                acp::PlanEntryStatus::InProgress,
-            ),
-            acp::PlanEntry::new(
-                "Run tests",
-                acp::PlanEntryPriority::Medium,
-                acp::PlanEntryStatus::Pending,
-            ),
-        ])),
-    )?;
-    send(
-        &cx,
-        acp::SessionUpdate::ToolCall(
-            acp::ToolCall::new("t1".to_string(), "Write src/lib.rs")
-                .kind(acp::ToolKind::Edit)
-                .status(acp::ToolCallStatus::Pending)
-                .content(vec![
-                    acp::Diff::new("src/lib.rs", "new")
-                        .old_text("old".to_string())
-                        .into(),
-                ]),
-        ),
-    )?;
-    let response = cx.send_request(permission("t1")).block_task().await?;
-    let decision = outcome(response);
+    let decision = turn
+        .request_permission("t1", "Write src/lib.rs", acp::ToolKind::Edit)
+        .await?;
     seen.lock()
         .unwrap()
         .permission_outcomes
@@ -129,27 +65,9 @@ async fn turn(
     } else {
         (acp::ToolCallStatus::Failed, "denied")
     };
-    send(
-        &cx,
-        acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-            "t1".to_string(),
-            acp::ToolCallUpdateFields::new()
-                .status(status)
-                .content(vec![acp::ToolCallContent::Content(acp::Content::new(
-                    text(output),
-                ))]),
-        )),
-    )?;
-    send(
-        &cx,
-        acp::SessionUpdate::UsageUpdate(
-            acp::UsageUpdate::new(1200, 200_000).cost(acp::Cost::new(0.25, "USD")),
-        ),
-    )?;
-    send(
-        &cx,
-        acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(text("done."))),
-    )?;
+    turn.tool_update("t1", status, Some(output))?;
+    turn.usage(1200, 200_000, Some(0.25))?;
+    turn.message("done.")?;
     Ok(acp::StopReason::EndTurn)
 }
 
@@ -167,66 +85,19 @@ async fn connect(permissions: PermissionHandler) -> Connected {
 
 /// Like [`connect`], attaching `mcp_servers` to the session.
 async fn connect_with(permissions: PermissionHandler, mcp_servers: &[McpServer]) -> Connected {
-    let (client_io, agent_io) = tokio::io::duplex(64 * 1024);
-    let (agent_read, agent_write) = tokio::io::split(agent_io);
-    let (client_read, client_write) = tokio::io::split(client_io);
-
     let seen = Arc::new(Mutex::new(Seen::default()));
-    let cancelled = CancellationToken::new();
-    let agent = Agent
-        .builder()
-        .name("fake-agent")
-        .on_receive_request(
-            async |request: acp::InitializeRequest, responder, _cx| {
-                responder.respond(acp::InitializeResponse::new(request.protocol_version))
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let seen = Arc::clone(&seen);
-                async move |request: acp::NewSessionRequest, responder, _cx| {
-                    let mut seen = seen.lock().unwrap();
-                    seen.cwd = Some(request.cwd);
-                    seen.mcp_servers = request.mcp_servers;
-                    responder.respond(acp::NewSessionResponse::new(SESSION))
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_request(
-            {
-                let seen = Arc::clone(&seen);
-                let cancelled = cancelled.clone();
-                async move |request: acp::PromptRequest, responder, cx: ConnectionTo<Client>| {
-                    let prompt = match request.prompt.first() {
-                        Some(acp::ContentBlock::Text(t)) => t.text.clone(),
-                        _ => String::new(),
-                    };
-                    let (seen, cancelled) = (Arc::clone(&seen), cancelled.clone());
-                    // The turn sends requests of its own, so it must run
-                    // outside the dispatch loop.
-                    cx.clone().spawn(async move {
-                        let result = turn(prompt, cx, cancelled, seen).await;
-                        responder.respond_with_result(result.map(acp::PromptResponse::new))
-                    })
-                }
-            },
-            agent_client_protocol::on_receive_request!(),
-        )
-        .on_receive_notification(
-            async move |_: acp::CancelNotification, _cx| {
-                cancelled.cancel();
-                Ok(())
-            },
-            agent_client_protocol::on_receive_notification!(),
-        );
-    let agent = tokio::spawn(agent.connect_to(ByteStreams::new(
-        agent_write.compat_write(),
-        agent_read.compat(),
-    )));
-
-    let transport = ByteStreams::new(client_write.compat_write(), client_read.compat());
+    let (transport, agent) = agentux_fake_agent::spawn_observed(
+        script({
+            let seen = Arc::clone(&seen);
+            move |t| turn(t, Arc::clone(&seen))
+        }),
+        {
+            let seen = Arc::clone(&seen);
+            move |request: &acp::NewSessionRequest| {
+                seen.lock().unwrap().mcp_servers = request.mcp_servers.clone();
+            }
+        },
+    );
     let (session, events) = tokio::time::timeout(
         TIMEOUT,
         AcpSession::connect_with_mcp_servers(
@@ -258,16 +129,16 @@ async fn prompt_streams_events_and_asks_for_permission() {
     });
     let (session, mut events, seen, agent) = connect(permissions).await;
     assert_eq!(session.id(), SESSION);
-    assert_eq!(
-        seen.lock().unwrap().cwd.as_deref(),
-        Some(Path::new("/work/tree"))
-    );
 
     let stop = tokio::time::timeout(TIMEOUT, session.prompt(WORK))
         .await
         .expect("prompt timed out")
         .expect("prompt failed");
     assert_eq!(stop, StopReason::EndTurn);
+    assert_eq!(
+        seen.lock().unwrap().cwd.as_deref(),
+        Some(Path::new("/work/tree"))
+    );
 
     assert_eq!(
         drain(&mut events),

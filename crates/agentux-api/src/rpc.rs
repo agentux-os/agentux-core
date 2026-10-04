@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{PermissionRequest, Run, StepAttempt};
+use crate::{PermissionRequest, Run, Session, StepAttempt};
 
 pub const VERSION: &str = "2.0";
 
@@ -18,6 +18,7 @@ pub mod method {
     pub const RUNS_LIST: &str = "runs.list";
     pub const RUNS_GET: &str = "runs.get";
     pub const RUNS_CANCEL: &str = "runs.cancel";
+    pub const SESSIONS_LIST: &str = "sessions.list";
     pub const REQUESTS_LIST: &str = "requests.list";
     pub const REQUESTS_APPROVE: &str = "requests.approve";
     pub const REQUESTS_DENY: &str = "requests.deny";
@@ -154,6 +155,17 @@ pub struct RunDetail {
     /// Oldest first.
     pub attempts: Vec<StepAttempt>,
     pub requests: Vec<PermissionRequest>,
+    /// Oldest first.
+    #[serde(default)]
+    pub sessions: Vec<Session>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListSessions {
+    /// Only the sessions of this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

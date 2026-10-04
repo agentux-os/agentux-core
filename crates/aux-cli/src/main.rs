@@ -56,9 +56,14 @@ enum Command {
         /// ~/.local/state/agentux/agentuxd.db]
         #[arg(long)]
         database: Option<PathBuf>,
-        /// Answer agent steps with a scripted fake instead of a harness
+        /// Answer agent steps with a scripted fake instead of real harnesses
         #[arg(long)]
         fake_agents: bool,
+        /// DANGEROUS: allow every tool call agents ask permission for
+        /// (commands, file edits, fetches) without asking you. Only for
+        /// unattended runs in a sandbox you trust
+        #[arg(long)]
+        auto_approve_permissions: bool,
     },
     /// Start a run in a project
     Run {
@@ -84,14 +89,16 @@ enum Command {
         #[arg(long, short)]
         all: bool,
     },
-    /// Approve a pending request
+    /// Approve a pending request (a plan, a step, a budget overrun, or an
+    /// agent's permission to run a tool)
     Approve {
         request_id: String,
         /// Note recorded with the decision
         #[arg(long, short)]
         message: Option<String>,
     },
-    /// Deny a pending request; its run fails
+    /// Deny a pending request: an agent asking permission is told no and
+    /// carries on; any other denial fails the run
     Deny {
         request_id: String,
         /// Reason recorded with the decision
@@ -158,10 +165,12 @@ fn main() -> ExitCode {
         Command::Daemon {
             database,
             fake_agents,
+            auto_approve_permissions,
         } => daemon(agentuxd::Options {
             socket: cli.socket,
             database,
             fake_agents,
+            auto_approve_permissions,
         }),
         command => remote(cli.socket, command),
     };

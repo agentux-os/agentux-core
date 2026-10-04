@@ -97,10 +97,26 @@ string_enum!(
 
 string_enum!(
     /// What an approval request is about. `plan` is the approval after a plan
-    /// step; `step` is any other `approve: true` step.
+    /// step; `step` is any other `approve: true` step; `permission` is an
+    /// agent asking before a tool call (the agent waits for the answer);
+    /// `budget` pauses a run whose spending passed its budget.
     RequestKind {
         Plan => "plan",
         Step => "step",
+        Permission => "permission",
+        Budget => "budget",
+    }
+);
+
+string_enum!(
+    /// `active` while the agent works on a prompt, `waiting` while it waits
+    /// for a permission answer, `idle` between steps, `ended` once the
+    /// harness process is gone.
+    SessionState {
+        Active => "active",
+        Idle => "idle",
+        Waiting => "waiting",
+        Ended => "ended",
     }
 );
 
@@ -181,8 +197,17 @@ pub struct Run {
     /// Rounds of the most recent review, and its limit.
     pub review_round: u32,
     pub review_max_rounds: u32,
-    /// `budget.max_usd_per_run`. Stored, not enforced yet.
+    /// Spending limit: `budget.max_usd_per_run`, raised by that amount each
+    /// time the human approves going over it.
     pub budget_usd: Option<f64>,
+    /// What the run's sessions have cost so far, as reported by the harnesses
+    /// (0 when none reports cost).
+    #[serde(default)]
+    pub cost_usd: f64,
+    /// Role name to the id of its harness session, filled as the run reaches
+    /// each role.
+    #[serde(default)]
+    pub sessions: BTreeMap<String, String>,
     pub started_at: i64,
     pub updated_at: i64,
     pub finished_at: Option<i64>,
@@ -216,6 +241,9 @@ pub struct PermissionRequest {
     pub kind: RequestKind,
     pub run_id: String,
     pub project_id: String,
+    /// The session that asked, for `permission` requests.
+    #[serde(default)]
+    pub session_id: Option<String>,
     pub step_index: usize,
     pub step: StepKind,
     pub title: String,
@@ -226,6 +254,130 @@ pub struct PermissionRequest {
     pub created_at: i64,
     pub resolved_at: Option<i64>,
 }
+
+/// A harness session: one agent process working for one role of a run, in
+/// the run's worktree.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Session {
+    pub id: String,
+    pub run_id: String,
+    pub project_id: String,
+    pub role: String,
+    /// The harness id, e.g. `opencode` (the cockpit's `vendor`).
+    pub harness: String,
+    pub model: Option<String>,
+    pub state: SessionState,
+    /// The worktree the harness works in.
+    pub cwd: String,
+    pub usage: SessionUsage,
+    pub started_at: i64,
+    pub updated_at: i64,
+    pub ended_at: Option<i64>,
+}
+
+/// What a harness reported about its session. ACP reports context-window
+/// usage, not input/output token counts, and cost only for some harnesses.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUsage {
+    /// Tokens currently in the context window.
+    pub used_tokens: u64,
+    /// Size of the context window.
+    pub context_tokens: u64,
+    /// Cumulative cost of the session in USD, if the harness reports it.
+    pub cost_usd: Option<f64>,
+}
+
+/// What happened in a session. Agent message chunks are coalesced into
+/// `message` events; a tool call arrives as one `tool_call` when it starts and
+/// another for each change, with only the changed fields set.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionEvent {
+    Message {
+        from: MessageFrom,
+        text: String,
+    },
+    ToolCall {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool: Option<ToolKind>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<ToolStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+    },
+    /// A file edit carried by a tool call. Large texts are truncated.
+    Diff {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        path: String,
+        #[serde(rename = "oldText")]
+        old_text: Option<String>,
+        #[serde(rename = "newText")]
+        new_text: String,
+    },
+    /// The agent's current plan, replacing any earlier one.
+    Plan { items: Vec<PlanItem> },
+    /// The agent asked for permission; see the request.
+    Permission {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
+    Usage { usage: SessionUsage },
+}
+
+string_enum!(
+    /// `user` is the prompt AgentUX sent; `system` is a note from the daemon.
+    MessageFrom {
+        User => "user",
+        Agent => "agent",
+        System => "system",
+    }
+);
+
+string_enum!(
+    ToolKind {
+        Read => "read",
+        Edit => "edit",
+        Delete => "delete",
+        Move => "move",
+        Search => "search",
+        Execute => "execute",
+        Think => "think",
+        Fetch => "fetch",
+        Other => "other",
+    }
+);
+
+string_enum!(
+    /// The cockpit's tool call states; ACP's `pending` and `in_progress`
+    /// both map to `running`.
+    ToolStatus {
+        Running => "running",
+        Ok => "ok",
+        Error => "error",
+    }
+);
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanItem {
+    pub text: String,
+    pub status: PlanItemStatus,
+}
+
+string_enum!(
+    PlanItemStatus {
+        Pending => "pending",
+        InProgress => "in_progress",
+        Done => "done",
+    }
+);
 
 /// A persisted event. `seq` grows by one per event and lets a subscriber
 /// resume where it left off.
@@ -261,5 +413,15 @@ pub enum EventBody {
     /// Free text: check output, agent summaries, state notes.
     Log {
         text: String,
+    },
+    /// Any change to a session (full snapshot).
+    Session {
+        session: Session,
+    },
+    /// Something happened inside a session.
+    SessionEvent {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        event: SessionEvent,
     },
 }

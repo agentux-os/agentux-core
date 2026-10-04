@@ -18,7 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentux_api::{
     AttemptStatus, CheckResult, Event, EventBody, PermissionRequest, Project, PullRequest,
-    RequestKind, RequestStatus, Run, RunStatus, StepAttempt, StepKind,
+    RequestKind, RequestStatus, Run, RunStatus, Session, SessionState, SessionUsage, StepAttempt,
+    StepKind,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
@@ -76,6 +77,9 @@ pub struct RunRecord {
     /// The project's `agentux.yaml` when the run started; `None` means the
     /// built-in default pipeline.
     pub config_yaml: Option<String>,
+    /// The commit the run's branch started from, for reviewers to diff
+    /// against.
+    pub base_commit: Option<String>,
 }
 
 /// What a new approval request is about.
@@ -88,6 +92,7 @@ pub struct NewRequest {
     pub step: StepKind,
     pub title: String,
     pub detail: String,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -205,13 +210,16 @@ pub struct Tx<'a> {
 const RUN_COLUMNS: &str = "id, project_id, title, prompt, issue, config_yaml, status, phase, \
      step_index, steps, roles, branch, worktree, loops, feedback, checks, gate_attempt, \
      gate_max_attempts, review_round, review_max_rounds, budget_usd, activity, error, \
-     pull_request, started_at, updated_at, finished_at";
+     pull_request, started_at, updated_at, finished_at, sessions, cost_usd, base_commit";
 
 const ATTEMPT_COLUMNS: &str =
     "id, run_id, step_index, step, status, output, started_at, finished_at";
 
 const REQUEST_COLUMNS: &str = "id, kind, run_id, project_id, step_index, step, title, detail, \
-     status, answer, created_at, resolved_at";
+     status, answer, created_at, resolved_at, session_id";
+
+const SESSION_COLUMNS: &str = "id, run_id, project_id, role, harness, model, state, cwd, usage, \
+     started_at, updated_at, ended_at";
 
 impl Tx<'_> {
     // ---- events ----
@@ -330,7 +338,7 @@ impl Tx<'_> {
             &format!(
                 "INSERT INTO runs ({RUN_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
                  ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, \
-                 ?25, ?26, ?27)"
+                 ?25, ?26, ?27, ?28, ?29, ?30)"
             ),
             rusqlite::params_from_iter(run_params(record)?),
         )?;
@@ -351,7 +359,8 @@ impl Tx<'_> {
              roles = ?11, branch = ?12, worktree = ?13, loops = ?14, feedback = ?15, \
              checks = ?16, gate_attempt = ?17, gate_max_attempts = ?18, review_round = ?19, \
              review_max_rounds = ?20, budget_usd = ?21, activity = ?22, error = ?23, \
-             pull_request = ?24, started_at = ?25, updated_at = ?26, finished_at = ?27 \
+             pull_request = ?24, started_at = ?25, updated_at = ?26, finished_at = ?27, \
+             sessions = ?28, cost_usd = ?29, base_commit = ?30 \
              WHERE id = ?1",
             rusqlite::params_from_iter(run_params(record)?),
         )?;
@@ -481,6 +490,7 @@ impl Tx<'_> {
             project_id: new.project_id,
             step_index: new.step_index,
             step: new.step,
+            session_id: new.session_id,
             title: new.title,
             detail: new.detail,
             status: RequestStatus::Pending,
@@ -491,7 +501,7 @@ impl Tx<'_> {
         self.tx.execute(
             &format!(
                 "INSERT INTO requests ({REQUEST_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
             ),
             params![
                 request.id,
@@ -506,6 +516,7 @@ impl Tx<'_> {
                 request.answer,
                 request.created_at,
                 request.resolved_at,
+                request.session_id,
             ],
         )?;
         self.emit(
@@ -569,9 +580,113 @@ impl Tx<'_> {
         )?;
         rows.map(|r| r?.map_err(Error::Data)).collect()
     }
+
+    // ---- sessions ----
+
+    /// Inserts a new session and emits a session event.
+    pub fn insert_session(&mut self, session: &Session) -> Result<()> {
+        self.tx.execute(
+            &format!(
+                "INSERT INTO sessions ({SESSION_COLUMNS}) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+            ),
+            rusqlite::params_from_iter(session_params(session)?),
+        )?;
+        self.emit(
+            Some(&session.run_id),
+            EventBody::Session {
+                session: session.clone(),
+            },
+        )
+    }
+
+    /// Writes `session` back, bumping `updated_at`, and emits a session
+    /// event.
+    pub fn save_session(&mut self, session: &mut Session) -> Result<()> {
+        session.updated_at = now_ms();
+        let changed = self.tx.execute(
+            "UPDATE sessions SET run_id = ?2, project_id = ?3, role = ?4, harness = ?5, \
+             model = ?6, state = ?7, cwd = ?8, usage = ?9, started_at = ?10, \
+             updated_at = ?11, ended_at = ?12 WHERE id = ?1",
+            rusqlite::params_from_iter(session_params(session)?),
+        )?;
+        if changed != 1 {
+            return Err(Error::Data(format!("session {} does not exist", session.id)));
+        }
+        self.emit(
+            Some(&session.run_id),
+            EventBody::Session {
+                session: session.clone(),
+            },
+        )
+    }
+
+    pub fn session(&self, id: &str) -> Result<Option<Session>> {
+        self.tx
+            .query_row(
+                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+                [id],
+                session_from_row,
+            )
+            .optional()?
+            .transpose()
+    }
+
+    /// Sessions, oldest first, optionally only those of one run.
+    pub fn sessions(&self, run_id: Option<&str>) -> Result<Vec<Session>> {
+        let mut stmt = self.tx.prepare(&format!(
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE ?1 IS NULL OR run_id = ?1 \
+             ORDER BY started_at, id"
+        ))?;
+        let rows = stmt.query_map([run_id], session_from_row)?;
+        rows.map(|r| r?).collect()
+    }
 }
 
 // ---- row mapping ----
+
+fn session_params(session: &Session) -> Result<Vec<Box<dyn rusqlite::ToSql>>> {
+    Ok(vec![
+        Box::new(session.id.clone()),
+        Box::new(session.run_id.clone()),
+        Box::new(session.project_id.clone()),
+        Box::new(session.role.clone()),
+        Box::new(session.harness.clone()),
+        Box::new(session.model.clone()),
+        Box::new(session.state.as_str()),
+        Box::new(session.cwd.clone()),
+        Box::new(to_json(&session.usage)?),
+        Box::new(session.started_at),
+        Box::new(session.updated_at),
+        Box::new(session.ended_at),
+    ])
+}
+
+fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Result<Session>> {
+    let state: String = row.get(6)?;
+    let usage: String = row.get(8)?;
+    let Some(state) = SessionState::parse(&state) else {
+        return Ok(Err(Error::Data(format!("bad session state {state:?}"))));
+    };
+    let usage: SessionUsage = match from_json(&usage) {
+        Ok(usage) => usage,
+        Err(e) => return Ok(Err(e)),
+    };
+    Ok(Ok(Session {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        project_id: row.get(2)?,
+        role: row.get(3)?,
+        harness: row.get(4)?,
+        model: row.get(5)?,
+        state,
+        cwd: row.get(7)?,
+        usage,
+        started_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        ended_at: row.get(11)?,
+    }))
+}
 
 fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
@@ -617,6 +732,9 @@ fn run_params(record: &RunRecord) -> Result<Vec<Box<dyn rusqlite::ToSql>>> {
         Box::new(run.started_at),
         Box::new(run.updated_at),
         Box::new(run.finished_at),
+        Box::new(to_json(&run.sessions)?),
+        Box::new(run.cost_usd),
+        Box::new(record.base_commit.clone()),
     ])
 }
 
@@ -664,11 +782,14 @@ fn run_from_row(row: &Row<'_>) -> Result<RunRecord> {
             started_at: row.get(24)?,
             updated_at: row.get(25)?,
             finished_at: row.get(26)?,
+            sessions: from_json(&text(27)?)?,
+            cost_usd: row.get(28)?,
         },
         phase: Phase::parse(&phase).ok_or_else(|| Error::Data(format!("bad phase {phase:?}")))?,
         loops,
         feedback: row.get(14)?,
         config_yaml: row.get(5)?,
+        base_commit: row.get(29)?,
     })
     .map(|mut record| {
         record.run.step = record
@@ -718,6 +839,7 @@ fn request_from_row(
         kind,
         run_id: row.get(2)?,
         project_id: row.get(3)?,
+        session_id: row.get(12)?,
         step_index: row.get::<_, i64>(4)? as usize,
         step,
         title: row.get(6)?,

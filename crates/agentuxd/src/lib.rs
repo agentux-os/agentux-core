@@ -13,12 +13,16 @@ use std::sync::Arc;
 use agentux_store::Store;
 use clap::Args;
 
+pub mod acp;
 pub mod engine;
 pub mod executor;
+pub mod forge;
+pub mod prompts;
 pub mod server;
 
-pub use engine::Engine;
-pub use executor::{FakeExecutor, StepExecutor, Unavailable};
+pub use acp::{AcpExecutor, HarnessLauncher, Launcher};
+pub use engine::{Engine, Settings};
+pub use executor::{FakeExecutor, StepExecutor, StepHost};
 
 /// Command-line options shared by `agentuxd` and `aux daemon`.
 #[derive(Debug, Clone, Args)]
@@ -31,10 +35,15 @@ pub struct Options {
     /// ~/.local/state/agentux/agentuxd.db]
     #[arg(long)]
     pub database: Option<PathBuf>,
-    /// Answer agent steps with a scripted fake instead of a harness (for
-    /// development and demos until harness adapters land)
+    /// Answer agent steps with a scripted fake instead of real harnesses
+    /// (for development and demos)
     #[arg(long)]
     pub fake_agents: bool,
+    /// DANGEROUS: allow every tool call agents ask permission for (running
+    /// commands, editing and deleting files, fetching URLs) without asking
+    /// you. Only for unattended runs in a sandbox you trust
+    #[arg(long)]
+    pub auto_approve_permissions: bool,
 }
 
 /// Runs the daemon until SIGINT or SIGTERM.
@@ -58,9 +67,12 @@ pub async fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let executor: Arc<dyn StepExecutor> = if options.fake_agents {
         Arc::new(FakeExecutor::default())
     } else {
-        Arc::new(Unavailable)
+        Arc::new(AcpExecutor::default())
     };
-    let engine = Engine::new(store, executor);
+    let settings = Settings {
+        auto_approve_permissions: options.auto_approve_permissions,
+    };
+    let engine = Engine::with_settings(store, executor, settings);
     let resumed = engine.resume()?;
     eprintln!(
         "agentuxd: listening on {} (database {}, {resumed} unfinished run(s) resumed{})",
@@ -72,6 +84,11 @@ pub async fn run(options: Options) -> Result<(), Box<dyn Error>> {
             ""
         }
     );
+    if options.auto_approve_permissions {
+        eprintln!(
+            "agentuxd: WARNING: --auto-approve-permissions: every tool call agents ask about              is allowed without asking you"
+        );
+    }
 
     server::serve(engine.clone(), &socket, shutdown_signal())
         .await

@@ -28,11 +28,14 @@ fn sample_run(project_id: &str) -> RunRecord {
             pull_request: None,
             activity: "starting".into(),
             error: None,
+            cost_usd: 0.0,
+            sessions: BTreeMap::new(),
         },
         phase: Phase::Setup,
         loops: BTreeMap::new(),
         feedback: None,
         config_yaml: None,
+        base_commit: None,
     }
 }
 
@@ -184,6 +187,7 @@ fn attempts_and_requests_are_tracked() {
                 step: StepKind::Plan,
                 title: "Approve the plan".into(),
                 detail: "1. do it".into(),
+                session_id: None,
             })
         })
         .unwrap();
@@ -208,4 +212,61 @@ fn attempts_and_requests_are_tracked() {
         store.read(|tx| tx.requests(Some(&run_id), None)).unwrap(),
         [approved]
     );
+}
+
+#[test]
+fn sessions_round_trip_and_emit_snapshots() {
+    let store = Store::open_in_memory().unwrap();
+    let mut events = store.subscribe();
+    let project = store
+        .write(|tx| tx.register_project("app", "/src/app"))
+        .unwrap();
+    let mut record = sample_run(&project.id);
+    record.base_commit = Some("abc123".into());
+    record.run.cost_usd = 0.5;
+    record
+        .run
+        .sessions
+        .insert("implementer".into(), "s1".into());
+    store.write(|tx| tx.insert_run(&record)).unwrap();
+    let mut session = Session {
+        id: "s1".into(),
+        run_id: record.run.id.clone(),
+        project_id: project.id.clone(),
+        role: "implementer".into(),
+        harness: "opencode".into(),
+        model: None,
+        state: SessionState::Active,
+        cwd: "/src/app.worktrees/x".into(),
+        usage: SessionUsage::default(),
+        started_at: now_ms(),
+        updated_at: now_ms(),
+        ended_at: None,
+    };
+    store.write(|tx| tx.insert_session(&session)).unwrap();
+    session.state = SessionState::Idle;
+    session.usage.cost_usd = Some(0.5);
+    store.write(|tx| tx.save_session(&mut session)).unwrap();
+
+    let (stored_run, stored) = store
+        .read(|tx| {
+            Ok::<_, Error>((
+                tx.run(&record.run.id)?.unwrap(),
+                tx.sessions(Some(&record.run.id))?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(stored, [session.clone()]);
+    assert_eq!(stored_run.base_commit.as_deref(), Some("abc123"));
+    assert_eq!(stored_run.run.cost_usd, 0.5);
+    assert_eq!(stored_run.run.sessions["implementer"], "s1");
+    assert_eq!(store.read(|tx| tx.session("s1")).unwrap(), Some(session));
+
+    let mut kinds = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let EventBody::Session { session } = event.body {
+            kinds.push(session.state);
+        }
+    }
+    assert_eq!(kinds, [SessionState::Active, SessionState::Idle]);
 }

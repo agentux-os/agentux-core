@@ -13,6 +13,7 @@ publish = false
 agentux-api = { path = "crates/agentux-api" }
 agentux-bus = { path = "crates/agentux-bus" }
 agentux-config = { path = "crates/agentux-config" }
+agentux-fake-agent = { path = "crates/agentux-fake-agent" }
 agentux-harness = { path = "crates/agentux-harness" }
 agentux-store = { path = "crates/agentux-store" }
 agentux-worktree = { path = "crates/agentux-worktree" }

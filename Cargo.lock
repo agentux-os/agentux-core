@@ -84,10 +84,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentux-fake-agent"
+version = "0.1.0"
+dependencies = [
+ "agent-client-protocol",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "agentux-harness"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "agentux-fake-agent",
  "rustix",
  "tempfile",
  "tokio",
@@ -119,6 +129,8 @@ version = "0.1.0"
 dependencies = [
  "agentux-api",
  "agentux-config",
+ "agentux-fake-agent",
+ "agentux-harness",
  "agentux-store",
  "agentux-worktree",
  "clap",

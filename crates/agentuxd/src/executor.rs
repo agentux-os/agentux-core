@@ -1,15 +1,15 @@
 //! The seam between the run state machine and whatever does the work of a
-//! step that needs an agent (or a forge). The ACP-backed implementation comes
-//! with the harness adapters; until then the daemon ships [`Unavailable`],
-//! and tests (and `--fake-agents`) use [`FakeExecutor`].
+//! step that needs an agent (or a forge). The daemon uses
+//! [`AcpExecutor`](crate::AcpExecutor) by default; tests and `--fake-agents`
+//! use [`FakeExecutor`].
 
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentux_api::{PullRequest, StepKind};
+use agentux_api::{PullRequest, SessionEvent, SessionState, StepKind};
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -17,6 +17,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentTask {
     pub run_id: String,
+    pub title: String,
     pub step_index: usize,
     pub step: StepKind,
     pub role: String,
@@ -32,7 +33,12 @@ pub struct AgentTask {
     /// Failure output of a gate, or a reviewer's comments, that sent the run
     /// back to this step.
     pub feedback: Option<String>,
+    /// The step that produced `feedback` (`gate` or `review`).
+    pub feedback_from: Option<StepKind>,
     pub worktree: PathBuf,
+    pub branch: Option<String>,
+    /// The commit the run's branch started from.
+    pub base_commit: Option<String>,
     /// 1 for the first execution of this step in the run, counting retries
     /// after a restart.
     pub attempt: u32,
@@ -56,7 +62,58 @@ pub struct PullRequestTask {
     pub branch: String,
     pub worktree: PathBuf,
     pub draft: bool,
+    pub prompt: Option<String>,
     pub issue: Option<u64>,
+    /// Output of the most recent successful plan step.
+    pub plan: Option<String>,
+    /// The approving review's summary.
+    pub review: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum PullRequestOutcome {
+    Opened(PullRequest),
+    /// No pull request could be opened for a reason that is not an error
+    /// (no GitHub remote, `gh` missing or logged out). The branch is kept.
+    Skipped(String),
+}
+
+/// What the daemon offers an executor while one agent step runs: recording
+/// sessions and what happens in them, and asking the human.
+pub trait StepHost: Send + Sync {
+    /// Records a new session for the step's role and returns its id.
+    fn open_session(&self, harness: &str, model: Option<&str>) -> Result<String, String>;
+
+    fn session_state(&self, session_id: &str, state: SessionState);
+
+    fn session_event(&self, session_id: &str, event: SessionEvent);
+
+    /// Asks whether the agent may run a tool call. Resolves to `true` when
+    /// allowed. Dropping the future withdraws the question.
+    fn ask_permission(
+        &self,
+        session_id: &str,
+        title: String,
+        detail: String,
+    ) -> BoxFuture<'static, bool>;
+}
+
+/// A host that records nothing and denies every permission, for executors
+/// called outside the engine.
+pub struct NoHost;
+
+impl StepHost for NoHost {
+    fn open_session(&self, harness: &str, _: Option<&str>) -> Result<String, String> {
+        Ok(format!("{harness}-session"))
+    }
+
+    fn session_state(&self, _: &str, _: SessionState) {}
+
+    fn session_event(&self, _: &str, _: SessionEvent) {}
+
+    fn ask_permission(&self, _: &str, _: String, _: String) -> BoxFuture<'static, bool> {
+        Box::pin(async { false })
+    }
 }
 
 /// Executes the steps that are not plain commands. Implementations must be
@@ -64,31 +121,21 @@ pub struct PullRequestTask {
 /// mid-step runs the step again on restart (ADR 0003). For pull requests that
 /// means reusing an existing one for the branch.
 pub trait StepExecutor: Send + Sync + 'static {
-    fn run_agent<'a>(&'a self, task: &'a AgentTask) -> BoxFuture<'a, Result<AgentOutcome, String>>;
+    fn run_agent<'a>(
+        &'a self,
+        task: &'a AgentTask,
+        host: Arc<dyn StepHost>,
+    ) -> BoxFuture<'a, Result<AgentOutcome, String>>;
 
     fn open_pull_request<'a>(
         &'a self,
         task: &'a PullRequestTask,
-    ) -> BoxFuture<'a, Result<PullRequest, String>>;
-}
+    ) -> BoxFuture<'a, Result<PullRequestOutcome, String>>;
 
-/// The default until harness adapters exist: agent and pull request steps
-/// fail with an explanation. Gates and approvals still work.
-pub struct Unavailable;
-
-const UNAVAILABLE: &str = "no harness adapter is available yet in this agentuxd build \
-     (start the daemon with --fake-agents to exercise pipelines without agents)";
-
-impl StepExecutor for Unavailable {
-    fn run_agent<'a>(&'a self, _: &'a AgentTask) -> BoxFuture<'a, Result<AgentOutcome, String>> {
-        Box::pin(async { Err(UNAVAILABLE.to_string()) })
-    }
-
-    fn open_pull_request<'a>(
-        &'a self,
-        _: &'a PullRequestTask,
-    ) -> BoxFuture<'a, Result<PullRequest, String>> {
-        Box::pin(async { Err(UNAVAILABLE.to_string()) })
+    /// The run finished or was cancelled: stop whatever is kept for it, such
+    /// as harness sessions.
+    fn release<'a>(&'a self, _run_id: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
     }
 }
 
@@ -146,7 +193,11 @@ impl FakeExecutor {
 }
 
 impl StepExecutor for FakeExecutor {
-    fn run_agent<'a>(&'a self, task: &'a AgentTask) -> BoxFuture<'a, Result<AgentOutcome, String>> {
+    fn run_agent<'a>(
+        &'a self,
+        task: &'a AgentTask,
+        _host: Arc<dyn StepHost>,
+    ) -> BoxFuture<'a, Result<AgentOutcome, String>> {
         Box::pin(async move {
             tokio::time::sleep(self.delay).await;
             self.calls
@@ -160,7 +211,7 @@ impl StepExecutor for FakeExecutor {
     fn open_pull_request<'a>(
         &'a self,
         task: &'a PullRequestTask,
-    ) -> BoxFuture<'a, Result<PullRequest, String>> {
+    ) -> BoxFuture<'a, Result<PullRequestOutcome, String>> {
         Box::pin(async move {
             tokio::time::sleep(self.delay).await;
             let mut prs = self.pull_requests.lock().unwrap_or_else(|e| e.into_inner());
@@ -172,10 +223,10 @@ impl StepExecutor for FakeExecutor {
                     prs.len()
                 }
             };
-            Ok(PullRequest {
+            Ok(PullRequestOutcome::Opened(PullRequest {
                 number: number as u64,
                 url: format!("https://forge.invalid/pulls/{number}"),
-            })
+            }))
         })
     }
 }

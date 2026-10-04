@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 agentux-api.workspace = true
 agentux-config.workspace = true
+agentux-harness.workspace = true
 agentux-store.workspace = true
 agentux-worktree.workspace = true
 clap.workspace = true
@@ -18,6 +19,7 @@ serde_json.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
+agentux-fake-agent.workspace = true
 tempfile.workspace = true
 
 [lints]
