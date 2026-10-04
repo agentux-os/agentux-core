@@ -17,7 +17,7 @@
 //! prompts in the target session through the executor, queued behind a turn
 //! in progress; a wake for a role without a session starts one.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -28,8 +28,8 @@ use agentux_api::{
 };
 use agentux_bus::{
     BackendError, BridgeOutcome, BridgeWelcome, Bus, BusBackend, BusCall, BusConfig, BusEvent,
-    EventKind, HumanQuestion, MessageKind, Participant, RunId, RunState, SessionId,
-    SessionIdentity, Target, Wake, WakeTarget,
+    EventKind, GoneSession, HumanQuestion, Message, MessageKind, Participant, Restore,
+    RestoredSent, RunId, RunState, SessionId, SessionIdentity, Target, Wake, WakeTarget,
 };
 use agentux_harness::McpServer;
 use agentux_store::{NewRequest, new_id};
@@ -148,8 +148,9 @@ impl Engine {
         let server = McpServer {
             name: agentux_bus::SERVER_NAME.to_string(),
             command: link.aux.clone(),
-            args: agentux_bus::bus_stdio_args(&link.socket, &token),
-            env: Vec::new(),
+            args: agentux_bus::bus_stdio_args(&link.socket),
+            // Not in the arguments: other local users can read those.
+            env: agentux_bus::bus_stdio_env(&token),
         };
         let prompt = agentux_bus::session_prompt(
             &identity,
@@ -201,6 +202,30 @@ impl Engine {
         });
         if let Err(e) = cancelled {
             eprintln!("agentuxd: run {run_id}: cannot cancel its questions: {e}");
+        }
+    }
+
+    /// The run's bus, opened (and restored from its log) if needed.
+    pub(crate) fn open_bus(&self, run_id: &str) -> Result<Bus, Error> {
+        Ok(self.run_bus(run_id)?.0)
+    }
+
+    /// After a restart: reopens the bus of an active run whose log has mail
+    /// still waiting for a role, so that the role is woken for it.
+    pub(crate) fn reopen_bus(&self, run_id: &str) {
+        let pending = self
+            .inner
+            .store
+            .read(|tx| tx.bus_messages(run_id))
+            .map(|log| !restore_from(&log).queued.is_empty());
+        match pending {
+            Ok(false) => {}
+            Ok(true) => {
+                if let Err(e) = self.run_bus(run_id) {
+                    eprintln!("agentuxd: run {run_id}: cannot reopen its bus: {e}");
+                }
+            }
+            Err(e) => eprintln!("agentuxd: run {run_id}: cannot read its bus log: {e}"),
         }
     }
 
@@ -292,6 +317,9 @@ impl Engine {
             max(|m| m.exchange),
             max(|m| m.question_id),
         );
+        // Exchanges, reply routing and waiting mail survive a restart.
+        bus.restore(&RunId(run_id.to_string()), restore_from(&log))
+            .map_err(internal)?;
         let mapper = Mapper {
             run_id: run_id.to_string(),
             project_id: record.run.project_id.clone(),
@@ -428,6 +456,7 @@ impl Engine {
             worktree: PathBuf::from(worktree),
             session_id,
             prompt: wake.prompt,
+            human: false,
         };
         self.inner
             .executor
@@ -717,21 +746,39 @@ impl Mapper {
                     at,
                 )
             }
-            EventKind::SessionLeft { session, unread } => {
+            EventKind::SessionLeft {
+                session,
+                unread,
+                requeued_for,
+            } => {
                 let endpoint = self.session(engine, session);
                 let mut subject = format!("{} left the bus", describe(&endpoint));
-                if *unread > 0 {
-                    subject.push_str(&format!("; {unread} unread message(s) dropped"));
+                match requeued_for {
+                    Some(role) => {
+                        subject.push_str(" (agentuxd restarted)");
+                        if *unread > 0 {
+                            subject.push_str(&format!(
+                                "; {unread} message(s) delivered to it queued again for role {role}"
+                            ));
+                        }
+                    }
+                    None if *unread > 0 => {
+                        subject.push_str(&format!("; {unread} unread message(s) dropped"));
+                    }
+                    None => {}
                 }
-                self.entry(
-                    BusMessageKind::Left,
-                    None,
-                    endpoint,
-                    BusEndpoint::Run,
-                    subject.clone(),
-                    subject,
-                    at,
-                )
+                BusMessage {
+                    queued_for_role: requeued_for.clone(),
+                    ..self.entry(
+                        BusMessageKind::Left,
+                        None,
+                        endpoint,
+                        BusEndpoint::Run,
+                        subject.clone(),
+                        subject,
+                        at,
+                    )
+                }
             }
             EventKind::MessagePosted {
                 message,
@@ -936,4 +983,172 @@ fn new_token() -> Result<String, String> {
         .and_then(|mut random| random.read_exact(&mut bytes))
         .map_err(|e| format!("cannot read /dev/urandom for a session token: {e}"))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Messages queued again for one role after a restart, at most.
+const MAX_REQUEUED_PER_ROLE: usize = 50;
+
+/// What a reopened run's bus takes from its persisted log: turns used per
+/// exchange, the sender of every message (for replies), and the mail nobody
+/// was told about yet. Reads are not logged, so a message counts as handled
+/// once a wake was issued for its recipient after it arrived (the session was
+/// prompted to read its mail, or a session was started for its role). What is
+/// left: messages still queued for a role, and messages delivered without a
+/// wake (the `run` channel) to sessions that were on the bus when the daemon
+/// stopped. Those sessions are gone; their mail is queued again for their
+/// role, and the `left` entry recording that carries `queuedForRole`, so a
+/// later rebuild sees the same queue.
+pub(crate) fn restore_from(log: &[BusMessage]) -> Restore {
+    let mut restore = Restore::default();
+    let mut exchanges: BTreeMap<u64, u32> = BTreeMap::new();
+    // Role to messages waiting for it, each with whether a wake announced it.
+    let mut pending: BTreeMap<String, Vec<(Message, bool)>> = BTreeMap::new();
+    // Session to (role, unannounced messages delivered to it), for the
+    // sessions on the bus.
+    let mut live: BTreeMap<String, (String, Vec<Message>)> = BTreeMap::new();
+    for entry in log {
+        match entry.kind {
+            BusMessageKind::Message
+            | BusMessageKind::ReviewRequest
+            | BusMessageKind::Handoff
+            | BusMessageKind::HumanAnswer => {
+                let (Some(id), Some(exchange)) = (entry.message_id, entry.exchange) else {
+                    continue;
+                };
+                let Some(from) = sender(&entry.from) else {
+                    continue;
+                };
+                let turns = exchanges.entry(exchange).or_insert(0);
+                *turns = (*turns).max(entry.turn);
+                restore.sent.push(RestoredSent {
+                    message: id,
+                    exchange,
+                    from: from.clone(),
+                });
+                let Some(to) = target(&entry.to) else {
+                    continue;
+                };
+                let message = Message {
+                    id,
+                    exchange,
+                    turn: entry.turn,
+                    run: RunId(entry.run_id.clone()),
+                    from,
+                    to,
+                    kind: match entry.kind {
+                        BusMessageKind::ReviewRequest => MessageKind::ReviewRequest,
+                        BusMessageKind::Handoff => MessageKind::Handoff,
+                        BusMessageKind::HumanAnswer => MessageKind::HumanAnswer,
+                        _ => MessageKind::Message,
+                    },
+                    body: entry.body.clone(),
+                    in_reply_to: entry.in_reply_to,
+                    sent_at_ms: u64::try_from(entry.at).unwrap_or(0),
+                };
+                if let Some(role) = &entry.queued_for_role {
+                    pending
+                        .entry(role.clone())
+                        .or_default()
+                        .push((message.clone(), false));
+                }
+                for session in &entry.delivered_to {
+                    if let Some((_, mail)) = live.get_mut(session) {
+                        mail.push(message.clone());
+                    }
+                }
+            }
+            BusMessageKind::Wake => match &entry.to {
+                BusEndpoint::Session { session_id, .. } => {
+                    if let Some((_, mail)) = live.get_mut(session_id) {
+                        mail.clear();
+                    }
+                }
+                BusEndpoint::Role { role } => {
+                    for (_, announced) in pending.entry(role.clone()).or_default() {
+                        *announced = true;
+                    }
+                }
+                _ => {}
+            },
+            BusMessageKind::Joined => {
+                if let BusEndpoint::Session {
+                    session_id, role, ..
+                } = &entry.from
+                {
+                    // The role's waiting mail moved to its mailbox; what a
+                    // wake announced, the session is prompted for.
+                    let mail = pending
+                        .remove(role)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|(_, announced)| !announced)
+                        .map(|(message, _)| message)
+                        .collect();
+                    live.insert(session_id.clone(), (role.clone(), mail));
+                }
+            }
+            BusMessageKind::Left => {
+                if let BusEndpoint::Session { session_id, .. } = &entry.from
+                    && let Some((_, mail)) = live.remove(session_id)
+                    && let Some(role) = &entry.queued_for_role
+                {
+                    pending
+                        .entry(role.clone())
+                        .or_default()
+                        .extend(mail.into_iter().map(|m| (m, false)));
+                }
+            }
+            _ => {}
+        }
+    }
+    for (session, (role, mail)) in live {
+        restore.gone.push(GoneSession {
+            session: SessionId(session),
+            role: role.clone(),
+            requeued: mail.len(),
+        });
+        pending
+            .entry(role)
+            .or_default()
+            .extend(mail.into_iter().map(|m| (m, false)));
+    }
+    for (role, mail) in pending {
+        let mut mail: Vec<Message> = mail.into_iter().map(|(m, _)| m).collect();
+        mail.sort_by_key(|m| m.id);
+        mail.dedup_by_key(|m| m.id);
+        let skip = mail.len().saturating_sub(MAX_REQUEUED_PER_ROLE);
+        restore
+            .queued
+            .extend(mail.into_iter().skip(skip).map(|m| (role.clone(), m)));
+    }
+    restore.exchanges = exchanges.into_iter().collect();
+    restore
+}
+
+fn sender(endpoint: &BusEndpoint) -> Option<Participant> {
+    match endpoint {
+        BusEndpoint::Session {
+            session_id,
+            role,
+            vendor,
+        } => Some(Participant::Session {
+            session: SessionId(session_id.clone()),
+            role: role.clone(),
+            vendor: vendor.clone(),
+        }),
+        BusEndpoint::Human => Some(Participant::Human),
+        BusEndpoint::Role { .. } | BusEndpoint::Run | BusEndpoint::Daemon => None,
+    }
+}
+
+fn target(endpoint: &BusEndpoint) -> Option<Target> {
+    match endpoint {
+        BusEndpoint::Session { session_id, .. } => {
+            Some(Target::Session(SessionId(session_id.clone())))
+        }
+        BusEndpoint::Role { role } => Some(Target::Role(role.clone())),
+        BusEndpoint::Run => Some(Target::Run),
+        BusEndpoint::Human => Some(Target::Human),
+        BusEndpoint::Daemon => None,
+    }
 }

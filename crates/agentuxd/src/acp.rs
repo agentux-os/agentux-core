@@ -245,13 +245,14 @@ impl AcpExecutor {
         host: &Arc<dyn StepHost>,
     ) -> Result<AgentOutcome, TurnError> {
         let prompt = slot.with_intro(&prompts::step_prompt(task));
-        let reply = turn(live, &slot.id, host, &prompt).await?;
+        let reply = turn(live, &slot.id, host, &prompt, true).await?;
         match task.step {
             StepKind::Review => {
                 let verdict = match prompts::parse_verdict(&reply) {
                     Some(verdict) => verdict,
                     None => {
-                        let again = turn(live, &slot.id, host, prompts::VERDICT_REMINDER).await?;
+                        let again =
+                            turn(live, &slot.id, host, prompts::VERDICT_REMINDER, true).await?;
                         prompts::parse_verdict(&again).ok_or_else(|| {
                             TurnError::Failed(format!(
                                 "the reviewer gave no verdict (expected APPROVE or CHANGES_REQUESTED); it replied: {}",
@@ -347,9 +348,16 @@ impl StepExecutor for AcpExecutor {
         host: Arc<dyn StepHost>,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
+            if task.human {
+                // A session that is still starting is live once this is free.
+                drop(self.starting.lock().await);
+            }
             let (role, slot) = match &task.session_id {
                 Some(id) => match self.find(&task.run_id, id) {
                     Some(found) => found,
+                    None if task.human => {
+                        return Err("the session ended before it got the message".into());
+                    }
                     // The session ended meanwhile; its mail went with it.
                     None => return Ok(()),
                 },
@@ -368,7 +376,8 @@ impl StepExecutor for AcpExecutor {
                 let mut live = slot.live.lock().await;
                 let _host = HostGuard::set(&slot, &host);
                 let prompt = slot.with_intro(&task.prompt);
-                let result = turn(&mut live, &slot.id, &host, &prompt).await;
+                // The human's message is recorded when it is accepted.
+                let result = turn(&mut live, &slot.id, &host, &prompt, !task.human).await;
                 if !matches!(result, Err(TurnError::Broken(_))) {
                     host.session_state(&slot.id, SessionState::Idle);
                 }
@@ -424,13 +433,15 @@ enum TurnError {
     Broken(String),
 }
 
-/// Sends one prompt and streams the turn's events to the host. Returns the
-/// agent's reply text.
+/// Sends one prompt and streams the turn's events to the host, recording the
+/// prompt as a `user` message when `record` is set. Returns the agent's reply
+/// text.
 async fn turn(
     live: &mut Live,
     session_id: &str,
     host: &Arc<dyn StepHost>,
     text: &str,
+    record: bool,
 ) -> Result<String, TurnError> {
     let Live { session, events } = live;
     let session = session
@@ -444,13 +455,15 @@ async fn turn(
     sink.flush();
     sink.reply.clear();
 
-    host.session_event(
-        session_id,
-        SessionEvent::Message {
-            from: MessageFrom::User,
-            text: text.to_string(),
-        },
-    );
+    if record {
+        host.session_event(
+            session_id,
+            SessionEvent::Message {
+                from: MessageFrom::User,
+                text: text.to_string(),
+            },
+        );
+    }
     host.session_state(session_id, SessionState::Active);
     let mut tick = tokio::time::interval(MESSAGE_FLUSH_EVERY);
     let stop = {

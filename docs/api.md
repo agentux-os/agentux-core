@@ -24,12 +24,15 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `runs.list` | `{ projectId? }` | `Run[]`, newest first |
 | `runs.get` | `{ runId }` | `{ run: Run, attempts: StepAttempt[], requests: PermissionRequest[], sessions: Session[] }` |
 | `runs.cancel` | `{ runId }` | `Run` |
+| `runs.events` | `{ runId, sinceSeq?, limit? }` — `limit` defaults to 1000, at most 10000 | `{ events: Event[], more, headSeq }`: the run's stored events with `seq > sinceSeq`, oldest first; see [History](#history) |
 | `sessions.list` | `{ runId? }` | `Session[]`, oldest first |
+| `sessions.prompt` | `{ sessionId, text }` | `{ session: Session, queued }` — the human's message to a live session; see [Talking to a session](#talking-to-a-session) |
 | `requests.list` | `{ pending? }` — `true` for the approvals inbox | `PermissionRequest[]`, newest first |
 | `requests.approve` | `{ requestId, answer? }` — `answer` is required for `question` requests | `PermissionRequest` |
 | `requests.deny` | `{ requestId, answer? }` | `PermissionRequest` (the run fails, except for `permission` requests, where the agent is told no and goes on, and `question` requests, where the agent is told the human declined) |
-| `events.subscribe` | `{ runId?, since? }` | `{ seq }`, then `event` notifications |
+| `events.subscribe` | `{ runId?, since? }` | `{ seq }`, then `event` notifications, with one `replay_done` notification where the replay ends |
 | `bus.list` | `{ runId }` | `BusMessage[]`, the run's agent bus log, oldest first |
+| `bus.post` | `{ runId, to?: BusEndpoint, body, subject?, inReplyTo? }` | `{ messageId, exchange, turn, deliveredTo, queuedForRole }` — a message from the human on the run's bus; see [Agent bus](#agent-bus) |
 | `bus.hello` | `{ sessionToken }` | `{ identity, allowedTools, maxTurnsPerExchange }` — bus bridge only, see [Agent bus](#agent-bus) |
 | `bus.call` | `{ sessionToken, call }` | `{ ok: <tool result> }` or `{ err: <refusal> }` — bus bridge only |
 
@@ -42,7 +45,7 @@ Standard JSON-RPC codes (`-32700` parse error, `-32600` invalid request, `-32601
 | Code | Meaning |
 |---|---|
 | `-32001` | Not found: no such project, run or request |
-| `-32002` | Conflict: e.g. approving a request that is no longer pending, cancelling a finished run |
+| `-32002` | Conflict: e.g. approving a request that is no longer pending, cancelling a finished run, prompting a session that has ended, posting on the bus of a finished run |
 | `-32003` | Invalid project: not a git repository, or its `agentux.yaml` is invalid |
 | `-32004` | Unauthorized: `bus.hello` / `bus.call` with an unknown session token, or the token of a session that has ended |
 
@@ -53,6 +56,18 @@ Standard JSON-RPC codes (`-32700` parse error, `-32600` invalid request, `-32601
 ```
 
 Every state change is stored as an event in the same transaction as the change, then pushed to subscribers after the commit. `seq` increases by one per event. `events.subscribe` with `since: N` first replays stored events with `seq > N` (`since: 0` replays everything), then continues live, without gaps or duplicates; without `since`, only new events are sent. `runId` limits the stream to one run. A client that reconnects passes the last `seq` it saw.
+
+Where the replay ends, the subscription gets one notification of its own, exactly once, before any live event (right away when there is nothing to replay):
+
+```json
+{"jsonrpc":"2.0","method":"replay_done","params":{"seq":57}}
+```
+
+`seq` is the newest event in the log when the replay was read: the client has every event of its stream up to it, and everything after the marker is live. Clients that only want events (the Rust `Subscription::next`) skip it; `Subscription::next_notice` returns it as `Notice::ReplayDone`.
+
+### History
+
+`runs.events { runId, sinceSeq?, limit? }` returns a run's stored events (every kind: `session_event`s, `bus_message`s, run snapshots, logs...) in pages, without a subscription: `{ events, more, headSeq }`. While `more` is true, ask again with `sinceSeq` set to the last event's `seq`. `headSeq` is the newest `seq` in the whole log when the page was read; once `more` is false, `events.subscribe { runId, since: headSeq }` continues live without a gap or a duplicate. An unknown run is `-32001`.
 
 | `kind` | Payload | When |
 |---|---|---|
@@ -139,7 +154,7 @@ interface Session {
 // ACP reports context-window usage and cumulative session cost, not
 // input/output token counts, so `usage` differs from the cockpit's TokenUsage.
 type SessionEvent =
-  | { kind: "message"; from: "user" | "agent" | "system"; text: string }  // user = the prompt AgentUX sent
+  | { kind: "message"; from: "user" | "agent" | "system" | "human"; text: string }  // user = the prompt AgentUX sent; human = sessions.prompt
   | { kind: "tool_call"; toolCallId: string; tool?: ToolKind; title?: string;
       status?: "running" | "ok" | "error"; output?: string }  // first event of a call has tool and title; updates carry what changed
   | { kind: "diff"; toolCallId: string; path: string; oldText: string | null; newText: string }  // whole texts, not hunks
@@ -180,7 +195,7 @@ type BusMessageKind =
   | "joined" | "left";                        // sessions entering and leaving the bus
 
 type BusEndpoint =
-  | { kind: "session"; sessionId: string; role: string; vendor: string }  // vendor = harness
+  | { kind: "session"; sessionId: string; role: string; vendor: string }  // vendor = harness; role and vendor may be omitted in bus.post
   | { kind: "role"; role: string }   // every session playing the role
   | { kind: "run" }                  // the run's channel (no wake)
   | { kind: "human" }
@@ -200,6 +215,11 @@ type BusEndpoint =
 6. **Budget.** Before each agent step, a run whose `costUsd` exceeds `budgetUsd` pauses on a `budget` request. Approving raises `budgetUsd` to `costUsd + budget.max_usd_per_run`; denying fails the run.
 
 7. **Agent bus.** Agents talk to each other and to the human through the `agentux` MCP server; see [Agent bus](#agent-bus).
+8. **The human in a session.** `sessions.prompt` sends the human's message to a live session; see [Talking to a session](#talking-to-a-session).
+
+### Talking to a session
+
+`sessions.prompt { sessionId, text }` sends `text`, as typed, to a live session as an extra ACP turn (`aux say <session-id> <text...>`). Like a bus wake, it is queued behind the turn in progress (a step's or a wake's) and any message queued before it; `queued` in the result says whether the session was in a turn. The message is recorded when it is accepted, as a `session_event` with `{ kind: "message", from: "human", text }` (it is not recorded again as a `user` prompt when it is sent). The turn's events are `session_event`s like a step's; its permission requests are `permission` requests of the run's current step. An empty `text` is `-32602`, an unknown session `-32001`, and a session that has ended (or whose run has finished) `-32002`. If the session ends before the message's turn, a `log` event says the message was not handled.
 
 ### Crash safety
 
@@ -214,12 +234,13 @@ Each active run has its own agent bus ([`agentux-bus`](../crates/agentux-bus), A
 ```text
 name: agentux
 command: <aux>             # this process if it is `aux daemon`, else the `aux` next to `agentuxd`, else `aux` from PATH
-args: bus-stdio --socket <the daemon's socket> --session-token <token>
+args: bus-stdio --socket <the daemon's socket>
+env: AGENTUX_BUS_SESSION_TOKEN=<token>
 ```
 
 Its first prompt starts with the session prompt from `agentux-bus` (its role and run, the tools it may call, the turn limit, the etiquette), then `---`, then the step's prompt.
 
-**Session tokens.** 32 random bytes from `/dev/urandom`, hex-encoded, one per session, kept only in the daemon's memory. A token stands for exactly one session: the daemon takes the caller's identity from the token, never from the request, so a session cannot act as another one or reach another run. A token stops working when its session ends, when the run ends, and when the daemon restarts (sessions do not survive a restart). The socket's `0600` mode remains the outer boundary: tokens appear in the harness's command line, which other local users can read, but only the daemon's user can connect.
+**Session tokens.** 32 random bytes from `/dev/urandom`, hex-encoded, one per session, kept only in the daemon's memory. A token stands for exactly one session: the daemon takes the caller's identity from the token, never from the request, so a session cannot act as another one or reach another run. A token stops working when its session ends, when the run ends, and when the daemon restarts (sessions do not survive a restart). The token travels in the MCP server spec's environment (`AGENTUX_BUS_SESSION_TOKEN`), not on the command line, which other local users can read (`aux bus-stdio --session-token <t>` still works, for trying it by hand). The socket's `0600` mode remains the outer boundary: only the daemon's user can connect.
 
 **The bridge.** `aux bus-stdio` serves the MCP server over its stdio and forwards each tool call to the daemon:
 
@@ -230,10 +251,12 @@ Requests on one connection are answered in order, and `ask_human` keeps its call
 
 **Wakes.** A message to a session or role wakes its recipients (messages to `run` do not): the daemon sends the bus's wake prompt (`[agentux bus] New message from ...`) to the session through ACP. A session in the middle of a turn (a step or another wake) gets it after that turn. A message to a role nobody plays yet is queued for the role, and the daemon starts the role's session (the role's harness and model, in the run's worktree) unless the run has ended or has no worktree yet; the new session finds the message in its mailbox. That session is then the role's session for later steps too. A wake turn's events are `session_event`s like a step's; its permission requests are `permission` requests of the run's current step. Wakes that cannot be delivered are logged (`log` event, `bus: ...`).
 
+**The human on the bus.** `bus.post { runId, to, body, subject?, inReplyTo? }` posts a message from the human (`aux bus <run-id> --post <to> <text...>`). `to` is a `session` (`{ kind: "session", sessionId }`; `role` and `vendor` may be omitted), a `role` or `run`; it may be omitted with `inReplyTo` (a bus `messageId`), which answers that message and goes to its sender by default. `subject`, one line, becomes the message's first line (and so its `subject` in the log). Recipients are woken as for an agent's message, and a role nobody plays gets a session started for it. The human is never cut off by turn limits. Errors: an unknown run `-32001`; a finished run, an unknown session or one that left `-32002`; `to: human` or `daemon`, an unknown role, an empty body, an unknown `inReplyTo` `-32602`.
+
 **Turn limits.** Each message uses one turn of its exchange (a message and its replies). Once an exchange has used `bus.max_turns_per_exchange` turns, further posts in it are refused with a `turn_limit` entry, so they wake nobody: two agents cannot ping-pong past the limit. The human is never cut off.
 
 **Questions.** `ask_human` creates a `question` request (title `<role> (<harness>) asks: <question>`, detail with context and options, `options`, `sessionId`) and a `question` bus entry with its `requestId`. It does not pause the run. `requests.approve { requestId, answer }` answers it (free text or one of the options; an empty answer is `-32602`); `requests.deny` tells the agent the human declined. The agent's tool call waits up to two minutes; an answer after that arrives as a `human_answer` message in its mailbox, with a wake. Questions still pending when the run ends or the daemon restarts are cancelled.
 
-**Restarts.** The log is in the event store, so `bus.list` and `events.subscribe { since: 0 }` return it after a restart. Mailboxes, queued messages and exchange turn counts live in memory and are lost with the sessions; a reopened run's bus continues message, exchange and question ids after the highest ones in its log.
+**Restarts.** The log is in the event store, so `bus.list` and `events.subscribe { since: 0 }` return it after a restart. Mailboxes, queues and turn counts live in memory, and a run's bus reopened after a restart rebuilds them from its log: message, exchange and question ids continue after the highest ones; each exchange keeps the turns it used, so limits still hold and replies to old messages (`in_reply_to`) route to their sender. Mail is rebuilt too, as far as the log tells: reads are not logged, so a message counts as handled once a wake was issued for its recipient after it arrived. Messages still queued for a role, and messages that reached a session without a wake (sent to `run`) while it was on the bus when the daemon stopped, are queued again for the role (at most 50 per role, the newest). The sessions of the old daemon are gone: each gets a `left` entry with subject `... left the bus (agentuxd restarted)` and `queuedForRole` set to its role, so a later rebuild sees the same queue. On startup, the bus of every unfinished run with mail waiting is reopened at once, and each role with mail gets a `wake` (and a session started for it), with a prompt saying the messages were sent before the restart. A message whose wake had been issued but whose turn never ran (the daemon stopped first) is not delivered again.
 
 **Models.** A role's `model` is selected over ACP when the harness offers it: ACP has no model field in `session/new`, but agents that let clients pick one list a session config option of category `model`; the daemon sets it with `session/set_config_option` (matching the option's value or name). When the harness offers no such option or not that model, the session starts with its default and gets a `system` message saying so.

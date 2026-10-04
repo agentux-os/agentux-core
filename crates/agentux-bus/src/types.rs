@@ -293,8 +293,14 @@ pub enum EventKind {
     },
     SessionLeft {
         session: SessionId,
-        /// Unread messages dropped with its mailbox.
+        /// Unread messages dropped with its mailbox (or, with
+        /// `requeued_for`, moved to its role's queue).
         unread: usize,
+        /// Set when the session is marked gone after a daemon restart: the
+        /// messages delivered to it were queued again for this role, since
+        /// whether it read them is not known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requeued_for: Option<String>,
     },
     /// A message was accepted and delivered.
     MessagePosted {

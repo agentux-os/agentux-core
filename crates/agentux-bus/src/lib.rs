@@ -24,9 +24,12 @@ pub use agentux_config::BusTool;
 pub use backend::{BackendError, BoxFuture, BusBackend, CheckResult, MemoryBackend, RunState};
 pub use bridge::{
     BridgeCall, BridgeHello, BridgeOutcome, BridgeWelcome, BusEndpoint, DaemonEndpoint,
-    LocalEndpoint, bus_stdio_args,
+    LocalEndpoint, SESSION_TOKEN_ENV, bus_stdio_args, bus_stdio_env,
 };
-pub use bus::{Bus, BusConfig, BusError, DEFAULT_ASK_HUMAN_WAIT, wake_prompt};
+pub use bus::{
+    Bus, BusConfig, BusError, DEFAULT_ASK_HUMAN_WAIT, GoneSession, Restore, RestoredSent,
+    restored_prompt, wake_prompt,
+};
 pub use prompt::{description, session_prompt};
 pub use server::{BusServer, SERVER_NAME};
 pub use tools::{

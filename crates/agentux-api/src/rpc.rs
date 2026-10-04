@@ -5,7 +5,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{PermissionRequest, Run, Session, StepAttempt};
+use crate::{BusEndpoint, Event, PermissionRequest, Run, Session, StepAttempt};
 
 pub const VERSION: &str = "2.0";
 
@@ -18,18 +18,24 @@ pub mod method {
     pub const RUNS_LIST: &str = "runs.list";
     pub const RUNS_GET: &str = "runs.get";
     pub const RUNS_CANCEL: &str = "runs.cancel";
+    pub const RUNS_EVENTS: &str = "runs.events";
     pub const SESSIONS_LIST: &str = "sessions.list";
+    pub const SESSIONS_PROMPT: &str = "sessions.prompt";
     pub const REQUESTS_LIST: &str = "requests.list";
     pub const REQUESTS_APPROVE: &str = "requests.approve";
     pub const REQUESTS_DENY: &str = "requests.deny";
     pub const EVENTS_SUBSCRIBE: &str = "events.subscribe";
     pub const BUS_LIST: &str = "bus.list";
+    pub const BUS_POST: &str = "bus.post";
     /// Used by `aux bus-stdio` (the bus bridge), not by the cockpit.
     pub const BUS_HELLO: &str = "bus.hello";
     /// Used by `aux bus-stdio` (the bus bridge), not by the cockpit.
     pub const BUS_CALL: &str = "bus.call";
     /// Server-to-client notification carrying one [`crate::Event`].
     pub const EVENT: &str = "event";
+    /// Server-to-client notification sent once per `events.subscribe`, after
+    /// the replayed events and before any live one: [`super::ReplayDone`].
+    pub const REPLAY_DONE: &str = "replay_done";
 }
 
 /// Error codes. The standard JSON-RPC ones, plus application codes.
@@ -217,4 +223,94 @@ pub struct ListBus {
 pub struct Subscribed {
     /// `seq` of the newest event at subscription time.
     pub seq: i64,
+}
+
+/// Params of `replay_done`: the subscriber has every event of its stream with
+/// `seq <= seq`; what follows is live.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplayDone {
+    pub seq: i64,
+}
+
+/// Params of `runs.events`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunEventsParams {
+    pub run_id: String,
+    /// Only events with `seq > since_seq` (default 0: from the start).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_seq: Option<i64>,
+    /// At most this many events (default [`RUN_EVENTS_DEFAULT_LIMIT`], at
+    /// most [`RUN_EVENTS_MAX_LIMIT`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+pub const RUN_EVENTS_DEFAULT_LIMIT: u32 = 1000;
+pub const RUN_EVENTS_MAX_LIMIT: u32 = 10_000;
+
+/// Result of `runs.events`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunEvents {
+    /// Oldest first.
+    pub events: Vec<Event>,
+    /// More events of the run follow: ask again with `sinceSeq` set to the
+    /// last event's `seq`.
+    pub more: bool,
+    /// The newest `seq` in the whole log when this page was read. Once `more`
+    /// is false, `events.subscribe { runId, since: headSeq }` continues
+    /// without a gap or duplicate.
+    pub head_seq: i64,
+}
+
+/// Params of `sessions.prompt`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptSession {
+    pub session_id: String,
+    pub text: String,
+}
+
+/// Result of `sessions.prompt`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Prompted {
+    pub session: Session,
+    /// The session was in a turn: the message waits for that turn (and any
+    /// queued before it) to end.
+    pub queued: bool,
+}
+
+/// Params of `bus.post`: a message from the human on a run's bus.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusPost {
+    pub run_id: String,
+    /// `session`, `role` or `run`. Required unless `in_reply_to` is set
+    /// (then it defaults to the sender of that message).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<BusEndpoint>,
+    pub body: String,
+    /// One line; becomes the message's first line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// The bus message id being answered (`BusMessage.messageId`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<u64>,
+}
+
+/// Result of `bus.post`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusPosted {
+    pub message_id: u64,
+    pub exchange: u64,
+    pub turn: u32,
+    /// Session ids whose mailbox received it.
+    pub delivered_to: Vec<String>,
+    /// No session plays the target role: the message waits, and a session
+    /// is started for the role.
+    pub queued_for_role: Option<String>,
 }

@@ -170,6 +170,12 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
                     }),
             )
         }
+        method::RUNS_EVENTS => to_value(engine.run_events(parse(params)?)),
+        method::SESSIONS_PROMPT => {
+            let params: rpc::PromptSession = parse(params)?;
+            to_value(engine.prompt_session(&params.session_id, &params.text))
+        }
+        method::BUS_POST => to_value(engine.bus_post(parse(params)?)),
         method::SESSIONS_LIST => {
             let params: rpc::ListSessions = parse_or_default(params)?;
             to_value(engine.sessions(params.run_id.as_deref()))
@@ -251,6 +257,14 @@ fn subscribe(
                 return;
             }
         }
+        // The backlog holds every event up to `head` (read in the same
+        // transaction), so the replay is complete up to there.
+        if params.since.is_some() {
+            last = last.max(head);
+        }
+        if !notify_replay_done(&tx, last) {
+            return;
+        }
         loop {
             match live.recv().await {
                 Ok(event) => {
@@ -281,6 +295,18 @@ fn notify(tx: &mpsc::UnboundedSender<String>, event: &Event) -> bool {
         jsonrpc: rpc::VERSION.into(),
         method: method::EVENT.into(),
         params: serde_json::to_value(event).unwrap_or(Value::Null),
+    };
+    match serde_json::to_string(&notification) {
+        Ok(line) => tx.send(line).is_ok(),
+        Err(_) => true,
+    }
+}
+
+fn notify_replay_done(tx: &mpsc::UnboundedSender<String>, seq: i64) -> bool {
+    let notification = rpc::Notification {
+        jsonrpc: rpc::VERSION.into(),
+        method: method::REPLAY_DONE.into(),
+        params: serde_json::to_value(rpc::ReplayDone { seq }).unwrap_or(Value::Null),
     };
     match serde_json::to_string(&notification) {
         Ok(line) => tx.send(line).is_ok(),

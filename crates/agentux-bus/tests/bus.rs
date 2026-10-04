@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentux_bus::{
-    AskHuman, Bus, BusConfig, BusError, BusEvent, BusTool, CheckResult, EventKind, Handoff,
-    HumanReplyStatus, MemoryBackend, MessageKind, Participant, PostMessage, ReadMessages,
-    RequestReview, RunId, RunState, SessionId, SessionIdentity, Target, Wake, WakeTarget,
+    AskHuman, Bus, BusConfig, BusError, BusEvent, BusTool, CheckResult, EventKind, GoneSession,
+    Handoff, HumanReplyStatus, MemoryBackend, Message, MessageKind, Participant, PostMessage,
+    ReadMessages, RequestReview, Restore, RestoredSent, RunId, RunState, SessionId,
+    SessionIdentity, Target, Wake, WakeTarget,
 };
 use agentux_config::Config;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -655,4 +656,87 @@ fn every_exchange_is_in_the_audit_log() {
     assert_eq!(json["run"], RUN);
     assert_eq!(json["message"]["to"], "role:reviewer");
     assert_eq!(json["message"]["body"], "ready?");
+}
+
+/// A bus reopened after a restart continues exchanges where the log left
+/// them, routes replies to old messages, and holds queued mail for roles.
+#[test]
+fn a_restored_bus_continues_exchanges_and_delivers_queued_mail() {
+    let backend = MemoryBackend::new();
+    let bus = Bus::new(backend);
+    let mut events = bus.subscribe();
+    let run = RunId::from(RUN);
+    bus.open_run(run.clone(), "shop", config()).unwrap();
+    let old_impl = Participant::Session {
+        session: s("old-impl"),
+        role: "implementer".into(),
+        vendor: "claude-code".into(),
+    };
+    let queued = Message {
+        id: 2,
+        exchange: 1,
+        turn: 2,
+        run: run.clone(),
+        from: Participant::Human,
+        to: Target::Session(s("old-impl")),
+        kind: MessageKind::Message,
+        body: "use the v2 API".into(),
+        in_reply_to: Some(1),
+        sent_at_ms: 1,
+    };
+    bus.restore(
+        &run,
+        Restore {
+            exchanges: vec![(1, 2)],
+            sent: vec![
+                RestoredSent {
+                    message: 1,
+                    exchange: 1,
+                    from: old_impl,
+                },
+                RestoredSent {
+                    message: 2,
+                    exchange: 1,
+                    from: Participant::Human,
+                },
+            ],
+            queued: vec![("implementer".into(), queued.clone())],
+            gone: vec![GoneSession {
+                session: s("old-impl"),
+                role: "implementer".into(),
+                requeued: 1,
+            }],
+        },
+    )
+    .unwrap();
+    let restored = drain(&mut events);
+    assert!(matches!(
+        &restored[0],
+        EventKind::SessionLeft { session, unread: 1, requeued_for: Some(role) }
+            if session == &s("old-impl") && role == "implementer"
+    ));
+    let wake = &wakes(&restored)[0];
+    assert_eq!(wake.target, WakeTarget::Role("implementer".into()));
+    assert_eq!(wake.message, 2);
+    assert!(wake.prompt.contains("1 message(s)"), "{}", wake.prompt);
+
+    // The role's new session finds the mail in its mailbox.
+    assert_eq!(
+        bus.join(identity("impl", "implementer", "claude-code"))
+            .unwrap(),
+        1
+    );
+    let inbox = bus
+        .read_messages(&s("impl"), ReadMessages::default())
+        .unwrap();
+    assert_eq!(inbox.messages, [queued]);
+
+    // A reply to the old message continues its exchange (turn 3 of 3) and
+    // goes to the human who sent it; the next post is over the limit.
+    let posted = bus.post_message(&s("impl"), reply(2, "done")).unwrap();
+    assert_eq!((posted.exchange, posted.turn, posted.message_id), (1, 3, 3));
+    assert!(matches!(
+        bus.post_message(&s("impl"), reply(2, "more")),
+        Err(BusError::TurnLimit { exchange: 1, .. })
+    ));
 }

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use agentux_api::rpc::{self, StartRun, Subscribe};
 use agentux_api::{
-    BusEndpoint, BusMessage, BusMessageKind, Client, ClientError, EventBody, MessageFrom,
+    BusEndpoint, BusMessage, BusMessageKind, Client, ClientError, EventBody, MessageFrom, Notice,
     RequestKind, RequestStatus, RunStatus, SessionEvent,
 };
 use agentux_bus::{
@@ -85,11 +85,11 @@ impl Launcher for BusLauncher {
                 .first()
                 .cloned()
                 .expect("every session gets the bus MCP server");
-            // bus-stdio --socket <socket> --session-token <token>
+            // bus-stdio --socket <socket>, with the token in the environment
             let ctx = Ctx {
                 harness: spec.harness.to_string(),
                 socket: PathBuf::from(&server.args[2]),
-                token: server.args[4].clone(),
+                token: token_of(&server),
                 seen: Arc::clone(&self.seen),
             };
             self.seen
@@ -133,6 +133,16 @@ impl Launcher for BusLauncher {
 }
 
 const AUX: &str = "/opt/agentux/bin/aux";
+
+/// The session token in a bus MCP server spec's environment.
+fn token_of(server: &McpServer) -> String {
+    server
+        .env
+        .iter()
+        .find(|(name, _)| name == agentux_bus::SESSION_TOKEN_ENV)
+        .map(|(_, token)| token.clone())
+        .expect("the spec carries the session token in its environment")
+}
 
 struct Daemon {
     engine: Engine,
@@ -342,18 +352,15 @@ async fn a_review_request_wakes_the_reviewer_and_its_reply_wakes_the_implementer
         for (_, server) in &seen.servers {
             assert_eq!(server.name, "agentux");
             assert_eq!(server.command, Path::new(AUX));
+            // The token is in the environment, not on the command line.
             assert_eq!(
-                server.args[..4],
-                [
-                    "bus-stdio",
-                    "--socket",
-                    d.socket.to_str().unwrap(),
-                    "--session-token"
-                ]
+                server.args,
+                ["bus-stdio", "--socket", d.socket.to_str().unwrap()]
             );
-            assert_eq!(server.args[4].len(), 64);
+            assert_eq!(server.env.len(), 1);
+            assert_eq!(token_of(server).len(), 64);
         }
-        assert_ne!(seen.servers[0].1.args[4], seen.servers[1].1.args[4]);
+        assert_ne!(token_of(&seen.servers[0].1), token_of(&seen.servers[1].1));
     }
     let coder = prompts_of(&seen, "fake-coder");
     assert_eq!(coder.len(), 2, "{coder:#?}");
@@ -489,7 +496,7 @@ async fn a_review_request_wakes_the_reviewer_and_its_reply_wakes_the_implementer
     assert_eq!(prompts_of(&seen, "fake-reviewer").len(), 2);
 
     // The run's bus closes with it: the sessions leave and tokens expire.
-    let token = seen.lock().unwrap().servers[0].1.args[4].clone();
+    let token = token_of(&seen.lock().unwrap().servers[0].1);
     eventually("the sessions leaving the bus", || {
         let log = bus_log(&d.engine, &run.id);
         (log.iter()
@@ -745,7 +752,7 @@ async fn a_session_token_only_acts_as_its_own_session() {
         .unwrap()
         .servers
         .iter()
-        .map(|(_, s)| s.args[4].clone())
+        .map(|(_, s)| token_of(s))
         .collect();
     let first_session = d.engine.sessions(Some(&first.id)).unwrap()[0].id.clone();
     let second_session = d.engine.sessions(Some(&second.id)).unwrap()[0].id.clone();
@@ -917,5 +924,426 @@ async fn bus_events_survive_a_daemon_restart() {
         .filter_map(|m| m.message_id)
         .collect();
     assert_eq!(ids, [1, 2]);
+    let _ = d.stop.send(());
+}
+
+// ---- the human in the run: sessions.prompt, bus.post, history ----
+
+const ONE_STEP: &str = "version: 1
+roles:
+  implementer:
+    harness: fake-coder
+  reviewer:
+    harness: fake-reviewer
+pipeline:
+  - step: implement
+    role: implementer
+    approve: true
+  - step: review
+    role: reviewer
+";
+
+/// Takes its time over the implement step; notes every other prompt, reads
+/// its mail on bus wakes and answers the human's messages.
+fn listens(ctx: Ctx, turn: Turn) -> BoxFuture<'static, TurnResult> {
+    Box::pin(async move {
+        if turn.prompt.contains("## Your step:") {
+            if ctx.harness == "fake-coder" {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+            }
+            turn.message("Verdict: APPROVE")?;
+            return Ok(acp::StopReason::EndTurn);
+        }
+        if is_wake(&turn.prompt) {
+            let bus = ctx.bus().await;
+            for message in read(&bus).await.messages {
+                ctx.note(format!("{} read: {}", ctx.harness, message.body));
+                if message.from == agentux_bus::Participant::Human {
+                    let answer = reply(&bus, message.id, "on it").await;
+                    ctx.note(format!("{} answered: {}", ctx.harness, answer.is_ok()));
+                }
+            }
+        } else {
+            ctx.note(format!("{} heard: {}", ctx.harness, turn.prompt));
+        }
+        turn.message("ok")?;
+        Ok(acp::StopReason::EndTurn)
+    })
+}
+
+fn notes(seen: &Shared) -> Vec<String> {
+    seen.lock().unwrap().notes.clone()
+}
+
+fn has_note(seen: &Shared, note: &str) -> Option<()> {
+    notes(seen).iter().any(|n| n == note).then_some(())
+}
+
+fn rpc_code<T: std::fmt::Debug>(result: Result<T, ClientError>) -> i64 {
+    match result {
+        Err(ClientError::Rpc(e)) => e.code,
+        other => panic!("expected an RPC error, got {other:?}"),
+    }
+}
+
+fn human_post(run_id: &str, to: BusEndpoint, body: &str) -> rpc::BusPost {
+    rpc::BusPost {
+        run_id: run_id.into(),
+        to: Some(to),
+        body: body.into(),
+        subject: None,
+        in_reply_to: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_human_prompts_a_live_session_after_its_current_turn() {
+    let f = fixture(ONE_STEP);
+    let seen = Shared::default();
+    let mut d = daemon(&f, &seen, listens, &[]).await;
+    let run = start(&f, &d.engine, "Add a health endpoint").await;
+    let session = eventually("the implementer session", || {
+        d.engine.sessions(Some(&run.id)).unwrap().into_iter().next()
+    })
+    .await;
+
+    // Mid-step: the message waits for the step's turn.
+    let prompted = d
+        .client
+        .prompt_session(&session.id, "Also log every request")
+        .await
+        .unwrap();
+    assert!(prompted.queued);
+    assert_eq!(prompted.session.id, session.id);
+    eventually("the implementer hearing the human", || {
+        has_note(&seen, "fake-coder heard: Also log every request")
+    })
+    .await;
+    let prompts = prompts_of(&seen, "fake-coder");
+    assert_eq!(prompts.len(), 2, "{prompts:#?}");
+    assert!(prompts[0].contains("## Your step: implement"));
+    assert_eq!(prompts[1], "Also log every request");
+
+    // Recorded once, as the human's, when it was accepted.
+    let events = d
+        .engine
+        .store()
+        .read(|tx| tx.events_since(0, Some(&run.id)))
+        .unwrap();
+    let said: Vec<MessageFrom> = events
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::SessionEvent {
+                event: SessionEvent::Message { from, text },
+                ..
+            } if text == "Also log every request" => Some(*from),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(said, [MessageFrom::Human]);
+
+    // Between turns the message is not queued.
+    wait_for(&d.engine, &run.id, |r| r.status == RunStatus::Waiting).await;
+    eventually("the session idle", || {
+        (d.engine.sessions(Some(&run.id)).unwrap()[0].state == agentux_api::SessionState::Idle)
+            .then_some(())
+    })
+    .await;
+    let prompted = d
+        .client
+        .prompt_session(&session.id, "Thanks")
+        .await
+        .unwrap();
+    assert!(!prompted.queued);
+    eventually("the second message", || {
+        has_note(&seen, "fake-coder heard: Thanks")
+    })
+    .await;
+
+    // Refusals: empty text, unknown session, ended session.
+    assert_eq!(
+        rpc_code(d.client.prompt_session(&session.id, "  ").await),
+        rpc::code::INVALID_PARAMS
+    );
+    assert_eq!(
+        rpc_code(d.client.prompt_session("nope", "hi").await),
+        rpc::code::NOT_FOUND
+    );
+    d.engine.cancel(&run.id).unwrap();
+    assert_eq!(
+        rpc_code(d.client.prompt_session(&session.id, "hi").await),
+        rpc::code::CONFLICT
+    );
+    let _ = d.stop.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_human_posts_on_the_bus_and_wakes_the_target() {
+    let f = fixture(ONE_STEP);
+    let seen = Shared::default();
+    let mut d = daemon(&f, &seen, listens, &[]).await;
+    let run = start(&f, &d.engine, "Add a health endpoint").await;
+    wait_for(&d.engine, &run.id, |r| r.status == RunStatus::Waiting).await;
+
+    // To a role nobody plays yet: queued, and a session started for it.
+    let posted = d
+        .client
+        .post_bus(&rpc::BusPost {
+            subject: Some("Review focus".into()),
+            ..human_post(
+                &run.id,
+                BusEndpoint::Role {
+                    role: "reviewer".into(),
+                },
+                "Look at the error path first.",
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(posted.queued_for_role.as_deref(), Some("reviewer"));
+    assert_eq!(posted.turn, 1);
+    eventually("the reviewer answering", || {
+        has_note(&seen, "fake-reviewer answered: true")
+    })
+    .await;
+    assert!(
+        has_note(
+            &seen,
+            "fake-reviewer read: Review focus\n\nLook at the error path first."
+        )
+        .is_some()
+    );
+
+    // To a session, addressed by its id only.
+    let implementer = d.engine.sessions(Some(&run.id)).unwrap()[0].clone();
+    let to: BusEndpoint =
+        serde_json::from_value(serde_json::json!({"kind": "session", "sessionId": implementer.id}))
+            .unwrap();
+    let posted = d
+        .client
+        .post_bus(&human_post(&run.id, to, "Ping"))
+        .await
+        .unwrap();
+    assert_eq!(posted.delivered_to, std::slice::from_ref(&implementer.id));
+    eventually("the implementer reading it", || {
+        has_note(&seen, "fake-coder read: Ping")
+    })
+    .await;
+
+    let log = bus_log(&d.engine, &run.id);
+    let mine: Vec<&BusMessage> = log
+        .iter()
+        .filter(|m| m.from == BusEndpoint::Human && m.kind == BusMessageKind::Message)
+        .collect();
+    assert_eq!(mine.len(), 2);
+    assert_eq!(mine[0].subject, "Review focus");
+    let answers = eventually("the answers to the human", || {
+        let answers: Vec<BusMessage> = bus_log(&d.engine, &run.id)
+            .into_iter()
+            .filter(|m| m.to == BusEndpoint::Human)
+            .collect();
+        (answers.len() == 2).then_some(answers)
+    })
+    .await;
+    assert_eq!(answers[0].in_reply_to, mine[0].message_id);
+    assert_eq!(answers[0].turn, 2);
+
+    // Refusals: to the human, an unknown role, an unknown run, a finished run.
+    assert_eq!(
+        rpc_code(
+            d.client
+                .post_bus(&human_post(&run.id, BusEndpoint::Human, "x"))
+                .await
+        ),
+        rpc::code::INVALID_PARAMS
+    );
+    let nobody = BusEndpoint::Role {
+        role: "nobody".into(),
+    };
+    assert_eq!(
+        rpc_code(d.client.post_bus(&human_post(&run.id, nobody, "x")).await),
+        rpc::code::INVALID_PARAMS
+    );
+    assert_eq!(
+        rpc_code(
+            d.client
+                .post_bus(&human_post("nope", BusEndpoint::Run, "x"))
+                .await
+        ),
+        rpc::code::NOT_FOUND
+    );
+    d.engine.cancel(&run.id).unwrap();
+    assert_eq!(
+        rpc_code(
+            d.client
+                .post_bus(&human_post(&run.id, BusEndpoint::Run, "x"))
+                .await
+        ),
+        rpc::code::CONFLICT
+    );
+    let _ = d.stop.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_is_paged_and_replay_ends_with_a_marker() {
+    let f = fixture(ONE_STEP);
+    let seen = Shared::default();
+    let mut d = daemon(&f, &seen, listens, &[]).await;
+    let run = start(&f, &d.engine, "Add a health endpoint").await;
+    wait_for(&d.engine, &run.id, |r| r.status == RunStatus::Waiting).await;
+
+    // runs.events in pages of 3 adds up to the whole stored history.
+    let mut paged = Vec::new();
+    let mut since = None;
+    let head = loop {
+        let page = d
+            .client
+            .run_events(&rpc::RunEventsParams {
+                run_id: run.id.clone(),
+                since_seq: since,
+                limit: Some(3),
+            })
+            .await
+            .unwrap();
+        assert!(page.events.len() <= 3);
+        since = page.events.last().map(|e| e.seq);
+        paged.extend(page.events);
+        if !page.more {
+            break page.head_seq;
+        }
+    };
+    let stored = d
+        .engine
+        .store()
+        .read(|tx| tx.events_since(0, Some(&run.id)))
+        .unwrap();
+    assert_eq!(paged, stored);
+    assert!(
+        paged
+            .iter()
+            .any(|e| matches!(e.body, EventBody::SessionEvent { .. }))
+    );
+    assert!(
+        paged
+            .iter()
+            .any(|e| matches!(e.body, EventBody::BusMessage { .. }))
+    );
+    let missing = d
+        .client
+        .run_events(&rpc::RunEventsParams {
+            run_id: "nope".into(),
+            ..Default::default()
+        })
+        .await;
+    assert_eq!(rpc_code(missing), rpc::code::NOT_FOUND);
+
+    // events.subscribe replays, then says so, then goes live.
+    let mut events = Client::connect(&d.socket)
+        .await
+        .unwrap()
+        .subscribe(&Subscribe {
+            run_id: Some(run.id.clone()),
+            since: Some(0),
+        })
+        .await
+        .unwrap();
+    let mut replayed = Vec::new();
+    let done = loop {
+        match events.next_notice().await.unwrap().unwrap() {
+            Notice::Event(event) => replayed.push(event),
+            Notice::ReplayDone { seq } => break seq,
+        }
+    };
+    assert_eq!(replayed, stored);
+    assert!(done >= head, "{done} < {head}");
+    d.client
+        .post_bus(&human_post(&run.id, BusEndpoint::Run, "live now"))
+        .await
+        .unwrap();
+    match events.next_notice().await.unwrap().unwrap() {
+        Notice::Event(event) => assert!(event.seq > done),
+        other => panic!("expected a live event, got {other:?}"),
+    }
+
+    // Without `since`, the marker comes right away.
+    let mut fresh = Client::connect(&d.socket)
+        .await
+        .unwrap()
+        .subscribe(&Subscribe::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        fresh.next_notice().await.unwrap().unwrap(),
+        Notice::ReplayDone { .. }
+    ));
+    d.engine.cancel(&run.id).unwrap();
+    let _ = d.stop.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mail_and_exchanges_survive_a_daemon_restart() {
+    let f = fixture(ONE_STEP);
+    let seen = Shared::default();
+    let mut d = daemon(&f, &seen, listens, &[]).await;
+    let run = start(&f, &d.engine, "Add a health endpoint").await;
+    wait_for(&d.engine, &run.id, |r| r.status == RunStatus::Waiting).await;
+
+    // A message on the run's channel wakes nobody: it sits unread in the
+    // implementer's mailbox when the daemon stops.
+    let posted = d
+        .client
+        .post_bus(&human_post(
+            &run.id,
+            BusEndpoint::Run,
+            "Remember the changelog",
+        ))
+        .await
+        .unwrap();
+    let old_session = d.engine.sessions(Some(&run.id)).unwrap()[0].id.clone();
+    assert_eq!(posted.delivered_to, std::slice::from_ref(&old_session));
+    d.engine.shutdown();
+    let _ = d.stop.send(());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The new daemon queues it again for the role and starts a session for
+    // it; the answer continues the old exchange.
+    let d = daemon(&f, &seen, listens, &[]).await;
+    d.engine.resume().unwrap();
+    eventually("the new implementer answering", || {
+        has_note(&seen, "fake-coder answered: true")
+    })
+    .await;
+    assert!(has_note(&seen, "fake-coder read: Remember the changelog").is_some());
+    let log = bus_log(&d.engine, &run.id);
+    let left = log
+        .iter()
+        .find(|m| m.kind == BusMessageKind::Left)
+        .expect("the old session is marked gone");
+    assert_eq!(left.queued_for_role.as_deref(), Some("implementer"));
+    assert!(
+        matches!(&left.from, BusEndpoint::Session { session_id, .. } if *session_id == old_session)
+    );
+    let answer = eventually("the answer in the log", || {
+        bus_log(&d.engine, &run.id)
+            .into_iter()
+            .find(|m| m.to == BusEndpoint::Human)
+    })
+    .await;
+    assert_eq!(answer.in_reply_to, Some(posted.message_id));
+    assert_eq!((answer.exchange, answer.turn), (Some(posted.exchange), 2));
+    assert_eq!(answer.message_id, Some(posted.message_id + 1));
+
+    // Another restart does not deliver it again: the new session was woken
+    // for it.
+    d.engine.shutdown();
+    let _ = d.stop.send(());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let before = notes(&seen).len();
+    let d = daemon(&f, &seen, listens, &[]).await;
+    d.engine.resume().unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let again = notes(&seen)[before..].to_vec();
+    assert!(again.is_empty(), "{again:?}");
+    d.engine.cancel(&run.id).unwrap();
     let _ = d.stop.send(());
 }

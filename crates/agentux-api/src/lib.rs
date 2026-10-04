@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 mod client;
 pub mod rpc;
 
-pub use client::{Client, ClientError, Subscription};
+pub use client::{Client, ClientError, Notice, Subscription};
 
 /// Overrides the socket path for every client and the daemon.
 pub const SOCKET_ENV: &str = "AGENTUX_SOCKET";
@@ -343,11 +343,14 @@ pub enum SessionEvent {
 }
 
 string_enum!(
-    /// `user` is the prompt AgentUX sent; `system` is a note from the daemon.
+    /// `user` is the prompt AgentUX sent; `human` is a message the human
+    /// typed into the session (`sessions.prompt`); `system` is a note from
+    /// the daemon.
     MessageFrom {
         User => "user",
         Agent => "agent",
         System => "system",
+        Human => "human",
     }
 );
 
@@ -474,7 +477,11 @@ pub enum BusEndpoint {
     Session {
         #[serde(rename = "sessionId")]
         session_id: String,
+        /// Filled by the daemon; clients addressing a session may omit it.
+        #[serde(default)]
         role: String,
+        /// Filled by the daemon; clients addressing a session may omit it.
+        #[serde(default)]
         vendor: String,
     },
     Role {

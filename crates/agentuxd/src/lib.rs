@@ -18,6 +18,7 @@ pub mod bus;
 pub mod engine;
 pub mod executor;
 pub mod forge;
+mod human;
 pub mod prompts;
 pub mod server;
 

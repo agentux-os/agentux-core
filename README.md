@@ -42,6 +42,8 @@ aux deny <request-id> [-m reason]
 aux answer <request-id> <answer>    # answer an agent's question (ask_human)
 aux watch <run-id>                  # history, then live events (bus traffic included) until the run ends
 aux bus <run-id>                    # the run's agent bus log
+aux bus <run-id> --post <to> <text> # post on it as the human (to: role:<name>, session:<id> or run)
+aux say <session-id> <text>         # message a live agent session (after its current turn)
 aux cancel <run-id>
 ```
 
@@ -52,7 +54,8 @@ A run gets its own worktree, then walks the pipeline: agent steps call the execu
 How agent steps work:
 
 - **Sessions.** Each role gets one harness session (the role's `harness` from `agentux.yaml`, launched as in the [`agentux-harness` table](crates/agentux-harness/README.md#harnesses)) in the run's worktree, started when the run first reaches the role (or when a bus message wakes the role) and reused by its later steps. Each harness uses the login you set up for it. Sessions end with the run; after a daemon restart, new ones start. A role's `model` is selected through ACP when the harness offers a model choice (a session config option of category `model`); otherwise the session uses the harness's default and its log says so.
-- **Agent bus.** Every session gets the `agentux` MCP server (`aux bus-stdio` with a per-session token) and, before its first prompt, a short prompt saying who it is and how to use the bus. Agents message each other, request reviews, hand off and ask you questions (`question` requests: `aux answer <id> <text>`). A message wakes its recipient with a prompt (after its current turn), or starts the session of a role that has none; exchanges stop at `bus.max_turns_per_exchange`. Everything is logged: `aux bus <run-id>`, `aux watch`. Details in [docs/api.md](docs/api.md#agent-bus).
+- **Agent bus.** Every session gets the `agentux` MCP server (`aux bus-stdio` with a per-session token) and, before its first prompt, a short prompt saying who it is and how to use the bus. Agents message each other, request reviews, hand off and ask you questions (`question` requests: `aux answer <id> <text>`). A message wakes its recipient with a prompt (after its current turn), or starts the session of a role that has none; exchanges stop at `bus.max_turns_per_exchange`. Everything is logged: `aux bus <run-id>`, `aux watch`. You can post too (`aux bus <run-id> --post role:reviewer <text>`, API `bus.post`), with the same wakes. After a daemon restart, each run's bus is rebuilt from its log: exchange turn counts, reply routing, and mail nobody was woken for yet. Details in [docs/api.md](docs/api.md#agent-bus).
+- **Talking to a session.** `aux say <session-id> <text>` (API `sessions.prompt`) sends your message to a live session as an extra turn, after the turn in progress; it is logged as a `human` message of the session.
 - **Prompts** ([`prompts.rs`](crates/agentuxd/src/prompts.rs)) are self-contained: the run's prompt or issue, the step, the role, the plan, and the gate output or review comments that sent the run back. The planner's reply is the plan.
 - **Commits.** Agents are told to edit files and not commit; after each `implement` and `custom` step the daemon commits whatever changed in the worktree (`git add --all`, so keep build artifacts such as `__pycache__/` in `.gitignore`: files left by a planner or reviewer running the tests end up in the next commit), with a subject derived from the run (`<title>`, `Fix failing checks: <title>`, `Address review comments: <title>`). Without a git identity it commits as `AgentUX <agentux@localhost>`.
 - **Review verdicts.** The reviewer is asked to end with a fenced JSON block, `{"verdict": "APPROVE" | "CHANGES_REQUESTED", "comments": ...}`. The last such object wins; without one, the last upper-case `APPROVE` / `CHANGES_REQUESTED` keyword does; without either, the reviewer is asked once more, then the step fails.
@@ -69,13 +72,14 @@ aux exec --harness <id> [--cwd <dir>] "<prompt>"
 aux worktree create <run-id> [--from <ref>] [--base-dir <dir>] [--repo <dir>]
 aux worktree list [--repo <dir>]
 aux worktree remove <run-id> [--force] [--delete-branch] [--repo <dir>]
-aux bus-stdio --session-token <t>   # the agentux MCP server for one session (agentuxd passes this to harnesses)
+aux bus-stdio                       # the agentux MCP server for one session (agentuxd passes this to harnesses,
+                                    # with the token in $AGENTUX_BUS_SESSION_TOKEN; --session-token <t> also works)
 aux bus-stdio --standalone [--project <dir>] [--role <r>]   # the same on an in-memory bus, for trying the tools by hand
 ```
 
 `aux worktree` and `aux exec` are development aids: `agentuxd` manages run worktrees itself, and `aux exec` runs one prompt against a harness (`claude-code`, `codex`, `opencode`, `antigravity`), streams what it does and asks y/n for each permission request; Ctrl-C cancels the turn.
 
-`aux bus-stdio` is the stdio MCP server harnesses launch to reach the bus: `agentuxd` passes it in ACP `session/new` with the session's token, and it forwards each tool call to the daemon (see the [`agentux-bus` README](crates/agentux-bus/README.md#transport-and-the-daemon-bridge)).
+`aux bus-stdio` is the stdio MCP server harnesses launch to reach the bus: `agentuxd` passes it in ACP `session/new` with the session's token in its environment (not on the command line, where other local users could read it), and it forwards each tool call to the daemon (see the [`agentux-bus` README](crates/agentux-bus/README.md#transport-and-the-daemon-bridge)).
 
 ## Install
 
@@ -109,7 +113,7 @@ Linux is the target. The crate holding `aux` is named `aux-cli` because `aux` is
 
 - Per-project permission policies in `agentux.yaml`; harness-specific model selection where ACP offers none.
 - Headless fallbacks for the harnesses, behind the same `Harness` trait ([ADR 0002](https://github.com/agentux-os/agentux/blob/main/docs/adr/0002-harness-integration-via-acp.md)).
-- Agent bus: messages from the human into a run (`Bus::post_from_human` is there; no API method yet), mailboxes that survive a daemon restart, and the token budget per run from ADR 0004.
+- Agent bus: the token budget per run from ADR 0004; logging reads so restored mailboxes are exact.
 - `aux attach` (follow and talk to one session); the cockpit's real `DaemonClient` on top of the sessions API.
 
 ## Relevant ADRs
