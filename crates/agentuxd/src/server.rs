@@ -190,6 +190,21 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
             let params: rpc::Resolve = parse(params)?;
             to_value(engine.deny(&params.request_id, params.answer.as_deref()))
         }
+        method::BUS_LIST => {
+            let params: rpc::ListBus = parse(params)?;
+            to_value(engine.bus_list(&params.run_id))
+        }
+        // The bridge behind `aux bus-stdio`. A `bus.call` can wait minutes
+        // (ask_human), which holds up later requests on this connection, so
+        // the bridge sends each call on a connection of its own.
+        method::BUS_HELLO => {
+            let params: agentux_bus::BridgeHello = parse(params)?;
+            to_value(engine.bus_hello(&params.session_token))
+        }
+        method::BUS_CALL => {
+            let params: agentux_bus::BridgeCall = parse(params)?;
+            to_value(engine.bus_call(&params.session_token, params.call).await)
+        }
         _ => Err(rpc::Error::new(
             code::METHOD_NOT_FOUND,
             format!("unknown method {method:?}"),
@@ -318,6 +333,7 @@ fn rpc_error(e: Error) -> rpc::Error {
         Error::Conflict(_) => code::CONFLICT,
         Error::InvalidProject(_) => code::INVALID_PROJECT,
         Error::InvalidParams(_) => code::INVALID_PARAMS,
+        Error::Unauthorized(_) => code::UNAUTHORIZED,
         Error::Internal(_) => code::INTERNAL_ERROR,
     };
     rpc::Error::new(code, e.to_string())

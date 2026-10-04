@@ -8,6 +8,10 @@
 //! daemon restart gets everything it needs. Session events are coalesced and
 //! handed to the engine's [`StepHost`]; permission requests become approval
 //! requests through it.
+//!
+//! Every session gets the `agentux` bus as an MCP server in `session/new`,
+//! and the bus's session prompt before its first prompt. Wakes from the bus
+//! are extra turns in the target session, queued behind a turn in progress.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,11 +24,13 @@ use agentux_api::{
 };
 use agentux_harness::{
     AcpHarness, AcpSession, Decision, Event, Events, Harness, HarnessSession, HarnessSpec,
-    PermissionHandler, PermissionRequest, PlanStatus, StopReason, permission_handler,
+    McpServer, ModelSelection, PermissionHandler, PermissionRequest, PlanStatus, StopReason,
+    permission_handler,
 };
 
 use crate::executor::{
-    AgentOutcome, AgentTask, BoxFuture, PullRequestOutcome, PullRequestTask, StepExecutor, StepHost,
+    AgentOutcome, AgentTask, BoxFuture, PullRequestOutcome, PullRequestTask, StepExecutor,
+    StepHost, WakeTask,
 };
 use crate::forge;
 use crate::prompts::{self, Verdict};
@@ -38,13 +44,23 @@ const MAX_EVENT_TEXT: usize = 16 * 1024;
 /// How long a released session gets to exit.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What to launch: the harness, where, with which model and MCP servers.
+#[derive(Debug, Clone, Copy)]
+pub struct LaunchSpec<'a> {
+    pub harness: &'a str,
+    pub cwd: &'a Path,
+    /// The role's `model` from `agentux.yaml`.
+    pub model: Option<&'a str>,
+    /// The `agentux` bus, to pass in `session/new`.
+    pub mcp_servers: &'a [McpServer],
+}
+
 /// Starts harness sessions. The daemon uses [`HarnessLauncher`]; tests plug in
 /// in-process agents.
 pub trait Launcher: Send + Sync + 'static {
     fn launch<'a>(
         &'a self,
-        harness: &'a str,
-        cwd: &'a Path,
+        spec: LaunchSpec<'a>,
         permissions: PermissionHandler,
     ) -> BoxFuture<'a, Result<(AcpSession, Events), String>>;
 }
@@ -55,20 +71,22 @@ pub struct HarnessLauncher;
 impl Launcher for HarnessLauncher {
     fn launch<'a>(
         &'a self,
-        harness: &'a str,
-        cwd: &'a Path,
+        spec: LaunchSpec<'a>,
         permissions: PermissionHandler,
     ) -> BoxFuture<'a, Result<(AcpSession, Events), String>> {
         Box::pin(async move {
-            let Some(spec) = HarnessSpec::find(harness) else {
+            let Some(harness) = HarnessSpec::find(spec.harness) else {
                 let known: Vec<String> = HarnessSpec::builtin().into_iter().map(|s| s.id).collect();
                 return Err(format!(
-                    "unknown harness `{harness}` (known: {})",
+                    "unknown harness `{}` (known: {})",
+                    spec.harness,
                     known.join(", ")
                 ));
             };
-            AcpHarness::new(spec)
-                .start(cwd, permissions)
+            AcpHarness::new(harness)
+                .with_mcp_servers(spec.mcp_servers.to_vec())
+                .with_model(spec.model.map(str::to_string))
+                .start(spec.cwd, permissions)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -82,9 +100,14 @@ struct Slot {
     /// The daemon's id of the session.
     id: String,
     harness: String,
-    /// The host of the step currently using the session, which permission
-    /// requests go to. `None` between steps: requests are then denied.
+    /// The host of the turn currently running in the session (a step's, or
+    /// a bus wake's), which permission requests go to. `None` between turns:
+    /// requests are then denied.
     host: HostSlot,
+    /// The bus system prompt, prepended to the session's first prompt.
+    intro: Mutex<Option<String>>,
+    /// Held for a whole turn (or a step's turns): a wake for a session that
+    /// is mid-turn waits here.
     live: tokio::sync::Mutex<Live>,
 }
 
@@ -93,10 +116,48 @@ struct Live {
     events: Events,
 }
 
+impl Slot {
+    /// `text`, preceded by the session prompt the first time.
+    fn with_intro(&self, text: &str) -> String {
+        match lock(&self.intro).take() {
+            Some(intro) => format!("{intro}\n\n---\n\n{text}"),
+            None => text.to_string(),
+        }
+    }
+}
+
+/// Sets the slot's host for as long as it lives.
+struct HostGuard<'a>(&'a Slot);
+
+impl<'a> HostGuard<'a> {
+    fn set(slot: &'a Slot, host: &Arc<dyn StepHost>) -> Self {
+        *lock(&slot.host) = Some(Arc::clone(host));
+        Self(slot)
+    }
+}
+
+impl Drop for HostGuard<'_> {
+    fn drop(&mut self) {
+        *lock(&self.0.host) = None;
+    }
+}
+
+/// The session a step or a wake needs.
+struct Want<'a> {
+    run_id: &'a str,
+    role: &'a str,
+    harness: &'a str,
+    model: Option<&'a str>,
+    worktree: &'a Path,
+}
+
 pub struct AcpExecutor {
     launcher: Box<dyn Launcher>,
     /// Keyed by (run id, role).
     sessions: Mutex<HashMap<(String, String), Arc<Slot>>>,
+    /// Held while a session starts, so that a step and a wake for the same
+    /// role do not both start one.
+    starting: tokio::sync::Mutex<()>,
 }
 
 impl Default for AcpExecutor {
@@ -110,6 +171,7 @@ impl AcpExecutor {
         Self {
             launcher: Box::new(launcher),
             sessions: Mutex::new(HashMap::new()),
+            starting: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -118,31 +180,44 @@ impl AcpExecutor {
     }
 
     /// The role's live session, started if needed.
-    async fn slot(&self, task: &AgentTask, host: &Arc<dyn StepHost>) -> Result<Arc<Slot>, String> {
-        let key = (task.run_id.clone(), task.role.clone());
+    async fn slot(&self, want: &Want<'_>, host: &Arc<dyn StepHost>) -> Result<Arc<Slot>, String> {
+        let key = (want.run_id.to_string(), want.role.to_string());
+        let _starting = self.starting.lock().await;
         if let Some(slot) = self.sessions().get(&key)
-            && slot.harness == task.harness
+            && slot.harness == want.harness
         {
             return Ok(Arc::clone(slot));
         }
-        let id = host.open_session(&task.harness, task.model.as_deref())?;
+        let opened = host.open_session(want.harness, want.model)?;
         let host_slot: HostSlot = Arc::default();
         let handler = permissions(
             Arc::clone(&host_slot),
-            id.clone(),
-            task.role.clone(),
-            task.harness.clone(),
+            opened.id.clone(),
+            want.role.to_string(),
+            want.harness.to_string(),
         );
-        match self
-            .launcher
-            .launch(&task.harness, &task.worktree, handler)
-            .await
-        {
+        let spec = LaunchSpec {
+            harness: want.harness,
+            cwd: want.worktree,
+            model: want.model,
+            mcp_servers: &opened.mcp_servers,
+        };
+        match self.launcher.launch(spec, handler).await {
             Ok((session, events)) => {
+                if let ModelSelection::Unavailable(note) = session.model_selection() {
+                    host.session_event(
+                        &opened.id,
+                        SessionEvent::Message {
+                            from: MessageFrom::System,
+                            text: note.clone(),
+                        },
+                    );
+                }
                 let slot = Arc::new(Slot {
-                    id,
-                    harness: task.harness.clone(),
+                    id: opened.id,
+                    harness: want.harness.to_string(),
                     host: host_slot,
+                    intro: Mutex::new(opened.system_prompt),
                     live: tokio::sync::Mutex::new(Live {
                         session: Some(session),
                         events,
@@ -154,8 +229,8 @@ impl AcpExecutor {
                 Ok(slot)
             }
             Err(e) => {
-                host.session_state(&id, SessionState::Ended);
-                Err(format!("cannot start the {} harness: {e}", task.harness))
+                host.session_state(&opened.id, SessionState::Ended);
+                Err(format!("cannot start the {} harness: {e}", want.harness))
             }
         }
     }
@@ -166,17 +241,17 @@ impl AcpExecutor {
         &self,
         task: &AgentTask,
         slot: &Slot,
+        live: &mut Live,
         host: &Arc<dyn StepHost>,
     ) -> Result<AgentOutcome, TurnError> {
-        let mut live = slot.live.lock().await;
-        let reply = turn(&mut live, &slot.id, host, &prompts::step_prompt(task)).await?;
+        let prompt = slot.with_intro(&prompts::step_prompt(task));
+        let reply = turn(live, &slot.id, host, &prompt).await?;
         match task.step {
             StepKind::Review => {
                 let verdict = match prompts::parse_verdict(&reply) {
                     Some(verdict) => verdict,
                     None => {
-                        let again =
-                            turn(&mut live, &slot.id, host, prompts::VERDICT_REMINDER).await?;
+                        let again = turn(live, &slot.id, host, prompts::VERDICT_REMINDER).await?;
                         prompts::parse_verdict(&again).ok_or_else(|| {
                             TurnError::Failed(format!(
                                 "the reviewer gave no verdict (expected APPROVE or CHANGES_REQUESTED); it replied: {}",
@@ -205,12 +280,28 @@ impl AcpExecutor {
         }
     }
 
-    fn forget(&self, task: &AgentTask, slot: &Arc<Slot>) {
-        let key = (task.run_id.clone(), task.role.clone());
+    fn forget(&self, run_id: &str, role: &str, slot: &Arc<Slot>) {
+        let key = (run_id.to_string(), role.to_string());
         let mut sessions = self.sessions();
         if sessions.get(&key).is_some_and(|s| Arc::ptr_eq(s, slot)) {
             sessions.remove(&key);
         }
+    }
+
+    /// Ends a session whose harness died or broke the protocol: the next
+    /// step of the role starts a new one.
+    fn broken(&self, run_id: &str, role: &str, slot: Arc<Slot>, host: &Arc<dyn StepHost>) {
+        self.forget(run_id, role, &slot);
+        host.session_state(&slot.id, SessionState::Ended);
+        tokio::spawn(shutdown(slot));
+    }
+
+    /// The live session with this id, if any.
+    fn find(&self, run_id: &str, session_id: &str) -> Option<(String, Arc<Slot>)> {
+        self.sessions()
+            .iter()
+            .find(|((run, _), slot)| run == run_id && slot.id == session_id)
+            .map(|((_, role), slot)| (role.clone(), Arc::clone(slot)))
     }
 }
 
@@ -221,25 +312,73 @@ impl StepExecutor for AcpExecutor {
         host: Arc<dyn StepHost>,
     ) -> BoxFuture<'a, Result<AgentOutcome, String>> {
         Box::pin(async move {
-            let slot = self.slot(task, &host).await?;
-            *lock(&slot.host) = Some(Arc::clone(&host));
-            let result = self.work(task, &slot, &host).await;
-            *lock(&slot.host) = None;
+            let want = Want {
+                run_id: &task.run_id,
+                role: &task.role,
+                harness: &task.harness,
+                model: task.model.as_deref(),
+                worktree: &task.worktree,
+            };
+            let slot = self.slot(&want, &host).await?;
+            let result = {
+                let mut live = slot.live.lock().await;
+                let _host = HostGuard::set(&slot, &host);
+                let result = self.work(task, &slot, &mut live, &host).await;
+                // Before the next turn (a queued wake) can start.
+                if !matches!(result, Err(TurnError::Broken(_))) {
+                    host.session_state(&slot.id, SessionState::Idle);
+                }
+                result
+            };
             match result {
-                Ok(outcome) => {
-                    host.session_state(&slot.id, SessionState::Idle);
-                    Ok(outcome)
-                }
-                Err(TurnError::Failed(message)) => {
-                    host.session_state(&slot.id, SessionState::Idle);
-                    Err(message)
-                }
+                Ok(outcome) => Ok(outcome),
+                Err(TurnError::Failed(message)) => Err(message),
                 Err(TurnError::Broken(message)) => {
-                    // The harness died or broke the protocol: the next step of
-                    // this role starts a new session.
-                    self.forget(task, &slot);
-                    host.session_state(&slot.id, SessionState::Ended);
-                    tokio::spawn(shutdown(slot));
+                    self.broken(&task.run_id, &task.role, slot, &host);
+                    Err(format!("the {} session failed: {message}", task.harness))
+                }
+            }
+        })
+    }
+
+    fn wake<'a>(
+        &'a self,
+        task: &'a WakeTask,
+        host: Arc<dyn StepHost>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            let (role, slot) = match &task.session_id {
+                Some(id) => match self.find(&task.run_id, id) {
+                    Some(found) => found,
+                    // The session ended meanwhile; its mail went with it.
+                    None => return Ok(()),
+                },
+                None => {
+                    let want = Want {
+                        run_id: &task.run_id,
+                        role: &task.role,
+                        harness: &task.harness,
+                        model: task.model.as_deref(),
+                        worktree: &task.worktree,
+                    };
+                    (task.role.clone(), self.slot(&want, &host).await?)
+                }
+            };
+            let result = {
+                let mut live = slot.live.lock().await;
+                let _host = HostGuard::set(&slot, &host);
+                let prompt = slot.with_intro(&task.prompt);
+                let result = turn(&mut live, &slot.id, &host, &prompt).await;
+                if !matches!(result, Err(TurnError::Broken(_))) {
+                    host.session_state(&slot.id, SessionState::Idle);
+                }
+                result
+            };
+            match result {
+                Ok(_) => Ok(()),
+                Err(TurnError::Failed(message)) => Err(message),
+                Err(TurnError::Broken(message)) => {
+                    self.broken(&task.run_id, &role, slot, &host);
                     Err(format!("the {} session failed: {message}", task.harness))
                 }
             }

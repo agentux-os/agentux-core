@@ -99,12 +99,15 @@ string_enum!(
     /// What an approval request is about. `plan` is the approval after a plan
     /// step; `step` is any other `approve: true` step; `permission` is an
     /// agent asking before a tool call (the agent waits for the answer);
-    /// `budget` pauses a run whose spending passed its budget.
+    /// `budget` pauses a run whose spending passed its budget; `question` is
+    /// an agent asking the human through the bus (`ask_human`), answered with
+    /// free text or one of its `options`.
     RequestKind {
         Plan => "plan",
         Step => "step",
         Permission => "permission",
         Budget => "budget",
+        Question => "question",
     }
 );
 
@@ -249,6 +252,10 @@ pub struct PermissionRequest {
     pub title: String,
     /// What is being approved, e.g. the plan text.
     pub detail: String,
+    /// Suggested answers of a `question` request (the human may also answer
+    /// in free text); empty otherwise.
+    #[serde(default)]
+    pub options: Vec<String>,
     pub status: RequestStatus,
     pub answer: Option<String>,
     pub created_at: i64,
@@ -428,4 +435,90 @@ pub enum EventBody {
         session_id: String,
         event: SessionEvent,
     },
+    /// Traffic on the agent bus: a message, a wake, a question to the human
+    /// and its answer, a refusal, a session joining or leaving.
+    BusMessage {
+        message: BusMessage,
+    },
+}
+
+string_enum!(
+    /// What a [`BusMessage`] records. `message`, `review_request`, `handoff`
+    /// and `human_answer` are messages routed between participants (an
+    /// answer that outlived the agent's `ask_human` call arrives as a
+    /// `human_answer` message); `question` and `answer` are an `ask_human`
+    /// escalation and the human's answer; `wake` is the daemon prompting a
+    /// session (or starting one for a role) for new mail; `turn_limit` and
+    /// `tool_denied` are refusals; `joined` and `left` are sessions entering
+    /// and leaving the bus.
+    BusMessageKind {
+        Message => "message",
+        ReviewRequest => "review_request",
+        Handoff => "handoff",
+        HumanAnswer => "human_answer",
+        Question => "question",
+        Answer => "answer",
+        Wake => "wake",
+        TurnLimit => "turn_limit",
+        ToolDenied => "tool_denied",
+        Joined => "joined",
+        Left => "left",
+    }
+);
+
+/// A participant or address on the bus. The cockpit's `BusEndpoint`, plus
+/// `role` (every session playing a role) and `run` (the run's channel).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BusEndpoint {
+    Session {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        role: String,
+        vendor: String,
+    },
+    Role {
+        role: String,
+    },
+    Run,
+    Human,
+    Daemon,
+}
+
+/// One entry of a run's bus log, mapped from the bus's own events. Close to
+/// the cockpit's `BusMessage`; the fields after `maxTurns` are additions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusMessage {
+    /// Unique id of this log entry.
+    pub id: String,
+    pub run_id: String,
+    pub project_id: String,
+    pub kind: BusMessageKind,
+    /// The bus tool behind it (`post_message`, `request_review`, `handoff`,
+    /// `ask_human`, ...), when an agent's tool call caused it.
+    pub tool: Option<String>,
+    pub from: BusEndpoint,
+    pub to: BusEndpoint,
+    /// One line for lists.
+    pub subject: String,
+    pub body: String,
+    pub at: i64,
+    /// Turn within its exchange (messages; 0 otherwise), and the run's limit.
+    pub turn: u32,
+    pub max_turns: u32,
+    /// The bus's message id (pass it as `in_reply_to`), for messages and the
+    /// wakes they caused.
+    pub message_id: Option<u64>,
+    pub exchange: Option<u64>,
+    pub in_reply_to: Option<u64>,
+    /// The `ask_human` question, for `question` and `answer`.
+    pub question_id: Option<u64>,
+    /// The approval request holding a `question`.
+    pub request_id: Option<String>,
+    /// Sessions whose mailbox received a message.
+    #[serde(default)]
+    pub delivered_to: Vec<String>,
+    /// Set when no session played the target role: the message waits for one.
+    pub queued_for_role: Option<String>,
 }

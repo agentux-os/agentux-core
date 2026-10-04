@@ -9,7 +9,7 @@
 //! - [`BusBackend`] is what the daemon provides: run state and the human.
 //!   [`MemoryBackend`] implements it in memory.
 //! - [`BusServer`] is the MCP server for one session, over a [`BusEndpoint`]
-//!   ([`LocalEndpoint`] in-process; a daemon bridge later, see [`bridge`]).
+//!   ([`LocalEndpoint`] in-process, [`DaemonEndpoint`] through `agentuxd`).
 //! - [`session_prompt`] is the system prompt telling a session about the bus.
 
 mod backend;
@@ -22,7 +22,10 @@ mod types;
 
 pub use agentux_config::BusTool;
 pub use backend::{BackendError, BoxFuture, BusBackend, CheckResult, MemoryBackend, RunState};
-pub use bridge::{BusEndpoint, LocalEndpoint, bus_stdio_args};
+pub use bridge::{
+    BridgeCall, BridgeHello, BridgeOutcome, BridgeWelcome, BusEndpoint, DaemonEndpoint,
+    LocalEndpoint, bus_stdio_args,
+};
 pub use bus::{Bus, BusConfig, BusError, DEFAULT_ASK_HUMAN_WAIT, wake_prompt};
 pub use prompt::{description, session_prompt};
 pub use server::{BusServer, SERVER_NAME};

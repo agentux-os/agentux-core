@@ -32,8 +32,10 @@ use agentux_worktree::Worktrees;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
+use crate::bus::{BusLink, Hub};
 use crate::executor::{
-    AgentOutcome, AgentTask, BoxFuture, PullRequestOutcome, PullRequestTask, StepExecutor, StepHost,
+    AgentOutcome, AgentTask, BoxFuture, OpenedSession, PullRequestOutcome, PullRequestTask,
+    StepExecutor, StepHost,
 };
 
 /// Keep at most this much of each check's output.
@@ -46,6 +48,8 @@ pub enum Error {
     Conflict(String),
     InvalidProject(String),
     InvalidParams(String),
+    /// A bus bridge request with an unknown or expired session token.
+    Unauthorized(String),
     Internal(String),
 }
 
@@ -56,6 +60,7 @@ impl fmt::Display for Error {
             | Self::Conflict(m)
             | Self::InvalidProject(m)
             | Self::InvalidParams(m)
+            | Self::Unauthorized(m)
             | Self::Internal(m) => f.write_str(m),
         }
     }
@@ -72,28 +77,33 @@ impl From<agentux_store::Error> for Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Engine behavior chosen when the daemon starts.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Settings {
     /// Allow every tool call agents ask about, without asking the human.
     /// Dangerous: agents can then run any command in the worktree.
     pub auto_approve_permissions: bool,
+    /// How sessions reach the agent bus. `None`: sessions still join their
+    /// run's bus (wakes work), but get no `agentux` MCP server.
+    pub bus: Option<BusLink>,
 }
 
 /// Owns the store, the executor and one driver task per active run. Cheap to
 /// clone.
 #[derive(Clone)]
 pub struct Engine {
-    inner: Arc<Inner>,
+    pub(crate) inner: Arc<Inner>,
 }
 
-struct Inner {
-    store: Store,
-    executor: Arc<dyn StepExecutor>,
-    settings: Settings,
+pub(crate) struct Inner {
+    pub(crate) store: Store,
+    pub(crate) executor: Arc<dyn StepExecutor>,
+    pub(crate) settings: Settings,
     /// Driver task per run. A run has at most one.
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     /// Agents waiting for the answer to a permission request, by request id.
     waiters: Mutex<HashMap<String, oneshot::Sender<bool>>>,
+    /// The agent buses of active runs.
+    pub(crate) hub: Hub,
 }
 
 impl Engine {
@@ -113,8 +123,13 @@ impl Engine {
                 settings,
                 tasks: Mutex::new(HashMap::new()),
                 waiters: Mutex::new(HashMap::new()),
+                hub: Hub::default(),
             }),
         }
+    }
+
+    pub(crate) fn from_inner(inner: Arc<Inner>) -> Self {
+        Self { inner }
     }
 
     pub fn store(&self) -> &Store {
@@ -124,7 +139,8 @@ impl Engine {
     /// Picks up every unfinished run after a (re)start. Attempts left
     /// `running` by a previous process are marked `interrupted`; their step
     /// runs again. The previous process's sessions are gone, so their
-    /// permission requests are cancelled and the sessions marked ended.
+    /// permission requests and questions to the human are cancelled and the
+    /// sessions marked ended.
     /// Returns how many runs were resumed.
     pub fn resume(&self) -> Result<usize> {
         let ids = self.inner.store.write(|tx| {
@@ -147,7 +163,10 @@ impl Engine {
                     }
                 }
                 for request in tx.requests(Some(id), Some(RequestStatus::Pending))? {
-                    if request.kind == RequestKind::Permission {
+                    if matches!(
+                        request.kind,
+                        RequestKind::Permission | RequestKind::Question
+                    ) {
                         tx.resolve_request(
                             &request.id,
                             RequestStatus::Cancelled,
@@ -339,8 +358,10 @@ impl Engine {
     /// Approves a pending request. An agent waiting for permission gets to
     /// run its tool call; a paused run resumes.
     pub fn approve(&self, request_id: &str, answer: Option<&str>) -> Result<PermissionRequest> {
-        if self.request_kind(request_id)? == RequestKind::Permission {
-            return self.answer_permission(request_id, true, answer);
+        match self.request_kind(request_id)? {
+            RequestKind::Permission => return self.answer_permission(request_id, true, answer),
+            RequestKind::Question => return self.answer_question(request_id, true, answer),
+            _ => {}
         }
         let request = self.inner.store.write(|tx| {
             let (request, mut record) = pending_request(tx, request_id)?;
@@ -380,8 +401,10 @@ impl Engine {
     /// Denies a pending request. An agent asking for permission is told no
     /// and carries on; any other denial fails the run.
     pub fn deny(&self, request_id: &str, answer: Option<&str>) -> Result<PermissionRequest> {
-        if self.request_kind(request_id)? == RequestKind::Permission {
-            return self.answer_permission(request_id, false, answer);
+        match self.request_kind(request_id)? {
+            RequestKind::Permission => return self.answer_permission(request_id, false, answer),
+            RequestKind::Question => return self.answer_question(request_id, false, answer),
+            _ => {}
         }
         let (request, run_id) = self.inner.store.write(|tx| {
             let (request, mut record) = pending_request(tx, request_id)?;
@@ -490,6 +513,7 @@ impl Engine {
                 title,
                 detail,
                 session_id: Some(session_id.to_string()),
+                options: Vec::new(),
             })?;
             tx.emit(
                 Some(&host.run_id),
@@ -568,8 +592,10 @@ impl Engine {
         self.inner.waiters.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Lets the executor stop what it keeps for a finished run.
+    /// Lets the executor stop what it keeps for a finished run, and closes
+    /// the run's bus.
     fn release(&self, run_id: &str) {
+        self.close_bus(run_id);
         let executor = Arc::clone(&self.inner.executor);
         let run_id = run_id.to_string();
         tokio::spawn(async move { executor.release(&run_id).await });
@@ -1157,6 +1183,7 @@ fn ask(tx: &mut Tx<'_>, record: &mut RunRecord, kind: RequestKind, detail: Strin
         RequestKind::Step => format!("Approve the {step} step of \"{}\"", record.run.title),
         RequestKind::Budget => format!("\"{}\" is over its budget", record.run.title),
         RequestKind::Permission => format!("Permission for \"{}\"", record.run.title),
+        RequestKind::Question => format!("A question about \"{}\"", record.run.title),
     };
     let request = tx.create_request(NewRequest {
         kind,
@@ -1167,6 +1194,7 @@ fn ask(tx: &mut Tx<'_>, record: &mut RunRecord, kind: RequestKind, detail: Strin
         title,
         detail,
         session_id: None,
+        options: Vec::new(),
     })?;
     record.run.status = RunStatus::Waiting;
     record.phase = Phase::Approval;
@@ -1197,7 +1225,7 @@ fn pending_request(tx: &Tx<'_>, request_id: &str) -> Result<(PermissionRequest, 
 }
 
 /// The pipeline the run started with.
-fn config_of(record: &RunRecord, project_root: &Path) -> Result<Config> {
+pub(crate) fn config_of(record: &RunRecord, project_root: &Path) -> Result<Config> {
     let config = match &record.config_yaml {
         Some(yaml) => Config::from_yaml(yaml)
             .map_err(|e| Error::Internal(format!("the run's stored pipeline is invalid: {e}")))?,
@@ -1220,7 +1248,7 @@ fn default_pipeline(project_root: &Path) -> Config {
     Config::default_for(project_root)
 }
 
-fn project_root(tx: &Tx<'_>, record: &RunRecord) -> Result<PathBuf> {
+pub(crate) fn project_root(tx: &Tx<'_>, record: &RunRecord) -> Result<PathBuf> {
     tx.project(&record.run.project_id)?
         .map(|p| PathBuf::from(p.path))
         .ok_or_else(|| Error::Internal(format!("project {} vanished", record.run.project_id)))
@@ -1293,15 +1321,17 @@ fn latest_output(attempts: &[StepAttempt], kind: StepKind) -> Option<String> {
 
 // ---- agent steps: the host, permissions, sessions and commits ----
 
-/// The engine's side of one agent step, handed to the executor.
-struct RunHost {
-    engine: Engine,
-    run_id: String,
-    project_id: String,
-    role: String,
-    step_index: usize,
-    step: StepKind,
-    cwd: String,
+/// The engine's side of one agent step (or bus wake), handed to the
+/// executor.
+pub(crate) struct RunHost {
+    pub(crate) engine: Engine,
+    pub(crate) run_id: String,
+    pub(crate) project_id: String,
+    pub(crate) role: String,
+    /// The run's step when the turn started.
+    pub(crate) step_index: usize,
+    pub(crate) step: StepKind,
+    pub(crate) cwd: String,
 }
 
 impl RunHost {
@@ -1317,7 +1347,7 @@ impl StepHost for RunHost {
         &self,
         harness: &str,
         model: Option<&str>,
-    ) -> std::result::Result<String, String> {
+    ) -> std::result::Result<OpenedSession, String> {
         let now = now_ms();
         let session = Session {
             id: new_id(),
@@ -1348,13 +1378,33 @@ impl StepHost for RunHost {
                 Ok::<_, Error>(())
             })
             .map_err(|e| e.to_string())?;
-        Ok(session.id)
+        // A session without the bus still works; say why it has none.
+        let (mcp_servers, system_prompt) = self
+            .engine
+            .bus_attach(&self.run_id, &self.role, harness, &session.id)
+            .unwrap_or_else(|e| {
+                self.record("a bus failure", |tx| {
+                    Ok(tx.log(
+                        &self.run_id,
+                        format!("bus: session {} is not on the bus: {e}", session.id),
+                    )?)
+                });
+                (Vec::new(), None)
+            });
+        Ok(OpenedSession {
+            id: session.id,
+            mcp_servers,
+            system_prompt,
+        })
     }
 
     fn session_state(&self, session_id: &str, state: SessionState) {
         self.record("a session state", |tx| {
             set_session_state(tx, session_id, state)
         });
+        if state == SessionState::Ended {
+            self.engine.bus_leave(session_id);
+        }
     }
 
     fn session_event(&self, session_id: &str, event: SessionEvent) {
@@ -1432,7 +1482,12 @@ impl Drop for PendingPermission {
 /// After a permission request is resolved: the session works again, and the
 /// run runs again once nothing else is pending.
 fn resume_after_permission(tx: &mut Tx<'_>, run_id: &str, session_id: Option<&str>) -> Result<()> {
-    let pending = tx.requests(Some(run_id), Some(RequestStatus::Pending))?;
+    // Questions to the human do not pause the run.
+    let pending: Vec<PermissionRequest> = tx
+        .requests(Some(run_id), Some(RequestStatus::Pending))?
+        .into_iter()
+        .filter(|r| r.kind != RequestKind::Question)
+        .collect();
     if let Some(session_id) = session_id
         && !pending
             .iter()

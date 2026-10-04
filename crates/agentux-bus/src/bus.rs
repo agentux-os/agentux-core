@@ -551,6 +551,16 @@ impl Bus {
         Ok(())
     }
 
+    /// Makes message, exchange and question ids start after these values. A
+    /// daemon that reopens a run after a restart passes the highest ids in
+    /// the run's persisted log, so new ids never repeat old ones.
+    pub fn reserve_ids(&self, message: u64, exchange: u64, question: u64) {
+        let mut state = self.lock();
+        state.next_message = state.next_message.max(message);
+        state.next_exchange = state.next_exchange.max(exchange);
+        state.next_question = state.next_question.max(question);
+    }
+
     /// Removes a run, its sessions, queues and pending questions.
     pub fn close_run(&self, run: &RunId) {
         let mut state = self.lock();
@@ -614,6 +624,11 @@ impl Bus {
                 },
             );
         }
+    }
+
+    /// Whether `session` is on the bus.
+    pub fn has_session(&self, session: &SessionId) -> bool {
+        self.lock().sessions.contains_key(session)
     }
 
     pub fn identity(&self, session: &SessionId) -> Option<SessionIdentity> {

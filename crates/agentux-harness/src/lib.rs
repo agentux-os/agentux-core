@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 mod acp;
 mod spec;
 
-pub use acp::{AcpHarness, AcpSession};
+pub use acp::{AcpHarness, AcpSession, ModelSelection, SessionOptions};
 pub use spec::HarnessSpec;
 
 /// Starts sessions with one harness.

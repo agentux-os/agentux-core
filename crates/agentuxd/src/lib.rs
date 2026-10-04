@@ -14,13 +14,15 @@ use agentux_store::Store;
 use clap::Args;
 
 pub mod acp;
+pub mod bus;
 pub mod engine;
 pub mod executor;
 pub mod forge;
 pub mod prompts;
 pub mod server;
 
-pub use acp::{AcpExecutor, HarnessLauncher, Launcher};
+pub use acp::{AcpExecutor, HarnessLauncher, LaunchSpec, Launcher};
+pub use bus::{BusLink, aux_binary};
 pub use engine::{Engine, Settings};
 pub use executor::{FakeExecutor, StepExecutor, StepHost};
 
@@ -71,6 +73,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn Error>> {
     };
     let settings = Settings {
         auto_approve_permissions: options.auto_approve_permissions,
+        bus: Some(BusLink::new(socket.clone())),
     };
     let engine = Engine::with_settings(store, executor, settings);
     let resumed = engine.resume()?;

@@ -188,6 +188,7 @@ fn attempts_and_requests_are_tracked() {
                 title: "Approve the plan".into(),
                 detail: "1. do it".into(),
                 session_id: None,
+                options: Vec::new(),
             })
         })
         .unwrap();
@@ -269,4 +270,88 @@ fn sessions_round_trip_and_emit_snapshots() {
         }
     }
     assert_eq!(kinds, [SessionState::Active, SessionState::Idle]);
+}
+
+#[test]
+fn questions_keep_their_options_and_bus_messages_are_listed_per_run() {
+    use agentux_api::{BusEndpoint, BusMessageKind};
+
+    let store = Store::open_in_memory().unwrap();
+    let project = store
+        .write(|tx| tx.register_project("app", "/src/app"))
+        .unwrap();
+    let record = sample_run(&project.id);
+    let run_id = record.run.id.clone();
+    store.write(|tx| tx.insert_run(&record)).unwrap();
+
+    let question = store
+        .write(|tx| {
+            tx.create_request(NewRequest {
+                kind: RequestKind::Question,
+                run_id: run_id.clone(),
+                project_id: project.id.clone(),
+                step_index: 0,
+                step: StepKind::Implement,
+                title: "implementer asks: which database?".into(),
+                detail: "which database?".into(),
+                session_id: Some("s1".into()),
+                options: vec!["postgres".into(), "sqlite".into()],
+            })
+        })
+        .unwrap();
+    let stored = store.read(|tx| tx.request(&question.id)).unwrap().unwrap();
+    assert_eq!(stored.kind, RequestKind::Question);
+    assert_eq!(stored.options, ["postgres", "sqlite"]);
+
+    let message = |id: &str, body: &str| BusMessage {
+        id: id.into(),
+        run_id: run_id.clone(),
+        project_id: project.id.clone(),
+        kind: BusMessageKind::Message,
+        tool: Some("post_message".into()),
+        from: BusEndpoint::Human,
+        to: BusEndpoint::Role {
+            role: "implementer".into(),
+        },
+        subject: body.into(),
+        body: body.into(),
+        at: now_ms(),
+        turn: 1,
+        max_turns: 6,
+        message_id: Some(1),
+        exchange: Some(1),
+        in_reply_to: None,
+        question_id: None,
+        request_id: None,
+        delivered_to: vec![],
+        queued_for_role: Some("implementer".into()),
+    };
+    let (first, second) = (message("m1", "hello"), message("m2", "again"));
+    store
+        .write(|tx| {
+            tx.emit(
+                Some(&run_id),
+                EventBody::BusMessage {
+                    message: first.clone(),
+                },
+            )?;
+            tx.log(&run_id, "not a bus message")?;
+            tx.emit(
+                Some(&run_id),
+                EventBody::BusMessage {
+                    message: second.clone(),
+                },
+            )
+        })
+        .unwrap();
+    assert_eq!(
+        store.read(|tx| tx.bus_messages(&run_id)).unwrap(),
+        [first, second]
+    );
+    assert!(
+        store
+            .read(|tx| tx.bus_messages("other"))
+            .unwrap()
+            .is_empty()
+    );
 }

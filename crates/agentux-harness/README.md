@@ -6,6 +6,7 @@ Drives coding-agent harnesses through the [Agent Client Protocol](https://agentc
 - `AcpHarness`: spawns the harness from a `HarnessSpec` with the worktree as its working directory, initializes ACP and opens a session there. The harness's stderr is inherited. Shutdown closes its stdin, waits 5 s, then kills it (on Unix, its whole process group, so agents behind `npx` do not linger).
 - `Event`: what a session streams: agent message and thought chunks, tool calls and their updates, plans, file diffs carried by tool calls, and context/cost usage. Other ACP updates (echoed user messages, slash commands, modes) are dropped.
 - Permission requests go to a caller-supplied async `PermissionHandler` that answers `Allow` or `Deny` for that one tool call. The session keeps streaming while it waits. `cancel` withdraws pending requests.
+- `SessionOptions`: MCP servers passed in `session/new` (the `agentux` bus) and a model. ACP has no model field in `session/new`; agents that offer a choice list a session config option of category `model`, and the session selects the model there with `session/set_config_option` (matching the option's value or name). `AcpSession::model_selection` reports `Selected`, or `Unavailable` with the reason when the agent offers no choice or not that model; the agent's default applies then.
 
 `aux exec --harness <id> [--cwd <dir>] "<prompt>"` uses this crate to try a harness by hand.
 

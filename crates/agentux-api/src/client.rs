@@ -11,7 +11,7 @@ use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
 use crate::rpc::{self, method};
-use crate::{Event, PermissionRequest, Project, Run, Session};
+use crate::{BusMessage, Event, PermissionRequest, Project, Run, Session};
 
 pub struct Client {
     lines: Lines<BufReader<OwnedReadHalf>>,
@@ -151,6 +151,14 @@ impl Client {
             answer,
         };
         self.call(method::REQUESTS_DENY, &params).await
+    }
+
+    /// A run's bus log, oldest first.
+    pub async fn list_bus(&mut self, run_id: &str) -> Result<Vec<BusMessage>, ClientError> {
+        let params = rpc::ListBus {
+            run_id: run_id.into(),
+        };
+        self.call(method::BUS_LIST, &params).await
     }
 
     /// Turns the connection into an event stream.

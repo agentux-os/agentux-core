@@ -182,6 +182,62 @@ pub fn spawn_observed(
     script: Script,
     on_new_session: impl Fn(&acp::NewSessionRequest) + Send + Sync + 'static,
 ) -> (Transport, JoinHandle<agent_client_protocol::Result<()>>) {
+    spawn_with(
+        script,
+        Setup {
+            on_new_session: Box::new(on_new_session),
+            ..Setup::default()
+        },
+    )
+}
+
+/// Receives `(config id, value)`.
+pub type OnSetConfig = Box<dyn Fn(&str, &str) + Send + Sync>;
+
+/// How [`spawn_with`] sets up the agent.
+pub struct Setup {
+    /// Called with each `session/new` request.
+    pub on_new_session: Box<dyn Fn(&acp::NewSessionRequest) + Send + Sync>,
+    /// Models offered as a `model` session config option (the first one is
+    /// current). Empty: no model choice is offered.
+    pub models: Vec<String>,
+    /// Called with the config id and value of each
+    /// `session/set_config_option` request.
+    pub on_set_config: OnSetConfig,
+}
+
+impl Default for Setup {
+    fn default() -> Self {
+        Self {
+            on_new_session: Box::new(|_| {}),
+            models: Vec::new(),
+            on_set_config: Box::new(|_, _| {}),
+        }
+    }
+}
+
+/// Like [`spawn`], set up by `setup`.
+pub fn spawn_with(
+    script: Script,
+    setup: Setup,
+) -> (Transport, JoinHandle<agent_client_protocol::Result<()>>) {
+    let Setup {
+        on_new_session,
+        models,
+        on_set_config,
+    } = setup;
+    let model_option = (!models.is_empty()).then(|| {
+        acp::SessionConfigOption::select(
+            "model",
+            "Model",
+            models[0].clone(),
+            models
+                .iter()
+                .map(|m| acp::SessionConfigSelectOption::new(m.clone(), m.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .category(acp::SessionConfigOptionCategory::Model)
+    });
     let (client_io, agent_io) = tokio::io::duplex(256 * 1024);
     let (agent_read, agent_write) = tokio::io::split(agent_io);
     let (client_read, client_write) = tokio::io::split(client_io);
@@ -203,8 +259,23 @@ pub fn spawn_observed(
                 async move |request: acp::NewSessionRequest, responder, _cx| {
                     on_new_session(&request);
                     *cwd.lock().unwrap() = request.cwd;
-                    responder.respond(acp::NewSessionResponse::new(SESSION))
+                    responder.respond(
+                        acp::NewSessionResponse::new(SESSION)
+                            .config_options(model_option.clone().map(|option| vec![option])),
+                    )
                 }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: acp::SetSessionConfigOptionRequest, responder, _cx| {
+                let value = request
+                    .value
+                    .as_value_id()
+                    .map(|v| v.0.to_string())
+                    .unwrap_or_default();
+                on_set_config(&request.config_id.0, &value);
+                responder.respond(acp::SetSessionConfigOptionResponse::new(Vec::new()))
             },
             agent_client_protocol::on_receive_request!(),
         )

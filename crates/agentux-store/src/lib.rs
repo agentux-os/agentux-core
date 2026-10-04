@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentux_api::{
-    AttemptStatus, CheckResult, Event, EventBody, PermissionRequest, Project, PullRequest,
-    RequestKind, RequestStatus, Run, RunStatus, Session, SessionState, SessionUsage, StepAttempt,
-    StepKind,
+    AttemptStatus, BusMessage, CheckResult, Event, EventBody, PermissionRequest, Project,
+    PullRequest, RequestKind, RequestStatus, Run, RunStatus, Session, SessionState, SessionUsage,
+    StepAttempt, StepKind,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
@@ -93,6 +93,8 @@ pub struct NewRequest {
     pub title: String,
     pub detail: String,
     pub session_id: Option<String>,
+    /// Suggested answers, for `question` requests.
+    pub options: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -216,7 +218,7 @@ const ATTEMPT_COLUMNS: &str =
     "id, run_id, step_index, step, status, output, started_at, finished_at";
 
 const REQUEST_COLUMNS: &str = "id, kind, run_id, project_id, step_index, step, title, detail, \
-     status, answer, created_at, resolved_at, session_id";
+     status, answer, created_at, resolved_at, session_id, options";
 
 const SESSION_COLUMNS: &str = "id, run_id, project_id, role, harness, model, state, cwd, usage, \
      started_at, updated_at, ended_at";
@@ -266,6 +268,20 @@ impl Tx<'_> {
                 run_id,
                 body: from_json(&body)?,
             })
+        })
+        .collect()
+    }
+
+    /// The bus log of a run (its `bus_message` events), oldest first.
+    pub fn bus_messages(&self, run_id: &str) -> Result<Vec<BusMessage>> {
+        let mut stmt = self.tx.prepare(
+            "SELECT body FROM events
+             WHERE run_id = ?1 AND json_extract(body, '$.kind') = 'bus_message' ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([run_id], |row| row.get::<_, String>(0))?;
+        rows.map(|body| match from_json(&body?)? {
+            EventBody::BusMessage { message } => Ok(message),
+            _ => Err(Error::Data("a bus_message event without a message".into())),
         })
         .collect()
     }
@@ -493,6 +509,7 @@ impl Tx<'_> {
             session_id: new.session_id,
             title: new.title,
             detail: new.detail,
+            options: new.options,
             status: RequestStatus::Pending,
             answer: None,
             created_at: now_ms(),
@@ -501,7 +518,7 @@ impl Tx<'_> {
         self.tx.execute(
             &format!(
                 "INSERT INTO requests ({REQUEST_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             ),
             params![
                 request.id,
@@ -517,6 +534,7 @@ impl Tx<'_> {
                 request.created_at,
                 request.resolved_at,
                 request.session_id,
+                to_json(&request.options)?,
             ],
         )?;
         self.emit(
@@ -830,10 +848,12 @@ fn request_from_row(
     let kind: String = row.get(1)?;
     let step: String = row.get(5)?;
     let status: String = row.get(8)?;
-    let (Some(kind), Some(step), Some(status)) = (
+    let options: String = row.get(13)?;
+    let (Some(kind), Some(step), Some(status), Ok(options)) = (
         RequestKind::parse(&kind),
         StepKind::parse(&step),
         RequestStatus::parse(&status),
+        serde_json::from_str::<Vec<String>>(&options),
     ) else {
         return Ok(Err(format!("bad request {kind:?} / {step:?} / {status:?}")));
     };
@@ -847,6 +867,7 @@ fn request_from_row(
         step,
         title: row.get(6)?,
         detail: row.get(7)?,
+        options,
         status,
         answer: row.get(9)?,
         created_at: row.get(10)?,

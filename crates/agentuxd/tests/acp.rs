@@ -17,7 +17,7 @@ use agentux_fake_agent::{Script, Turn, acp, script};
 use agentux_harness::{AcpSession, Events, PermissionHandler};
 use agentux_store::Store;
 use agentuxd::executor::BoxFuture;
-use agentuxd::{AcpExecutor, Engine, Launcher, Settings, server};
+use agentuxd::{AcpExecutor, Engine, LaunchSpec, Launcher, Settings, server};
 use common::{Fixture, fixture, wait_for, wait_until_settled};
 use tokio::sync::oneshot;
 
@@ -35,17 +35,16 @@ struct FakeLauncher {
 impl Launcher for FakeLauncher {
     fn launch<'a>(
         &'a self,
-        harness: &'a str,
-        cwd: &'a Path,
+        spec: LaunchSpec<'a>,
         permissions: PermissionHandler,
     ) -> BoxFuture<'a, std::result::Result<(AcpSession, Events), String>> {
         Box::pin(async move {
             self.launched
                 .lock()
                 .unwrap()
-                .push((harness.to_string(), cwd.to_path_buf()));
-            let (transport, _agent) = agentux_fake_agent::spawn((self.scripts)(harness));
-            AcpSession::connect(transport, cwd, permissions)
+                .push((spec.harness.to_string(), spec.cwd.to_path_buf()));
+            let (transport, _agent) = agentux_fake_agent::spawn((self.scripts)(spec.harness));
+            AcpSession::connect(transport, spec.cwd, permissions)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -468,6 +467,7 @@ async fn auto_approve_answers_permissions_without_asking() {
         executor,
         Settings {
             auto_approve_permissions: true,
+            ..Settings::default()
         },
     );
     let run = start(&f, &engine, "Create hello.txt").await;

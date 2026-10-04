@@ -2,17 +2,18 @@
 //! session. The daemon puts this command in the MCP server list of ACP
 //! `session/new`, and the agent launches it.
 //!
-//! Tool calls will be forwarded to `agentuxd` over its socket (the global
-//! `--socket`) once the daemon serves the bus (see the `agentux-bus` README);
-//! until then only `--standalone` works: an in-memory bus with this one
-//! session on it, for trying the tools from a harness by hand.
+//! With `--session-token`, tool calls go to `agentuxd` over its socket (the
+//! global `--socket`) as the session the token was issued to; see the
+//! `agentux-bus` README. `--standalone` serves an in-memory bus with this one
+//! session on it instead, for trying the tools from a harness by hand.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agentux_bus::{
-    Bus, BusConfig, BusServer, LocalEndpoint, MemoryBackend, RunId, SessionId, SessionIdentity,
+    Bus, BusConfig, BusServer, DaemonEndpoint, LocalEndpoint, MemoryBackend, RunId, SessionId,
+    SessionIdentity,
 };
 use agentux_config::Config;
 use clap::Args;
@@ -42,15 +43,14 @@ pub struct BusStdioArgs {
     run: String,
 }
 
-/// `socket` is the global `--socket` the daemon bridge will connect to.
+/// `socket` is the global `--socket` of the daemon to forward calls to.
 pub fn bus_stdio(socket: Option<PathBuf>, args: BusStdioArgs) -> Result {
-    if !args.standalone {
-        let _ = socket;
-        return Err(
-            "forwarding to agentuxd is not available yet (the daemon does not \
-                    serve the bus); use --standalone for an in-memory bus"
-                .into(),
-        );
+    if let Some(token) = args.session_token {
+        let socket = socket.or_else(agentux_api::default_socket_path).ok_or(
+            "cannot find the agentuxd socket: XDG_RUNTIME_DIR is not set; \
+             pass --socket or set AGENTUX_SOCKET",
+        )?;
+        return tokio::runtime::Runtime::new()?.block_on(forward(&socket, &token));
     }
     let project = args
         .project
@@ -87,6 +87,15 @@ async fn serve(identity: SessionIdentity, config: BusConfig) -> Result {
     bus.join(identity)?;
     let server = BusServer::new(LocalEndpoint::new(bus, &session)?);
     server
+        .serve_stdio()
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
+/// Serves the session's MCP server, forwarding each tool call to the daemon.
+async fn forward(socket: &Path, token: &str) -> Result {
+    let endpoint = DaemonEndpoint::connect(socket, token).await?;
+    BusServer::new(endpoint)
         .serve_stdio()
         .await
         .map_err(|e| -> Box<dyn std::error::Error> { e })

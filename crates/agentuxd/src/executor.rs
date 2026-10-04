@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agentux_api::{PullRequest, SessionEvent, SessionState, StepKind};
+use agentux_harness::McpServer;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -78,11 +79,39 @@ pub enum PullRequestOutcome {
     Skipped(String),
 }
 
+/// A session the daemon recorded, and how to start it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenedSession {
+    /// The daemon's id of the session.
+    pub id: String,
+    /// MCP servers to attach in `session/new`: the `agentux` bus.
+    pub mcp_servers: Vec<McpServer>,
+    /// Prepended to the session's first prompt: who it is and how to use the
+    /// bus (`agentux_bus::session_prompt`).
+    pub system_prompt: Option<String>,
+}
+
+/// A wake from the agent bus: prompt a session so it reads its new mail, or
+/// start one for a role that has none.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WakeTask {
+    pub run_id: String,
+    pub role: String,
+    pub harness: String,
+    pub model: Option<String>,
+    pub worktree: PathBuf,
+    /// The session to prompt; `None` means the role's live session, started
+    /// if it has none.
+    pub session_id: Option<String>,
+    pub prompt: String,
+}
+
 /// What the daemon offers an executor while one agent step runs: recording
 /// sessions and what happens in them, and asking the human.
 pub trait StepHost: Send + Sync {
-    /// Records a new session for the step's role and returns its id.
-    fn open_session(&self, harness: &str, model: Option<&str>) -> Result<String, String>;
+    /// Records a new session for the step's role (it joins the run's bus)
+    /// and returns how to start it.
+    fn open_session(&self, harness: &str, model: Option<&str>) -> Result<OpenedSession, String>;
 
     fn session_state(&self, session_id: &str, state: SessionState);
 
@@ -103,8 +132,11 @@ pub trait StepHost: Send + Sync {
 pub struct NoHost;
 
 impl StepHost for NoHost {
-    fn open_session(&self, harness: &str, _: Option<&str>) -> Result<String, String> {
-        Ok(format!("{harness}-session"))
+    fn open_session(&self, harness: &str, _: Option<&str>) -> Result<OpenedSession, String> {
+        Ok(OpenedSession {
+            id: format!("{harness}-session"),
+            ..OpenedSession::default()
+        })
     }
 
     fn session_state(&self, _: &str, _: SessionState) {}
@@ -131,6 +163,17 @@ pub trait StepExecutor: Send + Sync + 'static {
         &'a self,
         task: &'a PullRequestTask,
     ) -> BoxFuture<'a, Result<PullRequestOutcome, String>>;
+
+    /// Prompts a session for the agent bus (see [`WakeTask`]). A wake for a
+    /// session that is in the middle of a turn waits for the turn to end.
+    /// Executors without sessions ignore wakes.
+    fn wake<'a>(
+        &'a self,
+        _task: &'a WakeTask,
+        _host: Arc<dyn StepHost>,
+    ) -> BoxFuture<'a, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 
     /// The run finished or was cancelled: stop whatever is kept for it, such
     /// as harness sessions.

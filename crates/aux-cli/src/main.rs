@@ -48,7 +48,7 @@ enum Command {
         prompt: String,
     },
     /// Serve the agentux bus as a stdio MCP server for one harness session
-    /// (only --standalone works until agentuxd serves the bus)
+    /// (agentuxd passes this command to every harness it starts)
     BusStdio(bus_stdio::BusStdioArgs),
     /// Run the daemon in the foreground
     Daemon {
@@ -105,8 +105,17 @@ enum Command {
         #[arg(long, short)]
         message: Option<String>,
     },
-    /// Follow a run's events until it finishes
+    /// Answer an agent's question (asked with the bus's ask_human)
+    Answer {
+        request_id: String,
+        /// The answer: one of the question's options, or free text
+        #[arg(required = true, num_args = 1..)]
+        answer: Vec<String>,
+    },
+    /// Follow a run's events, bus traffic included, until it finishes
     Watch { run_id: String },
+    /// Print a run's agent bus log
+    Bus { run_id: String },
     /// Cancel a run (its worktree and branch are kept)
     Cancel { run_id: String },
 }
@@ -210,7 +219,13 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
                 request_id,
                 message,
             } => remote.resolve(&request_id, false, message).await,
+            Command::Answer { request_id, answer } => {
+                remote
+                    .resolve(&request_id, true, Some(answer.join(" ")))
+                    .await
+            }
             Command::Watch { run_id } => remote.watch(&run_id).await,
+            Command::Bus { run_id } => remote.bus(&run_id).await,
             Command::Cancel { run_id } => remote.cancel(&run_id).await,
             Command::Validate { .. }
             | Command::Worktree(_)

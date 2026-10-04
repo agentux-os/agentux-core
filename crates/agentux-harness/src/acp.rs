@@ -30,21 +30,53 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct AcpHarness {
     spec: HarnessSpec,
-    mcp_servers: Vec<McpServer>,
+    options: SessionOptions,
+}
+
+/// How sessions are set up besides their working directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionOptions {
+    /// Passed to the agent in `session/new`.
+    pub mcp_servers: Vec<McpServer>,
+    /// Model to select through the session's `model` config option, when the
+    /// agent offers one (see [`ModelSelection`]).
+    pub model: Option<String>,
+}
+
+/// What became of the model asked for in [`SessionOptions::model`].
+///
+/// ACP has no model field in `session/new`. Agents that let clients choose a
+/// model list a session config option of category `model` (a select) in the
+/// `session/new` response; the client sets it with
+/// `session/set_config_option`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelSelection {
+    /// No model was asked for: the agent's default applies.
+    Default,
+    /// The model is selected (or already was).
+    Selected(String),
+    /// The model could not be selected, and why; the agent's default applies.
+    Unavailable(String),
 }
 
 impl AcpHarness {
     pub fn new(spec: HarnessSpec) -> Self {
         Self {
             spec,
-            mcp_servers: Vec::new(),
+            options: SessionOptions::default(),
         }
     }
 
     /// MCP servers to attach to every session this harness starts, e.g. the
     /// `agentux` bus.
     pub fn with_mcp_servers(mut self, servers: Vec<McpServer>) -> Self {
-        self.mcp_servers = servers;
+        self.options.mcp_servers = servers;
+        self
+    }
+
+    /// Model to select in every session this harness starts.
+    pub fn with_model(mut self, model: Option<String>) -> Self {
+        self.options.model = model;
         self
     }
 
@@ -67,8 +99,7 @@ impl Harness for AcpHarness {
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         // On error `process` is dropped, which kills the harness.
         let (mut session, events) =
-            AcpSession::connect_with_mcp_servers(transport, cwd, &self.mcp_servers, permissions)
-                .await?;
+            AcpSession::connect_with(transport, cwd, &self.options, permissions).await?;
         session.process = Some(process);
         Ok((session, events))
     }
@@ -85,6 +116,7 @@ pub struct AcpSession {
     close: oneshot::Sender<()>,
     task: JoinHandle<Result<(), agent_client_protocol::Error>>,
     process: Option<AgentProcess>,
+    model: ModelSelection,
 }
 
 impl AcpSession {
@@ -105,6 +137,22 @@ impl AcpSession {
         transport: impl ConnectTo<Client> + 'static,
         cwd: &Path,
         mcp_servers: &[McpServer],
+        permissions: PermissionHandler,
+    ) -> Result<(Self, Events), Error> {
+        let options = SessionOptions {
+            mcp_servers: mcp_servers.to_vec(),
+            model: None,
+        };
+        Self::connect_with(transport, cwd, &options, permissions).await
+    }
+
+    /// Like [`AcpSession::connect`], with MCP servers and a model. A model
+    /// the agent does not offer is not an error: see
+    /// [`AcpSession::model_selection`].
+    pub async fn connect_with(
+        transport: impl ConnectTo<Client> + 'static,
+        cwd: &Path,
+        options: &SessionOptions,
         permissions: PermissionHandler,
     ) -> Result<(Self, Events), Error> {
         let (events_tx, events) = mpsc::unbounded_channel();
@@ -170,9 +218,16 @@ impl AcpSession {
             .block_task()
             .await?;
         let session = connection
-            .send_request(new_session_request(cwd, mcp_servers))
+            .send_request(new_session_request(cwd, &options.mcp_servers))
             .block_task()
             .await?;
+        let model = match &options.model {
+            None => ModelSelection::Default,
+            Some(model) => {
+                let offered = session.config_options.as_deref().unwrap_or_default();
+                select_model(&connection, &session.session_id, offered, model).await
+            }
+        };
 
         Ok((
             Self {
@@ -182,6 +237,7 @@ impl AcpSession {
                 close,
                 task,
                 process: None,
+                model,
             },
             events,
         ))
@@ -190,6 +246,73 @@ impl AcpSession {
     /// The agent's identifier for this session.
     pub fn id(&self) -> &str {
         &self.session_id.0
+    }
+
+    /// Whether the model asked for in [`SessionOptions`] is in use.
+    pub fn model_selection(&self) -> &ModelSelection {
+        &self.model
+    }
+}
+
+/// Selects `model` through the session's model config option.
+async fn select_model(
+    connection: &ConnectionTo<Agent>,
+    session: &acp::SessionId,
+    options: &[acp::SessionConfigOption],
+    model: &str,
+) -> ModelSelection {
+    let selector = options.iter().find_map(|option| {
+        let is_model = matches!(
+            option.category,
+            Some(acp::SessionConfigOptionCategory::Model)
+        ) || &*option.id.0 == "model";
+        match &option.kind {
+            acp::SessionConfigKind::Select(select) if is_model => Some((option, select)),
+            _ => None,
+        }
+    });
+    let Some((option, select)) = selector else {
+        return ModelSelection::Unavailable(format!(
+            "model `{model}` not selected: the agent offers no model choice over ACP, so it uses its default"
+        ));
+    };
+    let choices: Vec<&acp::SessionConfigSelectOption> = match &select.options {
+        acp::SessionConfigSelectOptions::Ungrouped(choices) => choices.iter().collect(),
+        acp::SessionConfigSelectOptions::Grouped(groups) => groups
+            .iter()
+            .flat_map(|group| group.options.iter())
+            .collect(),
+        _ => Vec::new(),
+    };
+    let found = choices
+        .iter()
+        .find(|choice| &*choice.value.0 == model)
+        .or_else(|| {
+            choices
+                .iter()
+                .find(|choice| choice.name.eq_ignore_ascii_case(model))
+        });
+    let Some(choice) = found else {
+        let offered: Vec<&str> = choices.iter().map(|choice| &*choice.value.0).collect();
+        return ModelSelection::Unavailable(format!(
+            "model `{model}` not selected: the agent offers {}, and uses `{}`",
+            offered.join(", "),
+            select.current_value.0
+        ));
+    };
+    if choice.value == select.current_value {
+        return ModelSelection::Selected(choice.value.0.to_string());
+    }
+    let request = acp::SetSessionConfigOptionRequest::new(
+        session.clone(),
+        option.id.clone(),
+        acp::SessionConfigOptionValue::value_id(choice.value.clone()),
+    );
+    match connection.send_request(request).block_task().await {
+        Ok(_) => ModelSelection::Selected(choice.value.0.to_string()),
+        Err(e) => ModelSelection::Unavailable(format!(
+            "model `{model}` not selected: the agent refused it ({e}), so it uses its default"
+        )),
     }
 }
 
