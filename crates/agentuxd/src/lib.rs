@@ -21,10 +21,11 @@ pub mod forge;
 mod human;
 pub mod prompts;
 pub mod server;
+mod terminal;
 
 pub use acp::{AcpExecutor, HarnessLauncher, LaunchSpec, Launcher};
 pub use bus::{BusLink, aux_binary};
-pub use engine::{Engine, Settings};
+pub use engine::{Engine, Settings, TuiCommands};
 pub use executor::{FakeExecutor, StepExecutor, StepHost};
 
 /// Command-line options shared by `agentuxd` and `aux daemon`.
@@ -75,6 +76,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let settings = Settings {
         auto_approve_permissions: options.auto_approve_permissions,
         bus: Some(BusLink::new(socket.clone())),
+        ..Settings::default()
     };
     let engine = Engine::with_settings(store, executor, settings);
     let resumed = engine.resume()?;

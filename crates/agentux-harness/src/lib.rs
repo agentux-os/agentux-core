@@ -218,6 +218,9 @@ pub enum Error {
     Protocol(agent_client_protocol::Error),
     /// The session was already shut down.
     Closed,
+    /// Asked to reopen a session, but the agent does not advertise
+    /// `loadSession`.
+    LoadUnsupported,
 }
 
 impl fmt::Display for Error {
@@ -226,6 +229,9 @@ impl fmt::Display for Error {
             Self::Spawn { command, source } => write!(f, "cannot start `{command}`: {source}"),
             Self::Protocol(e) => write!(f, "agent error: {e}"),
             Self::Closed => f.write_str("the session is closed"),
+            Self::LoadUnsupported => {
+                f.write_str("the agent cannot reopen sessions (no `loadSession` capability)")
+            }
         }
     }
 }
@@ -235,7 +241,7 @@ impl std::error::Error for Error {
         match self {
             Self::Spawn { source, .. } => Some(source),
             Self::Protocol(e) => Some(e),
-            Self::Closed => None,
+            Self::Closed | Self::LoadUnsupported => None,
         }
     }
 }

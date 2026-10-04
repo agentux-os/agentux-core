@@ -187,6 +187,43 @@ impl Client {
         self.call(method::RUNS_EVENTS, params).await
     }
 
+    /// Terminals, optionally only those of a session or run.
+    pub async fn list_terminals(
+        &mut self,
+        params: &rpc::ListTerminals,
+    ) -> Result<Vec<rpc::Terminal>, ClientError> {
+        self.call(method::TERMINALS_LIST, params).await
+    }
+
+    /// Opens a terminal (`terminals.open`) and turns the connection into its
+    /// stream: output and exit come through [`TerminalEvents`], input and
+    /// resizes go through [`TerminalInput`]. The terminal belongs to this
+    /// connection: dropping both halves closes it.
+    pub async fn open_terminal(
+        mut self,
+        params: &rpc::OpenTerminal,
+    ) -> Result<(rpc::Terminal, TerminalEvents, TerminalInput), ClientError> {
+        let terminal: rpc::Terminal = self.call(method::TERMINALS_OPEN, params).await?;
+        let id = terminal.terminal_id.clone();
+        let Self {
+            lines,
+            writer,
+            next_id,
+        } = self;
+        Ok((
+            terminal,
+            TerminalEvents {
+                lines,
+                terminal_id: id.clone(),
+            },
+            TerminalInput {
+                writer,
+                terminal_id: id,
+                next_id,
+            },
+        ))
+    }
+
     /// Turns the connection into an event stream.
     pub async fn subscribe(mut self, params: &rpc::Subscribe) -> Result<Subscription, ClientError> {
         let _: rpc::Subscribed = self.call(method::EVENTS_SUBSCRIBE, params).await?;
@@ -243,6 +280,116 @@ impl Subscription {
             }
         }
         Ok(None)
+    }
+}
+
+/// What a terminal stream delivers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalNotice {
+    /// Bytes the terminal wrote.
+    Output(Vec<u8>),
+    /// The process exited (`None`: killed by a signal) or the terminal was
+    /// closed. Nothing follows.
+    Exit(Option<i32>),
+}
+
+/// The receiving half of [`Client::open_terminal`].
+pub struct TerminalEvents {
+    lines: Lines<BufReader<OwnedReadHalf>>,
+    terminal_id: String,
+}
+
+impl TerminalEvents {
+    /// The next output or the exit, or `None` when the daemon closes the
+    /// connection. Responses to [`TerminalInput`] requests are skipped.
+    pub async fn next(&mut self) -> Result<Option<TerminalNotice>, ClientError> {
+        while let Some(line) = self.lines.next_line().await? {
+            let value: Value = serde_json::from_str(&line).map_err(protocol)?;
+            if value.get("id").is_some() {
+                continue;
+            }
+            let notification: rpc::Notification =
+                serde_json::from_value(value).map_err(protocol)?;
+            match notification.method.as_str() {
+                method::TERMINAL_OUTPUT => {
+                    let output: rpc::TerminalOutput =
+                        serde_json::from_value(notification.params).map_err(protocol)?;
+                    if output.terminal_id == self.terminal_id {
+                        let bytes =
+                            crate::decode_bytes(&output.data).map_err(ClientError::Protocol)?;
+                        return Ok(Some(TerminalNotice::Output(bytes)));
+                    }
+                }
+                method::TERMINAL_EXIT => {
+                    let exit: rpc::TerminalExit =
+                        serde_json::from_value(notification.params).map_err(protocol)?;
+                    if exit.terminal_id == self.terminal_id {
+                        return Ok(Some(TerminalNotice::Exit(exit.code)));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// The sending half of [`Client::open_terminal`]. Writes and resizes are
+/// JSON-RPC notifications (no response); `close` is a request whose response
+/// [`TerminalEvents`] skips.
+pub struct TerminalInput {
+    writer: OwnedWriteHalf,
+    terminal_id: String,
+    next_id: u64,
+}
+
+impl TerminalInput {
+    async fn send<P: Serialize>(
+        &mut self,
+        method: &str,
+        params: &P,
+        notify: bool,
+    ) -> Result<(), ClientError> {
+        let id = (!notify).then(|| {
+            self.next_id += 1;
+            Value::from(self.next_id)
+        });
+        let request = rpc::Request {
+            jsonrpc: rpc::VERSION.into(),
+            id,
+            method: method.into(),
+            params: serde_json::to_value(params).map_err(protocol)?,
+        };
+        let mut line = serde_json::to_vec(&request).map_err(protocol)?;
+        line.push(b'\n');
+        self.writer.write_all(&line).await?;
+        Ok(())
+    }
+
+    /// Types `data` into the terminal.
+    pub async fn write(&mut self, data: &[u8]) -> Result<(), ClientError> {
+        let params = rpc::WriteTerminal {
+            terminal_id: self.terminal_id.clone(),
+            data: crate::encode_bytes(data),
+        };
+        self.send(method::TERMINALS_WRITE, &params, true).await
+    }
+
+    pub async fn resize(&mut self, cols: u16, rows: u16) -> Result<(), ClientError> {
+        let params = rpc::ResizeTerminal {
+            terminal_id: self.terminal_id.clone(),
+            cols,
+            rows,
+        };
+        self.send(method::TERMINALS_RESIZE, &params, true).await
+    }
+
+    /// Asks the daemon to close the terminal; a `terminal_exit` follows.
+    pub async fn close(&mut self) -> Result<(), ClientError> {
+        let params = rpc::TerminalRef {
+            terminal_id: self.terminal_id.clone(),
+        };
+        self.send(method::TERMINALS_CLOSE, &params, false).await
     }
 }
 

@@ -16,7 +16,24 @@ use serde::{Deserialize, Serialize};
 mod client;
 pub mod rpc;
 
-pub use client::{Client, ClientError, Notice, Subscription};
+pub use client::{
+    Client, ClientError, Notice, Subscription, TerminalEvents, TerminalInput, TerminalNotice,
+};
+
+/// Bytes as the API carries them (`terminals.write`, `terminal_output`):
+/// base64, standard alphabet, padded.
+pub fn encode_bytes(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// The inverse of [`encode_bytes`].
+pub fn decode_bytes(text: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .decode(text)
+        .map_err(|e| format!("invalid base64: {e}"))
+}
 
 /// Overrides the socket path for every client and the daemon.
 pub const SOCKET_ENV: &str = "AGENTUX_SOCKET";
@@ -113,12 +130,15 @@ string_enum!(
 
 string_enum!(
     /// `active` while the agent works on a prompt, `waiting` while it waits
-    /// for a permission answer, `idle` between steps, `ended` once the
-    /// harness process is gone.
+    /// for a permission answer, `idle` between steps, `attached` while the
+    /// session is open in its harness's own TUI in a daemon terminal (ACP
+    /// turns wait until it is closed), `ended` once the harness process is
+    /// gone.
     SessionState {
         Active => "active",
         Idle => "idle",
         Waiting => "waiting",
+        Attached => "attached",
         Ended => "ended",
     }
 );
@@ -281,6 +301,12 @@ pub struct Session {
     pub started_at: i64,
     pub updated_at: i64,
     pub ended_at: Option<i64>,
+    /// The harness's own id of the session: the ACP `sessionId`, which the
+    /// built-in adapters share with the vendor CLI (`claude --resume <id>`,
+    /// `codex resume <id>`, `opencode --session <id>`). Set once the harness
+    /// has started the session.
+    #[serde(default)]
+    pub vendor_session_id: Option<String>,
 }
 
 /// What a harness reported about its session. ACP reports context-window

@@ -113,6 +113,10 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE requests ADD COLUMN options TEXT NOT NULL DEFAULT '[]';
     ",
+    // 4: the harness's own id of a session (for its TUI, `terminals.open`).
+    "
+    ALTER TABLE sessions ADD COLUMN vendor_session_id TEXT;
+    ",
 ];
 
 /// The schema version this build writes.

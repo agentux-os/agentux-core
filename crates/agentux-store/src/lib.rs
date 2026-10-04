@@ -221,7 +221,7 @@ const REQUEST_COLUMNS: &str = "id, kind, run_id, project_id, step_index, step, t
      status, answer, created_at, resolved_at, session_id, options";
 
 const SESSION_COLUMNS: &str = "id, run_id, project_id, role, harness, model, state, cwd, usage, \
-     started_at, updated_at, ended_at";
+     started_at, updated_at, ended_at, vendor_session_id";
 
 impl Tx<'_> {
     // ---- events ----
@@ -618,7 +618,7 @@ impl Tx<'_> {
         self.tx.execute(
             &format!(
                 "INSERT INTO sessions ({SESSION_COLUMNS}) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
             ),
             rusqlite::params_from_iter(session_params(session)?),
         )?;
@@ -637,7 +637,7 @@ impl Tx<'_> {
         let changed = self.tx.execute(
             "UPDATE sessions SET run_id = ?2, project_id = ?3, role = ?4, harness = ?5, \
              model = ?6, state = ?7, cwd = ?8, usage = ?9, started_at = ?10, \
-             updated_at = ?11, ended_at = ?12 WHERE id = ?1",
+             updated_at = ?11, ended_at = ?12, vendor_session_id = ?13 WHERE id = ?1",
             rusqlite::params_from_iter(session_params(session)?),
         )?;
         if changed != 1 {
@@ -692,6 +692,7 @@ fn session_params(session: &Session) -> Result<Vec<Box<dyn rusqlite::ToSql>>> {
         Box::new(session.started_at),
         Box::new(session.updated_at),
         Box::new(session.ended_at),
+        Box::new(session.vendor_session_id.clone()),
     ])
 }
 
@@ -718,6 +719,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Result<Session>> {
         started_at: row.get(9)?,
         updated_at: row.get(10)?,
         ended_at: row.get(11)?,
+        vendor_session_id: row.get(12)?,
     }))
 }
 

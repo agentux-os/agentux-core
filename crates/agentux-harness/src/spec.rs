@@ -56,6 +56,24 @@ impl HarnessSpec {
         }
     }
 
+    /// The command line that opens the harness's own interactive TUI on the
+    /// existing session `session_id` (the ACP session id, which the built-in
+    /// adapters share with the vendor: see the crate README), as program and
+    /// arguments. `None` when the harness cannot resume a session by id in
+    /// its TUI.
+    ///
+    /// Checked against each CLI's `--help` (Claude Code 2.1, Codex CLI 0.153,
+    /// OpenCode 1.18).
+    pub fn tui_resume(&self, session_id: &str) -> Option<Vec<String>> {
+        let line: &[&str] = match self.id.as_str() {
+            "claude-code" => &["claude", "--resume", session_id],
+            "codex" => &["codex", "resume", session_id],
+            "opencode" => &["opencode", "--session", session_id],
+            _ => return None,
+        };
+        Some(line.iter().map(|s| s.to_string()).collect())
+    }
+
     /// The command line, for messages.
     pub fn command_line(&self) -> String {
         std::iter::once(self.command.as_str())
@@ -85,6 +103,15 @@ mod tests {
         for spec in HarnessSpec::builtin() {
             assert_eq!(spec.experimental, spec.id == "antigravity", "{}", spec.id);
         }
+    }
+
+    #[test]
+    fn tui_resume_commands() {
+        let line = |id: &str| HarnessSpec::find(id).unwrap().tui_resume("abc");
+        assert_eq!(line("claude-code").unwrap(), ["claude", "--resume", "abc"]);
+        assert_eq!(line("codex").unwrap(), ["codex", "resume", "abc"]);
+        assert_eq!(line("opencode").unwrap(), ["opencode", "--session", "abc"]);
+        assert_eq!(line("antigravity"), None);
     }
 
     #[test]
