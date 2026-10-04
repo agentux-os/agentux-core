@@ -157,14 +157,18 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
         }
         method::RUNS_GET => {
             let params: rpc::RunRef = parse(params)?;
-            to_value(engine.run(&params.run_id).and_then(|(run, attempts, requests)| {
-                Ok(rpc::RunDetail {
-                    sessions: engine.sessions(Some(&run.id))?,
-                    run,
-                    attempts,
-                    requests,
-                })
-            }))
+            to_value(
+                engine
+                    .run(&params.run_id)
+                    .and_then(|(run, attempts, requests)| {
+                        Ok(rpc::RunDetail {
+                            sessions: engine.sessions(Some(&run.id))?,
+                            run,
+                            attempts,
+                            requests,
+                        })
+                    }),
+            )
         }
         method::SESSIONS_LIST => {
             let params: rpc::ListSessions = parse_or_default(params)?;

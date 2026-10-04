@@ -25,11 +25,20 @@ pub async fn open_pull_request(task: &PullRequestTask) -> Result<PullRequestOutc
     if !is_github(&remote) {
         return Ok(skip(&format!("origin ({remote}) is not on GitHub")));
     }
-    match output(dir, "gh", &["auth", "status", "--hostname", "github.com"], None).await {
+    match output(
+        dir,
+        "gh",
+        &["auth", "status", "--hostname", "github.com"],
+        None,
+    )
+    .await
+    {
         Ok(_) => {}
         Err(Failure::Spawn(_)) => return Ok(skip("the GitHub CLI (gh) is not installed")),
         Err(Failure::Exit(_)) => {
-            return Ok(skip("gh is not logged in to github.com (run `gh auth login`)"));
+            return Ok(skip(
+                "gh is not logged in to github.com (run `gh auth login`)",
+            ));
         }
     }
 
@@ -47,7 +56,14 @@ pub async fn open_pull_request(task: &PullRequestTask) -> Result<PullRequestOutc
         dir,
         "gh",
         &[
-            "pr", "list", "--head", &task.branch, "--state", "open", "--json", "number,url",
+            "pr",
+            "list",
+            "--head",
+            &task.branch,
+            "--state",
+            "open",
+            "--json",
+            "number,url",
         ],
         None,
     )
@@ -88,7 +104,8 @@ pub async fn open_pull_request(task: &PullRequestTask) -> Result<PullRequestOutc
         .map(str::trim)
         .find(|line| line.starts_with("https://"))
         .ok_or_else(|| format!("gh pr create printed no URL: {created}"))?;
-    let number = number_from_url(url).ok_or_else(|| format!("unexpected pull request URL {url}"))?;
+    let number =
+        number_from_url(url).ok_or_else(|| format!("unexpected pull request URL {url}"))?;
     Ok(PullRequestOutcome::Opened(PullRequest {
         number,
         url: url.to_string(),
@@ -110,7 +127,9 @@ fn skip(reason: &str) -> PullRequestOutcome {
 pub fn is_github(url: &str) -> bool {
     let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = rest.split('/').next().unwrap_or_default();
-    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     let host = host.split(':').next().unwrap_or_default();
     host.eq_ignore_ascii_case("github.com") || host.eq_ignore_ascii_case("www.github.com")
 }
@@ -239,10 +258,7 @@ mod tests {
 
     #[test]
     fn pull_request_numbers() {
-        assert_eq!(
-            number_from_url("https://github.com/o/r/pull/42"),
-            Some(42)
-        );
+        assert_eq!(number_from_url("https://github.com/o/r/pull/42"), Some(42));
         assert_eq!(
             number_from_url("https://github.com/o/r/pull/7/files"),
             Some(7)
@@ -263,7 +279,9 @@ mod tests {
             plan: Some("1. route".into()),
             review: Some("Looks right.".into()),
         });
-        assert!(body.starts_with("## Request\n\nAdd a health endpoint\n\nCloses #5\n\n## Plan\n\n1. route"));
+        assert!(body.starts_with(
+            "## Request\n\nAdd a health endpoint\n\nCloses #5\n\n## Plan\n\n1. route"
+        ));
         assert!(body.contains("## Review\n\nLooks right."));
         assert!(body.contains("AgentUX run 3f9a0c12"));
     }

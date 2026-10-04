@@ -56,18 +56,21 @@ impl Turn {
     }
 
     pub fn message(&self, text: &str) -> agent_client_protocol::Result<()> {
-        self.send(acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
-            text_block(text),
-        )))
+        self.send(acp::SessionUpdate::AgentMessageChunk(
+            acp::ContentChunk::new(text_block(text)),
+        ))
     }
 
     pub fn thought(&self, text: &str) -> agent_client_protocol::Result<()> {
-        self.send(acp::SessionUpdate::AgentThoughtChunk(acp::ContentChunk::new(
-            text_block(text),
-        )))
+        self.send(acp::SessionUpdate::AgentThoughtChunk(
+            acp::ContentChunk::new(text_block(text)),
+        ))
     }
 
-    pub fn plan(&self, entries: &[(&str, acp::PlanEntryStatus)]) -> agent_client_protocol::Result<()> {
+    pub fn plan(
+        &self,
+        entries: &[(&str, acp::PlanEntryStatus)],
+    ) -> agent_client_protocol::Result<()> {
         self.send(acp::SessionUpdate::Plan(acp::Plan::new(
             entries
                 .iter()
@@ -111,15 +114,19 @@ impl Turn {
                 text_block(output),
             ))]);
         }
-        self.send(acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
-            id.to_string(),
-            fields,
-        )))
+        self.send(acp::SessionUpdate::ToolCallUpdate(
+            acp::ToolCallUpdate::new(id.to_string(), fields),
+        ))
     }
 
     /// Reports context usage and, optionally, the session's cumulative cost
     /// in USD.
-    pub fn usage(&self, used: u64, size: u64, cost_usd: Option<f64>) -> agent_client_protocol::Result<()> {
+    pub fn usage(
+        &self,
+        used: u64,
+        size: u64,
+        cost_usd: Option<f64>,
+    ) -> agent_client_protocol::Result<()> {
         let mut usage = acp::UsageUpdate::new(used, size);
         if let Some(cost) = cost_usd {
             usage = usage.cost(acp::Cost::new(cost, "USD"));

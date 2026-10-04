@@ -60,7 +60,8 @@ pub fn step_prompt(task: &AgentTask) -> String {
                 "\n## Your step: review\n\n\
                  Review the changes made on this branch: see `git log {base}..HEAD` and `git diff {base}...HEAD`. Do not modify any files.\n\
                  Check that they do what the task asks{plan}, are correct, are tested, and fit the code base. \
-                 Request changes only for problems that must be fixed before merging.\n\n\
+                 Request changes only for problems that must be fixed before merging. \
+                 AgentUX commits the implementer's edits after each step, so ask for changes to files, not for git operations.\n\n\
                  End your reply with exactly one fenced JSON block holding your verdict, either\n\n\
                  ```json\n{{\"verdict\": \"APPROVE\", \"comments\": \"one-paragraph summary of the change\"}}\n```\n\n\
                  or\n\n\
@@ -117,22 +118,19 @@ pub enum Verdict {
 /// (fenced or not), else the last `APPROVE` / `CHANGES_REQUESTED` keyword
 /// (upper case, as asked). `None` when there is neither.
 pub fn parse_verdict(reply: &str) -> Option<Verdict> {
-    let from_json = reply
-        .match_indices('{')
-        .filter_map(|(i, _)| {
-            let value = serde_json::Deserializer::from_str(&reply[i..])
-                .into_iter::<Value>()
-                .next()?
-                .ok()?;
-            let verdict = verdict_word(value.get("verdict")?.as_str()?)?;
-            let comments = value
-                .get("comments")
-                .or_else(|| value.get("summary"))
-                .map(comments_text)
-                .unwrap_or_default();
-            Some((verdict, comments))
-        })
-        .last();
+    let from_json = reply.match_indices('{').rev().find_map(|(i, _)| {
+        let value = serde_json::Deserializer::from_str(&reply[i..])
+            .into_iter::<Value>()
+            .next()?
+            .ok()?;
+        let verdict = verdict_word(value.get("verdict")?.as_str()?)?;
+        let comments = value
+            .get("comments")
+            .or_else(|| value.get("summary"))
+            .map(comments_text)
+            .unwrap_or_default();
+        Some((verdict, comments))
+    });
     if let Some((approve, comments)) = from_json {
         let comments = if comments.trim().is_empty() {
             without_json(reply)
@@ -250,7 +248,10 @@ mod tests {
             "## Plan\n\n1. add /health",
             "The reviewer requested these changes:\n\nrename the helper",
         ] {
-            assert!(prompt.contains(needle), "{needle:?} missing from:\n{prompt}");
+            assert!(
+                prompt.contains(needle),
+                "{needle:?} missing from:\n{prompt}"
+            );
         }
     }
 
@@ -287,7 +288,10 @@ mod tests {
         );
         // Without comments, the prose is the summary.
         let reply = "All good.\n```json\n{\"verdict\": \"APPROVE\"}\n```";
-        assert_eq!(parse_verdict(reply), Some(Verdict::Approve("All good.".into())));
+        assert_eq!(
+            parse_verdict(reply),
+            Some(Verdict::Approve("All good.".into()))
+        );
     }
 
     #[test]

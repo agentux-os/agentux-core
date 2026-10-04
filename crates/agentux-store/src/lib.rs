@@ -611,7 +611,10 @@ impl Tx<'_> {
             rusqlite::params_from_iter(session_params(session)?),
         )?;
         if changed != 1 {
-            return Err(Error::Data(format!("session {} does not exist", session.id)));
+            return Err(Error::Data(format!(
+                "session {} does not exist",
+                session.id
+            )));
         }
         self.emit(
             Some(&session.run_id),

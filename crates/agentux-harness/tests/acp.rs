@@ -30,7 +30,10 @@ struct Seen {
 /// One prompt turn of the fake agent. `WORK` streams a message, a plan and a
 /// file edit that needs permission, then usage. `WAIT_FOR_PERMISSION` asks
 /// for permission and ends the turn as cancelled once the client cancels.
-async fn turn(turn: Turn, seen: Arc<Mutex<Seen>>) -> agent_client_protocol::Result<acp::StopReason> {
+async fn turn(
+    turn: Turn,
+    seen: Arc<Mutex<Seen>>,
+) -> agent_client_protocol::Result<acp::StopReason> {
     seen.lock().unwrap().cwd = Some(turn.cwd.clone());
     if turn.prompt == WAIT_FOR_PERMISSION {
         let outcome = turn

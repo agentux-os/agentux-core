@@ -322,13 +322,17 @@ pub enum SessionEvent {
         new_text: String,
     },
     /// The agent's current plan, replacing any earlier one.
-    Plan { items: Vec<PlanItem> },
+    Plan {
+        items: Vec<PlanItem>,
+    },
     /// The agent asked for permission; see the request.
     Permission {
         #[serde(rename = "requestId")]
         request_id: String,
     },
-    Usage { usage: SessionUsage },
+    Usage {
+        usage: SessionUsage,
+    },
 }
 
 string_enum!(

@@ -24,8 +24,7 @@ use agentux_harness::{
 };
 
 use crate::executor::{
-    AgentOutcome, AgentTask, BoxFuture, PullRequestOutcome, PullRequestTask, StepExecutor,
-    StepHost,
+    AgentOutcome, AgentTask, BoxFuture, PullRequestOutcome, PullRequestTask, StepExecutor, StepHost,
 };
 use crate::forge;
 use crate::prompts::{self, Verdict};
@@ -62,8 +61,7 @@ impl Launcher for HarnessLauncher {
     ) -> BoxFuture<'a, Result<(AcpSession, Events), String>> {
         Box::pin(async move {
             let Some(spec) = HarnessSpec::find(harness) else {
-                let known: Vec<String> =
-                    HarnessSpec::builtin().into_iter().map(|s| s.id).collect();
+                let known: Vec<String> = HarnessSpec::builtin().into_iter().map(|s| s.id).collect();
                 return Err(format!(
                     "unknown harness `{harness}` (known: {})",
                     known.join(", ")
@@ -334,7 +332,9 @@ async fn turn(
     match stop {
         Err(e) => Err(TurnError::Broken(e.to_string())),
         Ok(StopReason::Refusal) => Err(TurnError::Failed("the agent refused".into())),
-        Ok(StopReason::Cancelled) => Err(TurnError::Failed("the agent's turn was cancelled".into())),
+        Ok(StopReason::Cancelled) => {
+            Err(TurnError::Failed("the agent's turn was cancelled".into()))
+        }
         Ok(StopReason::EndTurn | StopReason::MaxTokens | StopReason::MaxTurnRequests) => {
             Ok(sink.reply)
         }
@@ -349,6 +349,8 @@ struct Sink<'a> {
     reply: String,
     /// Agent text not yet recorded.
     pending: String,
+    /// Whether something other than agent text came since the last text.
+    interrupted: bool,
 }
 
 impl<'a> Sink<'a> {
@@ -358,6 +360,7 @@ impl<'a> Sink<'a> {
             session_id,
             reply: String::new(),
             pending: String::new(),
+            interrupted: false,
         }
     }
 
@@ -378,6 +381,13 @@ impl<'a> Sink<'a> {
     fn push(&mut self, event: Event) {
         let event = match event {
             Event::AgentMessage(text) => {
+                // Text before and after a tool call are separate paragraphs.
+                if std::mem::take(&mut self.interrupted)
+                    && !self.reply.is_empty()
+                    && !self.reply.ends_with('\n')
+                {
+                    self.reply.push_str("\n\n");
+                }
                 self.reply.push_str(&text);
                 self.pending.push_str(&text);
                 if self.pending.len() >= MESSAGE_FLUSH_BYTES {
@@ -432,6 +442,7 @@ impl<'a> Sink<'a> {
                 },
             },
         };
+        self.interrupted = true;
         self.flush();
         self.emit(event);
     }
@@ -482,7 +493,9 @@ fn describe(role: &str, harness: &str, request: &PermissionRequest) -> (String, 
     let detail = format!(
         "{what}\n\nTool call {} ({}). The agent waits for your answer; denying tells it no, and the run goes on.",
         request.tool_call_id,
-        request.kind.map_or("unknown kind", |k| tool_kind(k).as_str()),
+        request
+            .kind
+            .map_or("unknown kind", |k| tool_kind(k).as_str()),
     );
     (title, detail)
 }

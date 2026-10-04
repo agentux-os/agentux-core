@@ -33,8 +33,7 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::executor::{
-    AgentOutcome, AgentTask, BoxFuture, PullRequestOutcome, PullRequestTask, StepExecutor,
-    StepHost,
+    AgentOutcome, AgentTask, BoxFuture, PullRequestOutcome, PullRequestTask, StepExecutor, StepHost,
 };
 
 /// Keep at most this much of each check's output.
@@ -435,7 +434,10 @@ impl Engine {
             if !allow {
                 tx.log(
                     &request.run_id,
-                    format!("permission denied: {}; the agent was told no", request.title),
+                    format!(
+                        "permission denied: {}; the agent was told no",
+                        request.title
+                    ),
                 )?;
             }
             resume_after_permission(tx, &request.run_id, request.session_id.as_deref())?;
@@ -500,10 +502,8 @@ impl Engine {
             )?;
             set_session_state(tx, session_id, SessionState::Waiting)?;
             record.run.status = RunStatus::Waiting;
-            record.run.activity = format!(
-                "waiting for permission ({}): {}",
-                request.id, request.title
-            );
+            record.run.activity =
+                format!("waiting for permission ({}): {}", request.id, request.title);
             tx.save_run(&mut record)?;
             Ok::<_, Error>(Some(request.id))
         });
@@ -820,8 +820,7 @@ impl Engine {
         let Some((attempt, number, plan, feedback_from)) =
             self.transition(&run_id, |tx, record| {
                 let attempts = tx.attempts(&run_id)?;
-                let number =
-                    attempts.iter().filter(|a| a.step_index == index).count() as u32 + 1;
+                let number = attempts.iter().filter(|a| a.step_index == index).count() as u32 + 1;
                 let plan = latest_output(&attempts, StepKind::Plan);
                 // The gate or review that sent the run back here.
                 let feedback_from = record.feedback.as_ref().and_then(|_| {
@@ -837,8 +836,7 @@ impl Engine {
                         .map(|a| a.step)
                 });
                 let attempt = tx.start_attempt(&run_id, index, kind)?;
-                record.run.activity =
-                    format!("{kind}: {role_name} ({}) is working", role.harness);
+                record.run.activity = format!("{kind}: {role_name} ({}) is working", role.harness);
                 Ok((attempt, number, plan, feedback_from))
             })?
         else {
@@ -1095,7 +1093,10 @@ impl Engine {
                 Ok(PullRequestOutcome::Skipped(reason)) => {
                     let note = format!("PR skipped: {reason}");
                     tx.finish_attempt(attempt.id, AttemptStatus::Succeeded, Some(&note))?;
-                    tx.log(&run_id, format!("{note}; the branch {} is kept", task.branch))?;
+                    tx.log(
+                        &run_id,
+                        format!("{note}; the branch {} is kept", task.branch),
+                    )?;
                     advance(record);
                 }
                 Ok(PullRequestOutcome::Opened(pr)) => {
@@ -1308,7 +1309,11 @@ impl RunHost {
 }
 
 impl StepHost for RunHost {
-    fn open_session(&self, harness: &str, model: Option<&str>) -> std::result::Result<String, String> {
+    fn open_session(
+        &self,
+        harness: &str,
+        model: Option<&str>,
+    ) -> std::result::Result<String, String> {
         let now = now_ms();
         let session = Session {
             id: new_id(),
@@ -1343,7 +1348,9 @@ impl StepHost for RunHost {
     }
 
     fn session_state(&self, session_id: &str, state: SessionState) {
-        self.record("a session state", |tx| set_session_state(tx, session_id, state));
+        self.record("a session state", |tx| {
+            set_session_state(tx, session_id, state)
+        });
     }
 
     fn session_event(&self, session_id: &str, event: SessionEvent) {
@@ -1470,7 +1477,11 @@ fn end_sessions(tx: &mut Tx<'_>, run_id: &str) -> Result<()> {
 /// Returns `<short sha> <subject>`, or `None` when nothing changed.
 async fn commit_changes(task: &AgentTask) -> std::result::Result<Option<String>, String> {
     let dir = &task.worktree;
-    if git(dir, &["status", "--porcelain"]).await?.trim().is_empty() {
+    if git(dir, &["status", "--porcelain"])
+        .await?
+        .trim()
+        .is_empty()
+    {
         return Ok(None);
     }
     git(dir, &["add", "--all"]).await?;
@@ -1481,7 +1492,12 @@ async fn commit_changes(task: &AgentTask) -> std::result::Result<Option<String>,
         .await
         .is_ok_and(|email| !email.trim().is_empty())
     {
-        args.extend(["-c", "user.name=AgentUX", "-c", "user.email=agentux@localhost"]);
+        args.extend([
+            "-c",
+            "user.name=AgentUX",
+            "-c",
+            "user.email=agentux@localhost",
+        ]);
     }
     args.extend(["commit", "--quiet", "-m", &subject, "-m", &body]);
     git(dir, &args).await?;

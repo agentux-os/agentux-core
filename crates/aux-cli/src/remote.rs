@@ -101,8 +101,8 @@ impl Remote {
                     "{:<10} {:<10} {:<10} {:<13} {:<16} {} — {}",
                     run.id,
                     truncate(project, 10),
-                    run.status,
-                    run.step,
+                    run.status.as_str(),
+                    run.step.as_str(),
                     loops,
                     run.title,
                     run.activity
@@ -116,7 +116,10 @@ impl Remote {
             for request in pending {
                 println!(
                     "{:<10} run {:<10} {:<11} {}",
-                    request.id, request.run_id, request.kind, request.title
+                    request.id,
+                    request.run_id,
+                    request.kind.as_str(),
+                    request.title
                 );
             }
             println!("\napprove with `aux approve <id>`, deny with `aux deny <id>`");

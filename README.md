@@ -2,7 +2,7 @@
 
 The orchestration engine of [AgentUX](https://github.com/agentux-os/agentux): the daemon, CLI and integrations that let coding agents from different vendors work as one team.
 
-> **Status:** early. `agentuxd` runs pipelines from `agentux.yaml` as persisted state machines in run worktrees, with gates, bounded loops, approvals and crash recovery, and `aux` drives it over a local socket. Agent steps go through an executor interface whose ACP-backed implementation (on top of `agentux-harness`) is not wired in yet, so today agent steps either fail with an explanation or, with `--fake-agents`, are answered by a scripted fake. Design decisions live in [agentux/docs/adr](https://github.com/agentux-os/agentux/tree/main/docs/adr).
+> **Status:** early. `agentuxd` runs pipelines from `agentux.yaml` as persisted state machines in run worktrees, with gates, bounded loops, approvals and crash recovery, and `aux` drives it over a local socket. Agent steps run in real harness sessions over ACP (tried with OpenCode; Claude Code and Codex go through their ACP adapters), with agent permission requests in the approvals inbox, session events in the event log, budgets enforced from reported cost, and pull requests opened with `gh`. `--fake-agents` swaps in a scripted fake. Design decisions live in [agentux/docs/adr](https://github.com/agentux-os/agentux/tree/main/docs/adr).
 
 ## Components
 
@@ -26,15 +26,17 @@ A Cargo workspace. What exists today:
 | [`agentux-store`](crates/agentux-store) | SQLite persistence (bundled SQLite): projects, runs, step attempts, approval requests and the event log, with schema migrations. Every change is one transaction; events are broadcast only after commit. |
 | [`agentux-api`](crates/agentux-api) | API types, the JSON-RPC envelope and an async client, shared by the daemon, `aux` and the cockpit backend. |
 | [`agentux-bus`](crates/agentux-bus) | The agent bus ([ADR 0004](https://github.com/agentux-os/agentux/blob/main/docs/adr/0004-unified-interface-and-agent-bus.md)): sessions with a scoped identity (run, project, role, vendor), mailboxes, routing to a session, a role, the run or the human, `request_review`, `handoff`, `get_run_state` and `ask_human`, with the `bus` limits from `agentux.yaml` (allowed tools, turns per exchange). Every exchange is an audit event; delivery is a wake event the daemon turns into an ACP prompt. Served to each session as the `agentux` MCP server (rmcp), with the session system prompt. Not wired into `agentuxd` yet. |
-| [`agentuxd`](crates/agentuxd) | The daemon: run state machine ([ADR 0003](https://github.com/agentux-os/agentux/blob/main/docs/adr/0003-workflow-engine.md)) and the API on a Unix socket ([docs/api.md](docs/api.md)). Also a library, so `aux daemon` runs the same code. |
+| [`agentuxd`](crates/agentuxd) | The daemon: run state machine ([ADR 0003](https://github.com/agentux-os/agentux/blob/main/docs/adr/0003-workflow-engine.md)), the ACP step executor (`AcpExecutor`, with the step prompts in `prompts.rs` and the `gh` pull request step in `forge.rs`) and the API on a Unix socket ([docs/api.md](docs/api.md)). Also a library, so `aux daemon` runs the same code. |
+| [`agentux-fake-agent`](crates/agentux-fake-agent) | Test support, not shipped: a scriptable ACP agent that runs in-process over a byte pipe, used by the harness and daemon tests. |
 | [`aux-cli`](crates/aux-cli) | The `aux` binary. |
 
 ### Running
 
 ```sh
-aux daemon [--fake-agents]          # agentuxd in the foreground (or: agentuxd, or the systemd unit below)
+aux daemon [--fake-agents] [--auto-approve-permissions]
+                                    # agentuxd in the foreground (or: agentuxd, or the systemd unit below)
 aux run [project-dir] --prompt "Add a health endpoint" [--issue 42] [--watch]
-aux ps [--all]                      # runs, and approvals waiting for you
+aux ps [--all]                      # runs, and approvals and agent permission requests waiting for you
 aux approve <request-id> [-m note]
 aux deny <request-id> [-m reason]
 aux watch <run-id>                  # history, then live events until the run ends
@@ -43,7 +45,17 @@ aux cancel <run-id>
 
 The socket is `$XDG_RUNTIME_DIR/agentux/agentuxd.sock` (override with `--socket` or `$AGENTUX_SOCKET`); state lives in `$XDG_STATE_HOME/agentux/agentuxd.db`. [`contrib/agentuxd.service`](contrib/agentuxd.service) is a systemd user unit for the image.
 
-A run gets its own worktree, then walks the pipeline: agent steps call the executor, gates run the configured checks with `sh -c` in the worktree, failures and requested changes loop back within `max_attempts`/`max_rounds`, and `approve: true` pauses the run until `aux approve`. Each transition is committed before its side effect, so a restarted daemon resumes every unfinished run, re-running a step that was interrupted. `budget.max_usd_per_run` is stored but not enforced yet (no usage data without harness adapters). The API, event stream and lifecycle are documented in [docs/api.md](docs/api.md).
+A run gets its own worktree, then walks the pipeline: agent steps call the executor, gates run the configured checks with `sh -c` in the worktree, failures and requested changes loop back within `max_attempts`/`max_rounds`, and `approve: true` pauses the run until `aux approve`. Each transition is committed before its side effect, so a restarted daemon resumes every unfinished run, re-running a step that was interrupted. The API, event stream and lifecycle are documented in [docs/api.md](docs/api.md).
+
+How agent steps work:
+
+- **Sessions.** Each role gets one harness session (the role's `harness` from `agentux.yaml`, launched as in the [`agentux-harness` table](crates/agentux-harness/README.md#harnesses)) in the run's worktree, started when the run first reaches the role and reused by its later steps. Each harness uses the login you set up for it. Sessions end with the run; after a daemon restart, new ones start. A role's `model` is recorded but not passed to the harness yet.
+- **Prompts** ([`prompts.rs`](crates/agentuxd/src/prompts.rs)) are self-contained: the run's prompt or issue, the step, the role, the plan, and the gate output or review comments that sent the run back. The planner's reply is the plan.
+- **Commits.** Agents are told to edit files and not commit; after each agent step the daemon commits whatever changed in the worktree (`git add --all`, so keep build artifacts in `.gitignore`), with a subject derived from the run (`<title>`, `Fix failing checks: <title>`, `Address review comments: <title>`). Without a git identity it commits as `AgentUX <agentux@localhost>`.
+- **Review verdicts.** The reviewer is asked to end with a fenced JSON block, `{"verdict": "APPROVE" | "CHANGES_REQUESTED", "comments": ...}`. The last such object wins; without one, the last upper-case `APPROVE` / `CHANGES_REQUESTED` keyword does; without either, the reviewer is asked once more, then the step fails.
+- **Permissions.** When an agent asks before a tool call, the run waits (`waiting`) with a `permission` request in `aux ps`; the agent waits for `aux approve` or `aux deny`. A denial tells the agent no and the run goes on. `--auto-approve-permissions` allows everything without asking: **dangerous**, since agents can then run any command with your user's rights; use it only for unattended runs in a sandbox you trust. (Some harnesses, OpenCode among them, run tools without asking through ACP; then there is nothing to approve.)
+- **Budget.** Harnesses that report cost update the run's `costUsd`. Before each agent step, a run over `budget.max_usd_per_run` pauses with a `budget` request; approving gives it another `max_usd_per_run`, denying fails it. A single step can overshoot.
+- **Pull requests.** With a GitHub `origin` and `gh` logged in, the `pull_request` step pushes `aux/<run-id>` and opens a pull request (title: the run's title; body: the request, the plan and the review), or reuses the one already open for the branch. Otherwise the branch stays and the step records `PR skipped: <reason>`.
 
 Other commands:
 
@@ -91,10 +103,10 @@ Linux is the target. The crate holding `aux` is named `aux-cli` because `aux` is
 
 ## Next steps
 
-- An ACP-backed step executor for `agentuxd` on top of `agentux-harness`, and usage reporting so budgets can be enforced.
+- Passing a role's `model` to harnesses; per-project permission policies in `agentux.yaml`.
 - Headless fallbacks for the harnesses, behind the same `Harness` trait ([ADR 0002](https://github.com/agentux-os/agentux/blob/main/docs/adr/0002-harness-integration-via-acp.md)).
 - Agent bus in `agentuxd`: the bridge behind `aux bus-stdio`, a `BusBackend` over run state and the approvals inbox, wakes turned into prompts, and bus events in the event log ([`agentux-bus`](crates/agentux-bus/README.md#transport-and-the-daemon-bridge)).
-- Sessions, permission requests from harnesses and `aux attach` in the API; the cockpit's real `DaemonClient` on top of it.
+- `aux attach` (follow and talk to one session); the cockpit's real `DaemonClient` on top of the sessions API.
 
 ## Relevant ADRs
 

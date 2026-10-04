@@ -23,10 +23,13 @@ use tokio::sync::oneshot;
 
 type Result = agentux_fake_agent::TurnResult;
 
+/// (harness, cwd) of each launch.
+type Launched = Arc<Mutex<Vec<(String, PathBuf)>>>;
+
 /// Starts a fake agent per launch; `scripts` picks its script by harness id.
 struct FakeLauncher {
     scripts: Arc<dyn Fn(&str) -> Script + Send + Sync>,
-    launched: Arc<Mutex<Vec<(String, PathBuf)>>>,
+    launched: Launched,
 }
 
 impl Launcher for FakeLauncher {
@@ -63,7 +66,7 @@ type Shared = Arc<Mutex<Seen>>;
 fn executor(
     seen: &Shared,
     agent: fn(String, Turn, Shared) -> BoxFuture<'static, Result>,
-) -> (Arc<AcpExecutor>, Arc<Mutex<Vec<(String, PathBuf)>>>) {
+) -> (Arc<AcpExecutor>, Launched) {
     let launched = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(seen);
     let launcher = FakeLauncher {
@@ -240,7 +243,12 @@ async fn a_full_pipeline_through_acp_agents() {
         assert!(coder[0].contains("## Plan\n\n1. Create hello.txt"));
         assert!(coder[0].contains("Do not commit"));
         assert!(coder[1].contains("The reviewer requested these changes:\n\n- say world too"));
-        let review = &seen.prompts.iter().find(|(h, _)| h == "fake-reviewer").unwrap().1;
+        let review = &seen
+            .prompts
+            .iter()
+            .find(|(h, _)| h == "fake-reviewer")
+            .unwrap()
+            .1;
         assert!(review.contains("git diff "), "{review}");
     }
 
@@ -297,7 +305,10 @@ async fn a_full_pipeline_through_acp_agents() {
         .collect();
     assert!(matches!(
         planner_events[0],
-        SessionEvent::Message { from: MessageFrom::User, .. }
+        SessionEvent::Message {
+            from: MessageFrom::User,
+            ..
+        }
     ));
     assert!(matches!(planner_events[1], SessionEvent::Plan { .. }));
     assert_eq!(
@@ -410,7 +421,10 @@ async fn permission_requests_round_trip_through_the_api() {
     let detail = client.get_run(&run.id).await.unwrap();
     assert_eq!(detail.run.status, RunStatus::Waiting);
     assert_eq!(detail.sessions.len(), 1);
-    assert_eq!(request.session_id.as_deref(), Some(detail.sessions[0].id.as_str()));
+    assert_eq!(
+        request.session_id.as_deref(),
+        Some(detail.sessions[0].id.as_str())
+    );
     assert_eq!(detail.sessions[0].state, SessionState::Waiting);
 
     let approved = client.approve(&request.id, None).await.unwrap();
@@ -436,10 +450,7 @@ async fn permission_requests_round_trip_through_the_api() {
         failed.error.as_deref(),
         Some("gate failed after 1 of 1 attempts")
     );
-    assert_eq!(
-        seen.lock().unwrap().permission_outcomes,
-        ["allow", "deny"]
-    );
+    assert_eq!(seen.lock().unwrap().permission_outcomes, ["allow", "deny"]);
     let (_, attempts, _) = engine.run(&run.id).unwrap();
     assert_eq!(
         attempts[0].output.as_deref(),
