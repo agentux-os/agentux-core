@@ -13,7 +13,17 @@ env:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    name: ci (${{ matrix.arch }})
+    # aarch64 too, natively, since release.yml ships an aarch64 RPM.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v5
       - name: Install the pinned toolchain

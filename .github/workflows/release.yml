@@ -6,9 +6,14 @@ name: release
 # with dnf in a fresh Fedora 44 container and smoke-tested before it is
 # published anywhere.
 #
-# - push of a `v*` tag: build, verify and attach the .rpm to a GitHub release
-#   for that tag (the tag must match the workspace version in Cargo.toml)
-# - workflow_dispatch: build, verify and upload the .rpm as a workflow artifact
+# Both x86_64 and aarch64 RPMs are built, each natively on a runner of that
+# architecture (GitHub's arm64 runners are free for public repositories), from
+# the same multi-arch fedora:44 image, and each is verified on its own arch.
+#
+# - push of a `v*` tag: build, verify and attach both .rpm files to a GitHub
+#   release for that tag (the tag must match the workspace version in Cargo.toml)
+# - workflow_dispatch: build, verify and upload the .rpm files as workflow
+#   artifacts (agentux-rpm-x86_64, agentux-rpm-aarch64)
 
 on:
   push:
@@ -27,12 +32,18 @@ env:
 
 jobs:
   rpm:
-    name: build rpm (fedora 44)
-    runs-on: ubuntu-latest
+    name: build rpm (fedora 44, ${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container:
       image: registry.fedoraproject.org/fedora:44
-    outputs:
-      name: ${{ steps.rpm.outputs.name }}
     steps:
       # Installed before checkout so actions/checkout can use git.
       - name: Install build dependencies
@@ -53,6 +64,8 @@ jobs:
           cargo --version
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
 
       - name: Read version
         id: version
@@ -83,7 +96,7 @@ jobs:
       - name: Inspect RPM
         id: rpm
         run: |
-          rpm_path=$(ls target/rpmbuild/RPMS/*/agentux-*.rpm)
+          rpm_path=$(ls target/rpmbuild/RPMS/${{ matrix.arch }}/agentux-*.${{ matrix.arch }}.rpm)
           echo "path=${rpm_path}" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "${rpm_path}")" >> "$GITHUB_OUTPUT"
           ls -l "${rpm_path}"
@@ -108,26 +121,37 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: agentux-rpm
+          name: agentux-rpm-${{ matrix.arch }}
           path: ${{ steps.rpm.outputs.path }}
           if-no-files-found: error
 
   verify:
-    name: verify rpm (fedora 44)
+    name: verify rpm (fedora 44, ${{ matrix.arch }})
     needs: rpm
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container:
       image: registry.fedoraproject.org/fedora:44
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: agentux-rpm
+          name: agentux-rpm-${{ matrix.arch }}
 
       - name: Install with dnf
         run: |
+          rpm_file=$(ls agentux-*.${{ matrix.arch }}.rpm)
           # Weak deps on, so the Recommends (gh) is resolved too.
-          dnf -y install --setopt=install_weak_deps=True "./${{ needs.rpm.outputs.name }}" systemd
+          dnf -y install --setopt=install_weak_deps=True "./${rpm_file}" systemd
           rpm -q agentux git gh
+          test "$(rpm -q --qf '%{ARCH}' agentux)" = "${{ matrix.arch }}"
+          test "$(uname -m)" = "${{ matrix.arch }}"
 
       - name: Smoke test
         run: |
@@ -157,9 +181,12 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: agentux-rpm
+          pattern: agentux-rpm-*
+          merge-multiple: true
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ needs.rpm.outputs.name }}
+          files: |
+            agentux-*.x86_64.rpm
+            agentux-*.aarch64.rpm
           fail_on_unmatched_files: true
