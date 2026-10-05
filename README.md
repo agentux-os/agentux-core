@@ -87,16 +87,16 @@ aux bus-stdio --standalone [--project <dir>] [--role <r>]   # the same on an in-
 
 ## Install
 
-The AgentUX image ships `aux` and `agentuxd` preinstalled from the `agentux` RPM. On another Fedora 44 system, download the `.rpm` from the [releases](https://github.com/agentux-os/agentux-core/releases) and install it:
+The AgentUX image ships `aux` and `agentuxd` preinstalled from the `agentux` RPM. On another Fedora 44 system, download the `.rpm` for your architecture (`x86_64` or `aarch64`) from the [releases](https://github.com/agentux-os/agentux-core/releases) and install it:
 
 ```sh
-sudo dnf install ./agentux-<version>-1.fc44.x86_64.rpm
+sudo dnf install ./agentux-<version>-1.fc44.$(uname -m).rpm
 systemctl --user enable --now agentuxd.service   # optional: run the daemon as a user service
 ```
 
 It installs `/usr/bin/aux`, `/usr/bin/agentuxd` and the user unit `/usr/lib/systemd/user/agentuxd.service`, requires `git` and recommends `gh`. On an rpm-ostree system, use `rpm-ostree install` instead of `dnf`.
 
-The RPM is built by [`.github/workflows/release.yml`](.github/workflows/release.yml) in a Fedora 44 container from [`packaging/agentux.spec`](packaging/agentux.spec): pushing a `v<version>` tag that matches the workspace version in `Cargo.toml` builds it, installs and smoke-tests it in a clean container, and attaches it to the GitHub release; running the workflow manually leaves it as a workflow artifact.
+The RPM is built by [`.github/workflows/release.yml`](.github/workflows/release.yml) in a Fedora 44 container from [`packaging/agentux.spec`](packaging/agentux.spec): pushing a `v<version>` tag that matches the workspace version in `Cargo.toml` builds it for x86_64 and aarch64 (each natively, on GitHub's x86_64 and arm64 runners), installs and smoke-tests each in a clean container of its architecture, and attaches both to the GitHub release; running the workflow manually leaves them as workflow artifacts (`agentux-rpm-x86_64`, `agentux-rpm-aarch64`). CI runs the tests on both architectures too.
 
 ## Build and test
 
