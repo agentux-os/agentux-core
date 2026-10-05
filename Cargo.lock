@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "agentux-api"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64",
  "serde",
@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "agentux-bus"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "agentux-config",
  "rmcp",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "agentux-config"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "serde",
  "serde-saphyr",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "agentux-fake-agent"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "agent-client-protocol",
  "tokio",
@@ -95,7 +95,7 @@ dependencies = [
 
 [[package]]
 name = "agentux-harness"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "agent-client-protocol",
  "agentux-fake-agent",
@@ -107,7 +107,7 @@ dependencies = [
 
 [[package]]
 name = "agentux-store"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "agentux-api",
  "rusqlite",
@@ -119,14 +119,14 @@ dependencies = [
 
 [[package]]
 name = "agentux-worktree"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "agentuxd"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "agentux-api",
  "agentux-bus",
@@ -323,7 +323,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "aux-cli"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "agentux-api",
  "agentux-bus",
