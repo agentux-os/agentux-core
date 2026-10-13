@@ -37,6 +37,7 @@ aux daemon [--fake-agents] [--auto-approve-permissions]
                                     # agentuxd in the foreground (or: agentuxd, or the systemd unit below)
 aux run [project-dir] --prompt "Add a health endpoint" [--issue 42] [--watch]
 aux ps [--all]                      # runs, and approvals and agent permission requests waiting for you
+aux ps --json [--all]               # the same as one JSON object, for status bars and scripts (exit 3: daemon down)
 aux approve <request-id> [-m note]
 aux deny <request-id> [-m reason]
 aux answer <request-id> <answer>    # answer an agent's question (ask_human)
@@ -50,7 +51,7 @@ aux cancel <run-id>
 
 The socket is `$XDG_RUNTIME_DIR/agentux/agentuxd.sock` (override with `--socket` or `$AGENTUX_SOCKET`); state lives in `$XDG_STATE_HOME/agentux/agentuxd.db`. [`contrib/agentuxd.service`](contrib/agentuxd.service) is a systemd user unit for the image.
 
-A run gets its own worktree, then walks the pipeline: agent steps call the executor, gates run the configured checks with `sh -c` in the worktree (on the host, or with `isolation.mode: podman` in a rootless container that sees only the worktree, see below), failures and requested changes loop back within `max_attempts`/`max_rounds`, and `approve: true` pauses the run until `aux approve`. Each transition is committed before its side effect, so a restarted daemon resumes every unfinished run, re-running a step that was interrupted. The API, event stream and lifecycle are documented in [docs/api.md](docs/api.md).
+A run gets its own worktree, then walks the pipeline: agent steps call the executor, gates run the configured checks with `sh -c` in the worktree (on the host, or with `isolation.mode: podman` in a rootless container that sees only the worktree, see below), failures and requested changes loop back within `max_attempts`/`max_rounds`, and `approve: true` pauses the run until `aux approve`. Each transition is committed before its side effect, so a restarted daemon resumes every unfinished run, re-running a step that was interrupted. The API, event stream and lifecycle are documented in [docs/api.md](docs/api.md), as is the JSON of [`aux ps --json`](docs/api.md#aux-ps---json).
 
 How agent steps work:
 

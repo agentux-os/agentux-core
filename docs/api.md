@@ -324,3 +324,68 @@ Requests on one connection are answered in order, and `ask_human` keeps its call
 **Restarts.** The log is in the event store, so `bus.list` and `events.subscribe { since: 0 }` return it after a restart. Mailboxes, queues and turn counts live in memory, and a run's bus reopened after a restart rebuilds them from its log: message, exchange and question ids continue after the highest ones; each exchange keeps the turns it used, so limits still hold and replies to old messages (`in_reply_to`) route to their sender. Mail is rebuilt too, as far as the log tells: reads are not logged, so a message counts as handled once a wake was issued for its recipient after it arrived. Messages still queued for a role, and messages that reached a session without a wake (sent to `run`) while it was on the bus when the daemon stopped, are queued again for the role (at most 50 per role, the newest). The sessions of the old daemon are gone: each gets a `left` entry with subject `... left the bus (agentuxd restarted)` and `queuedForRole` set to its role, so a later rebuild sees the same queue. On startup, the bus of every unfinished run with mail waiting is reopened at once, and each role with mail gets a `wake` (and a session started for it), with a prompt saying the messages were sent before the restart. A message whose wake had been issued but whose turn never ran (the daemon stopped first) is not delivered again.
 
 **Models.** A role's `model` is selected over ACP when the harness offers it: ACP has no model field in `session/new`, but agents that let clients pick one list a session config option of category `model`; the daemon sets it with `session/set_config_option` (matching the option's value or name). When the harness offers no such option or not that model, the session starts with its default and gets a `system` message saying so.
+
+## CLI
+
+`aux` is a client of this API; its text output is for people and may change. One command has a stable, machine-readable form.
+
+### `aux ps --json`
+
+Prints one JSON object on stdout, one line, for status bars (the agentux-os Waybar module) and scripts. It is built from `projects.list`, `runs.list` and `requests.list { pending: true }`. Like `aux ps`, it lists unfinished runs (`running`, `waiting`), and every run with `--all`.
+
+```json
+{
+  "daemon": "up",
+  "runs": [
+    {
+      "id": "k3x9q2ab",
+      "projectId": "p7c1d0e4",
+      "project": { "name": "api", "path": "/home/me/src/api" },
+      "title": "Add a health endpoint",
+      "status": "waiting",
+      "step": "plan",
+      "stepIndex": 0,
+      "activity": "waiting for plan approval",
+      "gate": { "attempt": 0, "max": 3 },
+      "review": { "round": 0, "max": 2 },
+      "costUsd": 0.42,
+      "updatedAt": 1791849600000
+    }
+  ],
+  "pending": [
+    {
+      "id": "r5f2a9c1",
+      "runId": "k3x9q2ab",
+      "kind": "plan",
+      "title": "Approve the plan for \"Add a health endpoint\"",
+      "sessionId": "s8d3e6f0",
+      "options": ["yes", "no"],
+      "createdAt": 1791849600000
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `daemon` | `"up"`; `"down"` when the daemon cannot be reached (then it is the only field) |
+| `runs` | Runs, newest first; empty when idle |
+| `runs[].id`, `projectId`, `title`, `status`, `step`, `stepIndex`, `activity`, `updatedAt` | As in `Run`: `status` is `running`, `waiting`, `done`, `failed` or `cancelled`; `step` a step kind; `updatedAt` in milliseconds since the epoch |
+| `runs[].project` | `{ name, path }` of the run's project (left out if the project is unknown) |
+| `runs[].gate` | `{ attempt, max }`: attempts of the most recent gate and its limit (`gateAttempt`, `gateMaxAttempts`); only when the run's pipeline has a gate step |
+| `runs[].review` | `{ round, max }`: rounds of the most recent review and its limit; only when the pipeline has a review step |
+| `runs[].costUsd` | What the run's sessions have cost so far; only when a harness reported cost |
+| `pending` | Requests waiting for the human (approvals inbox), newest first; not affected by `--all` |
+| `pending[].id`, `runId`, `kind`, `title`, `createdAt` | As in `PermissionRequest`: `kind` is `plan`, `step`, `permission`, `budget` or `question`; `id` is what `aux approve`, `aux deny` and `aux answer` take |
+| `pending[].sessionId` | The session that asked (`permission` and `question` requests) |
+| `pending[].options` | Suggested answers of a `question` request, when it has any |
+
+Optional fields are left out, never `null`. New fields may be added; existing ones keep their name and meaning.
+
+Exit codes:
+
+| Code | stdout |
+|---|---|
+| `0` | The document above, `"daemon": "up"` |
+| `3` | `{"daemon":"down"}`: no socket, or nothing accepts connections on it (the reason goes to stderr) |
+| `1` | Nothing; the daemon answered with an error (the message goes to stderr) |
