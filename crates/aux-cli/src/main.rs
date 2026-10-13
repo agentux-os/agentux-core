@@ -89,6 +89,10 @@ enum Command {
         /// Include finished runs
         #[arg(long, short)]
         all: bool,
+        /// Print one JSON object instead of a table (schema in docs/api.md);
+        /// exits with 3 and `{"daemon":"down"}` when the daemon is unreachable
+        #[arg(long)]
+        json: bool,
     },
     /// Approve a pending request (a plan, a step, a budget overrun, or an
     /// agent's permission to run a tool)
@@ -211,6 +215,7 @@ fn main() -> ExitCode {
             fake_agents,
             auto_approve_permissions,
         }),
+        Command::Ps { all, json: true } => return remote::ps_json(cli.socket, all),
         command => remote(cli.socket, command),
     };
     match result {
@@ -240,7 +245,7 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
                 title,
                 watch,
             } => remote.run(&project_dir, prompt, issue, title, watch).await,
-            Command::Ps { all } => remote.ps(all).await,
+            Command::Ps { all, .. } => remote.ps(all).await,
             Command::Approve {
                 request_id,
                 message,

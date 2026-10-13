@@ -232,3 +232,98 @@ fn commands_explain_a_missing_daemon() {
     assert!(err.contains("cannot connect to agentuxd"), "{err}");
     assert!(err.contains("aux daemon"), "{err}");
 }
+
+impl Setup {
+    /// `aux ps --json [extra]`, parsed, with its exit code.
+    fn ps_json(&self, extra: &[&str]) -> (Option<i32>, serde_json::Value) {
+        let mut args = vec!["ps", "--json"];
+        args.extend_from_slice(extra);
+        let output = self.aux(&args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+            panic!(
+                "aux {args:?} printed no JSON ({e}):\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        (output.status.code(), value)
+    }
+}
+
+#[test]
+fn ps_json_reports_an_idle_daemon() {
+    let s = setup(&PIPELINE.replace("CHECK", "true"));
+    let _daemon = s.daemon();
+    let (code, value) = s.ps_json(&[]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        value,
+        serde_json::json!({ "daemon": "up", "runs": [], "pending": [] })
+    );
+}
+
+#[test]
+fn ps_json_shows_a_run_waiting_for_plan_approval() {
+    let s = setup(&PIPELINE.replace("CHECK", "true"));
+    let _daemon = s.daemon();
+    let run_id = s
+        .ok(&["run", path(&s.repo), "--prompt", "Add a health endpoint"])
+        .trim()
+        .to_string();
+
+    let mut value = serde_json::Value::Null;
+    wait_until("the run waits for plan approval", || {
+        value = s.ps_json(&[]).1;
+        value["pending"].as_array().is_some_and(|p| !p.is_empty())
+    });
+    assert_eq!(value["daemon"], "up");
+
+    let runs = value["runs"].as_array().unwrap();
+    assert_eq!(runs.len(), 1, "{value}");
+    let run = &runs[0];
+    assert_eq!(run["id"], run_id.as_str());
+    assert_eq!(run["title"], "Add a health endpoint");
+    assert_eq!(run["status"], "waiting");
+    assert_eq!(run["step"], "plan");
+    assert_eq!(run["stepIndex"], 0);
+    assert_eq!(run["project"]["name"], "repo");
+    let repo = fs::canonicalize(&s.repo).unwrap();
+    assert_eq!(run["project"]["path"], path(&repo));
+    assert!(run["projectId"].is_string());
+    assert!(run["updatedAt"].as_i64().unwrap() > 0);
+    // The pipeline has a gate (no on_fail: one attempt) and no review step.
+    assert_eq!(run["gate"]["max"], 1, "{run}");
+    assert!(run["gate"]["attempt"].is_u64(), "{run}");
+    assert!(run.get("review").is_none(), "{run}");
+    assert!(run.get("costUsd").is_none(), "{run}");
+
+    let pending = value["pending"].as_array().unwrap();
+    assert_eq!(pending.len(), 1, "{value}");
+    let request = &pending[0];
+    assert_eq!(request["runId"], run_id.as_str());
+    assert_eq!(request["kind"], "plan");
+    assert!(request["title"].as_str().is_some_and(|t| !t.is_empty()));
+    assert!(request.get("options").is_none(), "{request}");
+
+    // Denying the plan fails the run: gone from the default list, shown with --all.
+    let request_id = request["id"].as_str().unwrap();
+    s.ok(&["deny", request_id, "-m", "not now"]);
+    wait_until("the run fails", || {
+        s.ps_json(&[]).1["runs"]
+            .as_array()
+            .is_some_and(|r| r.is_empty())
+    });
+    let (code, all) = s.ps_json(&["--all"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(all["runs"][0]["id"], run_id.as_str());
+    assert_eq!(all["runs"][0]["status"], "failed");
+    assert_eq!(all["pending"], serde_json::json!([]));
+}
+
+#[test]
+fn ps_json_reports_a_missing_daemon_with_exit_code_3() {
+    let s = setup(&PIPELINE.replace("CHECK", "true"));
+    let (code, value) = s.ps_json(&[]);
+    assert_eq!(code, Some(3));
+    assert_eq!(value, serde_json::json!({ "daemon": "down" }));
+}

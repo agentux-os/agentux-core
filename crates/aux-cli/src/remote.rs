@@ -3,14 +3,139 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 
 use agentux_api::rpc::{BusPost, StartRun, Subscribe};
 use agentux_api::{
-    BusEndpoint, BusMessage, BusMessageKind, Client, Event, EventBody, MessageFrom, RequestKind,
-    RequestStatus, Run, RunStatus, SessionEvent, SessionState, ToolStatus,
+    BusEndpoint, BusMessage, BusMessageKind, Client, Event, EventBody, MessageFrom,
+    PermissionRequest, Project, RequestKind, RequestStatus, Run, RunStatus, SessionEvent,
+    SessionState, StepKind, ToolStatus,
 };
 
+use serde_json::{Value, json};
+
 use crate::Result;
+
+/// Exit code of `aux ps --json` when the daemon cannot be reached.
+pub const EXIT_DAEMON_DOWN: u8 = 3;
+
+/// `aux ps --json`: one JSON object on stdout (schema in docs/api.md).
+/// Exits with [`EXIT_DAEMON_DOWN`] and `{"daemon":"down"}` when the daemon
+/// cannot be reached, so status bars can tell "down" from "idle".
+pub fn ps_json(socket: Option<PathBuf>, all: bool) -> ExitCode {
+    let down = |reason: &dyn std::fmt::Display| {
+        eprintln!("{reason}");
+        println!("{}", json!({ "daemon": "down" }));
+        ExitCode::from(EXIT_DAEMON_DOWN)
+    };
+    let remote = match Remote::new(socket) {
+        Ok(remote) => remote,
+        Err(e) => return down(&e),
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    runtime.block_on(async {
+        let mut client = match Client::connect(&remote.socket).await {
+            Ok(client) => client,
+            Err(e) => return down(&e),
+        };
+        let document = async {
+            let projects = client.list_projects().await?;
+            let runs = client.list_runs().await?;
+            let pending = client.list_requests(true).await?;
+            Ok::<_, agentux_api::ClientError>(ps_document(&projects, &runs, &pending, all))
+        };
+        match document.await {
+            Ok(document) => {
+                println!("{document}");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        }
+    })
+}
+
+/// The `aux ps --json` document for a reachable daemon. Optional fields are
+/// left out rather than set to `null`.
+fn ps_document(
+    projects: &[Project],
+    runs: &[Run],
+    pending: &[PermissionRequest],
+    all: bool,
+) -> Value {
+    let projects: HashMap<&str, &Project> = projects.iter().map(|p| (p.id.as_str(), p)).collect();
+    let runs: Vec<Value> = runs
+        .iter()
+        .filter(|r| all || !r.status.is_terminal())
+        .map(|run| {
+            let mut value = json!({
+                "id": run.id,
+                "projectId": run.project_id,
+                "title": run.title,
+                "status": run.status,
+                "step": run.step,
+                "stepIndex": run.step_index,
+                "activity": run.activity,
+                "updatedAt": run.updated_at,
+            });
+            let object = value.as_object_mut().expect("an object");
+            if let Some(project) = projects.get(run.project_id.as_str()) {
+                object.insert(
+                    "project".into(),
+                    json!({ "name": project.name, "path": project.path }),
+                );
+            }
+            if run.steps.contains(&StepKind::Gate) {
+                object.insert(
+                    "gate".into(),
+                    json!({ "attempt": run.gate_attempt, "max": run.gate_max_attempts }),
+                );
+            }
+            if run.steps.contains(&StepKind::Review) {
+                object.insert(
+                    "review".into(),
+                    json!({ "round": run.review_round, "max": run.review_max_rounds }),
+                );
+            }
+            if run.cost_usd > 0.0 {
+                object.insert("costUsd".into(), json!(run.cost_usd));
+            }
+            value
+        })
+        .collect();
+    let pending: Vec<Value> = pending
+        .iter()
+        .map(|request| {
+            let mut value = json!({
+                "id": request.id,
+                "runId": request.run_id,
+                "kind": request.kind,
+                "title": request.title,
+                "createdAt": request.created_at,
+            });
+            let object = value.as_object_mut().expect("an object");
+            if let Some(session_id) = &request.session_id {
+                object.insert("sessionId".into(), json!(session_id));
+            }
+            if !request.options.is_empty() {
+                object.insert("options".into(), json!(request.options));
+            }
+            value
+        })
+        .collect();
+    json!({ "daemon": "up", "runs": runs, "pending": pending })
+}
 
 pub struct Remote {
     socket: PathBuf,
