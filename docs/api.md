@@ -39,6 +39,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `terminals.resize` | `{ terminalId, cols, rows }` | `null` |
 | `terminals.close` | `{ terminalId }` | `null`; `terminal_exit` follows |
 | `terminals.list` | `{ sessionId?, runId? }` | `Terminal[]`, oldest first |
+| `helper.ask` | `{ harness, question, context?, model? }` | `{ harness, answer }` — one read-only question for the cockpit's helper, answered by a fresh session of `harness`; see [Helper questions](#helper-questions) |
 | `bus.hello` | `{ sessionToken }` | `{ identity, allowedTools, maxTurnsPerExchange }` — bus bridge only, see [Agent bus](#agent-bus) |
 | `bus.call` | `{ sessionToken, call }` | `{ ok: <tool result> }` or `{ err: <refusal> }` — bus bridge only |
 
@@ -324,6 +325,18 @@ Requests on one connection are answered in order, and `ask_human` keeps its call
 **Restarts.** The log is in the event store, so `bus.list` and `events.subscribe { since: 0 }` return it after a restart. Mailboxes, queues and turn counts live in memory, and a run's bus reopened after a restart rebuilds them from its log: message, exchange and question ids continue after the highest ones; each exchange keeps the turns it used, so limits still hold and replies to old messages (`in_reply_to`) route to their sender. Mail is rebuilt too, as far as the log tells: reads are not logged, so a message counts as handled once a wake was issued for its recipient after it arrived. Messages still queued for a role, and messages that reached a session without a wake (sent to `run`) while it was on the bus when the daemon stopped, are queued again for the role (at most 50 per role, the newest). The sessions of the old daemon are gone: each gets a `left` entry with subject `... left the bus (agentuxd restarted)` and `queuedForRole` set to its role, so a later rebuild sees the same queue. On startup, the bus of every unfinished run with mail waiting is reopened at once, and each role with mail gets a `wake` (and a session started for it), with a prompt saying the messages were sent before the restart. A message whose wake had been issued but whose turn never ran (the daemon stopped first) is not delivered again.
 
 **Models.** A role's `model` is selected over ACP when the harness offers it: ACP has no model field in `session/new`, but agents that let clients pick one list a session config option of category `model`; the daemon sets it with `session/set_config_option` (matching the option's value or name). When the harness offers no such option or not that model, the session starts with its default and gets a `system` message saying so.
+
+## Helper questions
+
+`helper.ask { harness, question, context?, model? }` asks the user's own harness one question for the cockpit's helper (the penguin, ADR 0014) and returns `{ harness, answer }`. It belongs to no run: nothing is stored, no event is emitted, and it does not show up in `runs.list` or the inbox.
+
+- **The session.** A fresh harness session (`harness` as in `agentux.yaml`, with `model` selected as for a role) started in a new, empty directory with mode `0700` under `$XDG_RUNTIME_DIR` (else the temp directory), removed afterwards. It gets no MCP server, so no agent bus. The harness uses the login the user set up for it, like any session.
+- **No tools.** Every permission request is denied. When the agent starts a tool call anyway (some harnesses run tools without asking, depending on their own settings), the daemon cancels the turn at that event and returns an error instead of the answer. A harness that runs a tool without asking can still run that one call before the cancel lands; the empty working directory and the prompt (which carries no file contents and no secrets) limit what it could see.
+- **The prompt.** The daemon's helper rules (answer about AgentUX only and politely decline anything else, such as KDE or Linux desktop questions; use no tools; say so when the material does not answer it; be brief, in the question's language), then `context` as reference material, then `question`. `context` is whatever the client sends: the cockpit sends excerpts of the AgentUX documentation and a summary of the current view (route and the selected run's title, status and step), never file contents. It is cut at 48 KiB.
+- **Limits.** The answer is the agent's reply text of that one turn. A turn that takes longer than 180 s (harness start included) is an error.
+- **Errors.** An empty `question` or one over 2000 characters, or an empty `harness`, is `-32602`. A harness that cannot start, refuses, sends nothing, tries a tool or times out is `-32603` with the reason. With `--fake-agents` the answer is a scripted line that starts with `(fake agent)`.
+
+A slow `helper.ask` holds up later requests on its connection (see [Transport](#transport)); clients use a connection of their own for it.
 
 ## CLI
 

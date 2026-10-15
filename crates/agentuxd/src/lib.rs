@@ -19,6 +19,7 @@ mod checks;
 pub mod engine;
 pub mod executor;
 pub mod forge;
+pub mod helper;
 mod human;
 pub mod prompts;
 pub mod server;
@@ -27,7 +28,7 @@ mod terminal;
 pub use acp::{AcpExecutor, HarnessLauncher, LaunchSpec, Launcher};
 pub use bus::{BusLink, aux_binary};
 pub use engine::{Engine, Settings, TuiCommands};
-pub use executor::{FakeExecutor, StepExecutor, StepHost};
+pub use executor::{FakeExecutor, HelperTask, StepExecutor, StepHost};
 
 /// Command-line options shared by `agentuxd` and `aux daemon`.
 #[derive(Debug, Clone, Args)]

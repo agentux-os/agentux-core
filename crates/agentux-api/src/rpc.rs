@@ -37,6 +37,9 @@ pub mod method {
     pub const TERMINALS_RESIZE: &str = "terminals.resize";
     pub const TERMINALS_CLOSE: &str = "terminals.close";
     pub const TERMINALS_LIST: &str = "terminals.list";
+    /// A one-off, read-only question for the cockpit's helper, answered by
+    /// the user's own harness ([`super::HelperAsk`]).
+    pub const HELPER_ASK: &str = "helper.ask";
     /// Server-to-client notification: output of a terminal this connection
     /// opened or attached, [`super::TerminalOutput`].
     pub const TERMINAL_OUTPUT: &str = "terminal_output";
@@ -312,6 +315,39 @@ pub struct BusPost {
     /// The bus message id being answered (`BusMessage.messageId`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_reply_to: Option<u64>,
+}
+
+/// Params of `helper.ask`: one question for the cockpit's helper (the
+/// penguin), answered by a fresh session of `harness` that may not use any
+/// tool. See `docs/api.md`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HelperAsk {
+    /// The harness that answers (`claude-code`, `codex`, ...).
+    pub harness: String,
+    /// The model to select, when the harness offers a choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub question: String,
+    /// Reference material from the client: AgentUX documentation excerpts
+    /// and a summary of what the user is looking at. Cut at
+    /// [`HELPER_MAX_CONTEXT`] bytes.
+    #[serde(default)]
+    pub context: String,
+}
+
+/// Longest `question` `helper.ask` takes, in characters.
+pub const HELPER_MAX_QUESTION: usize = 2000;
+/// `context` beyond this many bytes is dropped.
+pub const HELPER_MAX_CONTEXT: usize = 48 * 1024;
+
+/// Result of `helper.ask`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HelperAnswer {
+    /// The harness that answered.
+    pub harness: String,
+    pub answer: String,
 }
 
 /// Result of `bus.post`.

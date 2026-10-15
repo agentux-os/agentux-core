@@ -162,6 +162,14 @@ impl Client {
     }
 
     /// Sends a message to a live session as the human (`sessions.prompt`).
+    /// `helper.ask`: one read-only question for the cockpit's helper.
+    pub async fn ask_helper(
+        &mut self,
+        params: &rpc::HelperAsk,
+    ) -> Result<rpc::HelperAnswer, ClientError> {
+        self.call(method::HELPER_ASK, params).await
+    }
+
     pub async fn prompt_session(
         &mut self,
         session_id: &str,
