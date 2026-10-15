@@ -110,6 +110,20 @@ pub struct WakeTask {
     pub human: bool,
 }
 
+/// A one-off question for the cockpit's helper (`helper.ask`): one turn in a
+/// fresh session that belongs to no run, gets no MCP server and may not use
+/// any tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperTask {
+    pub harness: String,
+    pub model: Option<String>,
+    /// The question as the human typed it.
+    pub question: String,
+    /// The whole prompt: the helper's rules, the client's context and the
+    /// question ([`crate::helper::helper_prompt`]).
+    pub prompt: String,
+}
+
 /// What the daemon offers an executor while one agent step runs: recording
 /// sessions and what happens in them, and asking the human.
 pub trait StepHost: Send + Sync {
@@ -203,6 +217,12 @@ pub trait StepExecutor: Send + Sync + 'static {
         Box::pin(async { Err("these agents cannot be opened in their own TUI".into()) })
     }
 
+    /// Answers a helper question ([`HelperTask`]) with the agent's reply.
+    /// Executors without harness sessions cannot.
+    fn ask_helper<'a>(&'a self, _task: &'a HelperTask) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async { Err("these agents cannot answer helper questions".into()) })
+    }
+
     /// Takes back a session handed over by [`StepExecutor::take_over`]:
     /// reopens it over ACP (with everything the TUI added to it) and lets
     /// the waiting turns run.
@@ -237,6 +257,7 @@ pub struct FakeExecutor {
     delay: Duration,
     calls: Mutex<Vec<AgentTask>>,
     pull_requests: Mutex<Vec<PullRequestTask>>,
+    helper_calls: Mutex<Vec<HelperTask>>,
 }
 
 impl Default for FakeExecutor {
@@ -258,6 +279,7 @@ impl FakeExecutor {
             delay: Duration::ZERO,
             calls: Mutex::new(Vec::new()),
             pull_requests: Mutex::new(Vec::new()),
+            helper_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -271,6 +293,14 @@ impl FakeExecutor {
     /// Agent calls so far, in order.
     pub fn calls(&self) -> Vec<AgentTask> {
         self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Helper questions so far, in order.
+    pub fn helper_calls(&self) -> Vec<HelperTask> {
+        self.helper_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn pull_requests(&self) -> Vec<PullRequestTask> {
@@ -316,6 +346,23 @@ impl StepExecutor for FakeExecutor {
                 number: number as u64,
                 url: format!("https://forge.invalid/pulls/{number}"),
             }))
+        })
+    }
+
+    /// A scripted answer that says no real agent answered, so the cockpit's
+    /// helper can be tried on a demo daemon (`--fake-agents`).
+    fn ask_helper<'a>(&'a self, task: &'a HelperTask) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            self.helper_calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(task.clone());
+            Ok(format!(
+                "(fake agent) This agentuxd runs with --fake-agents, so no real agent answered. With a signed-in {} the answer to \"{}\" would be here.",
+                task.harness,
+                task.question.trim()
+            ))
         })
     }
 }

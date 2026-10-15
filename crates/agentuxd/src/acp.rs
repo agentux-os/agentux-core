@@ -30,8 +30,8 @@ use agentux_harness::{
 };
 
 use crate::executor::{
-    AgentOutcome, AgentTask, BoxFuture, HeldSession, PullRequestOutcome, PullRequestTask,
-    StepExecutor, StepHost, WakeTask,
+    AgentOutcome, AgentTask, BoxFuture, HeldSession, HelperTask, PullRequestOutcome,
+    PullRequestTask, StepExecutor, StepHost, WakeTask,
 };
 use crate::forge;
 use crate::prompts::{self, Verdict};
@@ -327,6 +327,65 @@ impl AcpExecutor {
         }
     }
 
+    /// The helper's one turn (see [`crate::helper`]): a fresh session in
+    /// `dir`, no MCP servers, every permission request denied, and the turn
+    /// cancelled at the first tool call. Returns the agent's reply.
+    async fn helper_turn(&self, task: &HelperTask, dir: &Path) -> Result<String, String> {
+        let deny = permission_handler(|_: PermissionRequest| async { Decision::Deny });
+        let spec = LaunchSpec {
+            harness: &task.harness,
+            cwd: dir,
+            model: task.model.as_deref(),
+            mcp_servers: &[],
+            load: None,
+        };
+        let (session, mut events) = self
+            .launcher
+            .launch(spec, deny)
+            .await
+            .map_err(|e| format!("cannot start the {} harness: {e}", task.harness))?;
+        let mut reply = String::new();
+        let mut tool: Option<String> = None;
+        let stop = {
+            let prompt = session.prompt(&task.prompt);
+            tokio::pin!(prompt);
+            loop {
+                tokio::select! {
+                    stop = &mut prompt => break stop,
+                    Some(event) = events.recv() => {
+                        if let Some(title) = helper_event(event, &mut reply)
+                            && tool.is_none()
+                        {
+                            tool = Some(title);
+                            let _ = session.cancel();
+                        }
+                    }
+                }
+            }
+        };
+        while let Ok(event) = events.try_recv() {
+            if let Some(title) = helper_event(event, &mut reply) {
+                tool.get_or_insert(title);
+            }
+        }
+        let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, session.shutdown()).await;
+        if let Some(title) = tool {
+            return Err(format!(
+                "{} tried to use a tool ({}); helper answers may not use tools, so the answer was dropped",
+                task.harness,
+                excerpt(&title)
+            ));
+        }
+        match stop {
+            Err(e) => Err(format!("the {} session failed: {e}", task.harness)),
+            Ok(StopReason::Refusal) => Err(format!("{} refused to answer", task.harness)),
+            Ok(StopReason::Cancelled) => Err(format!("{}'s turn was cancelled", task.harness)),
+            Ok(StopReason::EndTurn | StopReason::MaxTokens | StopReason::MaxTurnRequests) => {
+                Ok(reply)
+            }
+        }
+    }
+
     fn forget(&self, run_id: &str, role: &str, slot: &Arc<Slot>) {
         let key = (run_id.to_string(), role.to_string());
         let mut sessions = self.sessions();
@@ -541,6 +600,16 @@ impl StepExecutor for AcpExecutor {
         })
     }
 
+    fn ask_helper<'a>(&'a self, task: &'a HelperTask) -> BoxFuture<'a, Result<String, String>> {
+        Box::pin(async move {
+            let dir =
+                helper_dir().map_err(|e| format!("cannot create the helper's directory: {e}"))?;
+            let result = self.helper_turn(task, &dir).await;
+            let _ = std::fs::remove_dir_all(&dir);
+            result
+        })
+    }
+
     fn release<'a>(&'a self, run_id: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let slots: Vec<Arc<Slot>> = {
@@ -559,6 +628,45 @@ impl StepExecutor for AcpExecutor {
 struct Hold {
     slot: Arc<Slot>,
     live: tokio::sync::OwnedMutexGuard<Live>,
+}
+
+/// Adds a helper turn's agent text to `reply`; returns the title of a tool
+/// call the agent started (which ends the helper's turn).
+fn helper_event(event: Event, reply: &mut String) -> Option<String> {
+    match event {
+        Event::AgentMessage(text) => {
+            reply.push_str(&text);
+            None
+        }
+        Event::ToolCall(call) => Some(call.title),
+        Event::Diff(diff) => Some(format!("edit {}", diff.path.display())),
+        _ => None,
+    }
+}
+
+/// A new, empty directory only the daemon's user can enter, for a helper
+/// session to start in.
+fn helper_dir() -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::AtomicU64;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let dir = base.join(format!(
+        "agentux-helper-{}-{nanos}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
 }
 
 async fn shutdown(slot: Arc<Slot>) {

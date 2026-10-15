@@ -209,6 +209,7 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
             to_value(engine.prompt_session(&params.session_id, &params.text))
         }
         method::BUS_POST => to_value(engine.bus_post(parse(params)?)),
+        method::HELPER_ASK => to_value(engine.ask_helper(parse(params)?).await),
         method::SESSIONS_LIST => {
             let params: rpc::ListSessions = parse_or_default(params)?;
             to_value(engine.sessions(params.run_id.as_deref()))
