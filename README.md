@@ -1,8 +1,57 @@
-# agentux-core
+<p align="center">
+  <a href="https://agentuxos.org">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/agentux-os/agentux/main/brand/svg/lockup-dark.svg">
+      <img alt="AgentUX" src="https://raw.githubusercontent.com/agentux-os/agentux/main/brand/svg/lockup-light.svg" width="340">
+    </picture>
+  </a>
+</p>
+
+<h3 align="center">agentux-core: the daemon, CLI and agent bus that make coding agents work as one team</h3>
+
+<p align="center">
+  <a href="https://github.com/agentux-os/agentux-core/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/agentux-os/agentux-core/ci.yml?branch=main&label=ci&logo=github&labelColor=0b0d10"></a>
+  <a href="https://github.com/agentux-os/agentux-core/actions/workflows/release.yml"><img alt="RPM release" src="https://img.shields.io/github/actions/workflow/status/agentux-os/agentux-core/release.yml?label=rpm%20build&logo=fedora&logoColor=white&labelColor=0b0d10"></a>
+  <a href="https://github.com/agentux-os/agentux-core/releases"><img alt="Latest release" src="https://img.shields.io/github/v/release/agentux-os/agentux-core?include_prereleases&label=release&labelColor=0b0d10&color=4f7d0b"></a>
+  <a href="rust-toolchain.toml"><img alt="Rust" src="https://img.shields.io/badge/built%20with-Rust-4f7d0b?logo=rust&logoColor=white&labelColor=0b0d10"></a>
+  <a href="https://agentclientprotocol.com"><img alt="Agent Client Protocol" src="https://img.shields.io/badge/harnesses-ACP%20%C2%B7%20MCP-4f7d0b?labelColor=0b0d10"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/agentux-os/agentux-core?labelColor=0b0d10&color=4f7d0b"></a>
+  <a href="https://agentuxos.org"><img alt="Website" src="https://img.shields.io/badge/website-agentuxos.org-c6f36b?labelColor=0b0d10"></a>
+</p>
+
+<p align="center">
+  <a href="https://agentuxos.org"><b>Website</b></a> ·
+  <a href="https://download.agentuxos.org"><b>Download</b></a> ·
+  <a href="docs/api.md"><b>Docs</b></a> ·
+  <a href="https://github.com/agentux-os/agentux/blob/main/docs/getting-started.md"><b>Getting started</b></a> ·
+  <a href="https://github.com/agentux-os/agentux-core/releases"><b>Releases</b></a>
+</p>
 
 The orchestration engine of [AgentUX](https://github.com/agentux-os/agentux): the daemon, CLI and integrations that let coding agents from different vendors work as one team.
 
 > **Status:** early. `agentuxd` runs pipelines from `agentux.yaml` as persisted state machines in run worktrees, with gates, bounded loops, approvals and crash recovery, and `aux` drives it over a local socket. Agent steps run in real harness sessions over ACP (tried with OpenCode; Claude Code and Codex go through their ACP adapters), with agent permission requests in the approvals inbox, session events in the event log, budgets enforced from reported cost, and pull requests opened with `gh`. Agents talk to each other and to you through the agent bus, an MCP server the daemon gives every session. `--fake-agents` swaps in a scripted fake. Design decisions live in [agentux/docs/adr](https://github.com/agentux-os/agentux/tree/main/docs/adr).
+
+## At a glance
+
+Two binaries, one RPM:
+
+- **`agentuxd`** is the daemon. It owns every run: the git worktree, the harness sessions (Claude Code, Codex, OpenCode, Antigravity CLI), the pipeline state in SQLite and the agent bus. It serves the cockpit and `aux` over a local socket. On the [AgentUX image](https://github.com/agentux-os/agentux-os) it already runs as a systemd user service.
+- **`aux`** is its terminal twin: everything the cockpit does, from a shell or over SSH.
+
+A first run, from inside any git repository:
+
+```sh
+aux run . --prompt "Add a /health endpoint" --watch   # plan → implement → test → review → PR, in its own worktree
+aux ps                                                # runs, and what is waiting for you
+aux approve <request-id>                              # approve the plan (or a permission request)
+aux attach <session-id>                               # open a session in its vendor's own TUI; Ctrl-] detaches
+```
+
+No daemon running, or no vendor logins yet? `aux daemon --fake-agents` starts one in the foreground with a scripted fake agent, so you can watch a run go all the way to a pull request. Installing outside the image: [Install](#install). Every command: [Running](#running).
+
+## Contents
+
+[Components](#components) · [Install](#install) · [Running](#running) · [Crates](#crates) · [Build and test](#build-and-test) · [Next steps](#next-steps) · [Relevant ADRs](#relevant-adrs) · [License](#license)
 
 ## Components
 
@@ -14,23 +63,20 @@ The orchestration engine of [AgentUX](https://github.com/agentux-os/agentux): th
 | Workflow engine | Executes pipelines declared in each project's `agentux.yaml`: plan → implement → test → review → PR, with approval gates and bounded retries. |
 | Agent bus | MCP server exposed to every harness so agents can message each other, request cross-vendor reviews, hand off work and escalate to the human. |
 
-## Crates
+## Install
 
-A Cargo workspace. What exists today:
+The AgentUX image ships `aux` and `agentuxd` preinstalled from the `agentux` RPM. On another Fedora 44 system, download the `.rpm` for your architecture (`x86_64` or `aarch64`) from the [releases](https://github.com/agentux-os/agentux-core/releases) and install it:
 
-| Crate | What it does |
-|---|---|
-| [`agentux-config`](crates/agentux-config) | Types, parsing and strict validation of `agentux.yaml` ([ADR 0005](https://github.com/agentux-os/agentux/blob/main/docs/adr/0005-agentux-yaml.md)). Unknown keys fail with line and column; rule violations are reported together, each with its field path (`pipeline[2].on_fail`). Without a file, the built-in default pipeline (the ADR's example) applies, with its `lint` and `test` checks detected from the project (justfile recipes, Cargo, npm scripts, pytest/ruff via uv, Go); with nothing detected, the gate step is left out. Also `isolation` ([ADR 0009](https://github.com/agentux-os/agentux/blob/main/docs/adr/0009-container-isolation-for-checks.md)): whether checks run on the host or in rootless Podman, and in which image (`image`, else the `image` of `.devcontainer/devcontainer.json`, else `registry.fedoraproject.org/fedora-toolbox:44`), and each check's `timeout` (default 30 minutes). |
-| [`agentux-harness`](crates/agentux-harness) | Drives a harness through the Agent Client Protocol ([ADR 0002](https://github.com/agentux-os/agentux/blob/main/docs/adr/0002-harness-integration-via-acp.md)): spawns it in a worktree, opens a session, sends prompts, streams vendor-neutral events, routes permission requests to the caller, cancels. Knows how to launch Claude Code, Codex, OpenCode and (experimental) Antigravity. |
-| [`agentux-worktree`](crates/agentux-worktree) | Creates, lists and removes the git worktree of a run: branch `aux/<run-id>`, checked out under a configurable base directory. Shells out to `git`. |
-| [`agentux-store`](crates/agentux-store) | SQLite persistence (bundled SQLite): projects, runs, step attempts, approval requests and the event log, with schema migrations. Every change is one transaction; events are broadcast only after commit. |
-| [`agentux-api`](crates/agentux-api) | API types, the JSON-RPC envelope and an async client, shared by the daemon, `aux` and the cockpit backend. |
-| [`agentux-bus`](crates/agentux-bus) | The agent bus ([ADR 0004](https://github.com/agentux-os/agentux/blob/main/docs/adr/0004-unified-interface-and-agent-bus.md)): sessions with a scoped identity (run, project, role, vendor), mailboxes, routing to a session, a role, the run or the human, `request_review`, `handoff`, `get_run_state` and `ask_human`, with the `bus` limits from `agentux.yaml` (allowed tools, turns per exchange). Every exchange is an audit event; delivery is a wake event the daemon turns into an ACP prompt. Served to each session as the `agentux` MCP server (rmcp), with the session system prompt, in-process or through `agentuxd` (`DaemonEndpoint`, behind `aux bus-stdio`). |
-| [`agentuxd`](crates/agentuxd) | The daemon: run state machine ([ADR 0003](https://github.com/agentux-os/agentux/blob/main/docs/adr/0003-workflow-engine.md)), the ACP step executor (`AcpExecutor`, with the step prompts in `prompts.rs` and the `gh` pull request step in `forge.rs`), the agent bus of each run (`bus.rs`) and the API on a Unix socket ([docs/api.md](docs/api.md)). Also a library, so `aux daemon` runs the same code. |
-| [`agentux-fake-agent`](crates/agentux-fake-agent) | Test support, not shipped: a scriptable ACP agent that runs in-process over a byte pipe, used by the harness and daemon tests. |
-| [`aux-cli`](crates/aux-cli) | The `aux` binary. |
+```sh
+sudo dnf install ./agentux-<version>-1.fc44.$(uname -m).rpm
+systemctl --user enable --now agentuxd.service   # optional: run the daemon as a user service
+```
 
-### Running
+It installs `/usr/bin/aux`, `/usr/bin/agentuxd` and the user unit `/usr/lib/systemd/user/agentuxd.service`, requires `git` and recommends `gh`. On an rpm-ostree system, use `rpm-ostree install` instead of `dnf`.
+
+The RPM is built by [`.github/workflows/release.yml`](.github/workflows/release.yml) in a Fedora 44 container from [`packaging/agentux.spec`](packaging/agentux.spec): pushing a `v<version>` tag that matches the workspace version in `Cargo.toml` builds it for x86_64 and aarch64 (each natively, on GitHub's x86_64 and arm64 runners), installs and smoke-tests each in a clean container of its architecture, and attaches both to the GitHub release; running the workflow manually leaves them as workflow artifacts (`agentux-rpm-x86_64`, `agentux-rpm-aarch64`). CI runs the tests on both architectures too.
+
+## Running
 
 ```sh
 aux daemon [--fake-agents] [--auto-approve-permissions]
@@ -53,6 +99,9 @@ The socket is `$XDG_RUNTIME_DIR/agentux/agentuxd.sock` (override with `--socket`
 
 A run gets its own worktree, then walks the pipeline: agent steps call the executor, gates run the configured checks with `sh -c` in the worktree (on the host, or with `isolation.mode: podman` in a rootless container that sees only the worktree, see below), failures and requested changes loop back within `max_attempts`/`max_rounds`, and `approve: true` pauses the run until `aux approve`. Each transition is committed before its side effect, so a restarted daemon resumes every unfinished run, re-running a step that was interrupted. The API, event stream and lifecycle are documented in [docs/api.md](docs/api.md), as is the JSON of [`aux ps --json`](docs/api.md#aux-ps---json).
 
+<details>
+<summary>More detail: sessions, the agent bus, terminal mode, checks, commits, review verdicts, permissions, budget and pull requests</summary>
+
 How agent steps work:
 
 - **Sessions.** Each role gets one harness session (the role's `harness` from `agentux.yaml`, launched as in the [`agentux-harness` table](crates/agentux-harness/README.md#harnesses)) in the run's worktree, started when the run first reaches the role (or when a bus message wakes the role) and reused by its later steps. Each harness uses the login you set up for it. Sessions end with the run; after a daemon restart, new ones start. A role's `model` is selected through ACP when the harness offers a model choice (a session config option of category `model`); otherwise the session uses the harness's default and its log says so.
@@ -66,6 +115,8 @@ How agent steps work:
 - **Permissions.** When an agent asks before a tool call, the run waits (`waiting`) with a `permission` request in `aux ps`; the agent waits for `aux approve` or `aux deny`. A denial tells the agent no and the run goes on. `--auto-approve-permissions` allows everything without asking: **dangerous**, since agents can then run any command with your user's rights; use it only for unattended runs in a sandbox you trust. (Some harnesses, OpenCode among them, run tools without asking through ACP; then there is nothing to approve.)
 - **Budget.** Harnesses that report cost update the run's `costUsd`. Before each agent step, a run over `budget.max_usd_per_run` pauses with a `budget` request; approving gives it another `max_usd_per_run`, denying fails it. A single step can overshoot.
 - **Pull requests.** With a GitHub `origin` and `gh` logged in, the `pull_request` step pushes `aux/<run-id>` and opens a pull request (title: the run's title; body: the request, the plan and the review), or reuses the one already open for the branch. Otherwise the branch stays and the step records `PR skipped: <reason>`.
+
+</details>
 
 Other commands:
 
@@ -86,18 +137,21 @@ aux bus-stdio --standalone [--project <dir>] [--role <r>]   # the same on an in-
 
 `aux bus-stdio` is the stdio MCP server harnesses launch to reach the bus: `agentuxd` passes it in ACP `session/new` with the session's token in its environment (not on the command line, where other local users could read it), and it forwards each tool call to the daemon (see the [`agentux-bus` README](crates/agentux-bus/README.md#transport-and-the-daemon-bridge)).
 
-## Install
+## Crates
 
-The AgentUX image ships `aux` and `agentuxd` preinstalled from the `agentux` RPM. On another Fedora 44 system, download the `.rpm` for your architecture (`x86_64` or `aarch64`) from the [releases](https://github.com/agentux-os/agentux-core/releases) and install it:
+A Cargo workspace. What exists today:
 
-```sh
-sudo dnf install ./agentux-<version>-1.fc44.$(uname -m).rpm
-systemctl --user enable --now agentuxd.service   # optional: run the daemon as a user service
-```
-
-It installs `/usr/bin/aux`, `/usr/bin/agentuxd` and the user unit `/usr/lib/systemd/user/agentuxd.service`, requires `git` and recommends `gh`. On an rpm-ostree system, use `rpm-ostree install` instead of `dnf`.
-
-The RPM is built by [`.github/workflows/release.yml`](.github/workflows/release.yml) in a Fedora 44 container from [`packaging/agentux.spec`](packaging/agentux.spec): pushing a `v<version>` tag that matches the workspace version in `Cargo.toml` builds it for x86_64 and aarch64 (each natively, on GitHub's x86_64 and arm64 runners), installs and smoke-tests each in a clean container of its architecture, and attaches both to the GitHub release; running the workflow manually leaves them as workflow artifacts (`agentux-rpm-x86_64`, `agentux-rpm-aarch64`). CI runs the tests on both architectures too.
+| Crate | What it does |
+|---|---|
+| [`agentux-config`](crates/agentux-config) | Types, parsing and strict validation of `agentux.yaml` ([ADR 0005](https://github.com/agentux-os/agentux/blob/main/docs/adr/0005-agentux-yaml.md)). Unknown keys fail with line and column; rule violations are reported together, each with its field path (`pipeline[2].on_fail`). Without a file, the built-in default pipeline (the ADR's example) applies, with its `lint` and `test` checks detected from the project (justfile recipes, Cargo, npm scripts, pytest/ruff via uv, Go); with nothing detected, the gate step is left out. Also `isolation` ([ADR 0009](https://github.com/agentux-os/agentux/blob/main/docs/adr/0009-container-isolation-for-checks.md)): whether checks run on the host or in rootless Podman, and in which image (`image`, else the `image` of `.devcontainer/devcontainer.json`, else `registry.fedoraproject.org/fedora-toolbox:44`), and each check's `timeout` (default 30 minutes). |
+| [`agentux-harness`](crates/agentux-harness) | Drives a harness through the Agent Client Protocol ([ADR 0002](https://github.com/agentux-os/agentux/blob/main/docs/adr/0002-harness-integration-via-acp.md)): spawns it in a worktree, opens a session, sends prompts, streams vendor-neutral events, routes permission requests to the caller, cancels. Knows how to launch Claude Code, Codex, OpenCode and (experimental) Antigravity. |
+| [`agentux-worktree`](crates/agentux-worktree) | Creates, lists and removes the git worktree of a run: branch `aux/<run-id>`, checked out under a configurable base directory. Shells out to `git`. |
+| [`agentux-store`](crates/agentux-store) | SQLite persistence (bundled SQLite): projects, runs, step attempts, approval requests and the event log, with schema migrations. Every change is one transaction; events are broadcast only after commit. |
+| [`agentux-api`](crates/agentux-api) | API types, the JSON-RPC envelope and an async client, shared by the daemon, `aux` and the cockpit backend. |
+| [`agentux-bus`](crates/agentux-bus) | The agent bus ([ADR 0004](https://github.com/agentux-os/agentux/blob/main/docs/adr/0004-unified-interface-and-agent-bus.md)): sessions with a scoped identity (run, project, role, vendor), mailboxes, routing to a session, a role, the run or the human, `request_review`, `handoff`, `get_run_state` and `ask_human`, with the `bus` limits from `agentux.yaml` (allowed tools, turns per exchange). Every exchange is an audit event; delivery is a wake event the daemon turns into an ACP prompt. Served to each session as the `agentux` MCP server (rmcp), with the session system prompt, in-process or through `agentuxd` (`DaemonEndpoint`, behind `aux bus-stdio`). |
+| [`agentuxd`](crates/agentuxd) | The daemon: run state machine ([ADR 0003](https://github.com/agentux-os/agentux/blob/main/docs/adr/0003-workflow-engine.md)), the ACP step executor (`AcpExecutor`, with the step prompts in `prompts.rs` and the `gh` pull request step in `forge.rs`), the agent bus of each run (`bus.rs`) and the API on a Unix socket ([docs/api.md](docs/api.md)). Also a library, so `aux daemon` runs the same code. |
+| [`agentux-fake-agent`](crates/agentux-fake-agent) | Test support, not shipped: a scriptable ACP agent that runs in-process over a byte pipe, used by the harness and daemon tests. |
+| [`aux-cli`](crates/aux-cli) | The `aux` binary. |
 
 ## Build and test
 
