@@ -719,7 +719,10 @@ async fn turn(
         );
     }
     host.session_state(session_id, SessionState::Active);
-    let mut tick = tokio::time::interval(MESSAGE_FLUSH_EVERY);
+    let mut tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + MESSAGE_FLUSH_EVERY,
+        MESSAGE_FLUSH_EVERY,
+    );
     let stop = {
         let prompt = session.prompt(text);
         tokio::pin!(prompt);
