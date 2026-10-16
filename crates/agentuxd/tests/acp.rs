@@ -93,6 +93,7 @@ fn team(harness: String, turn: Turn, seen: Shared) -> BoxFuture<'static, Result>
             "fake-planner" => {
                 turn.plan(&[("Write hello.txt", acp::PlanEntryStatus::Pending)])?;
                 turn.message("1. Create hello.txt\n")?;
+                tokio::time::sleep(Duration::from_millis(5)).await;
                 turn.message("2. Say hello in it\n")?;
             }
             "fake-coder" => {
