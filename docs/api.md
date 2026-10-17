@@ -328,7 +328,7 @@ Requests on one connection are answered in order, and `ask_human` keeps its call
 
 ## Helper questions
 
-`helper.ask { harness, question, context?, model? }` asks the user's own harness one question for the cockpit's helper (the penguin, ADR 0014) and returns `{ harness, answer }`. It belongs to no run: nothing is stored, no event is emitted, and it does not show up in `runs.list` or the inbox.
+`helper.ask { harness, question, context?, model? }` asks the user's own harness one question for the cockpit's helper (the penguin, [ADR 0016](https://github.com/agentux-os/agentux/blob/main/docs/adr/0016-help-mascot.md)) and returns `{ harness, answer }`. It belongs to no run: nothing is stored, no event is emitted, and it does not show up in `runs.list` or the inbox.
 
 - **The session.** A fresh harness session (`harness` as in `agentux.yaml`, with `model` selected as for a role) started in a new, empty directory with mode `0700` under `$XDG_RUNTIME_DIR` (else the temp directory), removed afterwards. It gets no MCP server, so no agent bus. The harness uses the login the user set up for it, like any session.
 - **No tools.** Every permission request is denied. When the agent starts a tool call anyway (some harnesses run tools without asking, depending on their own settings), the daemon cancels the turn at that event and returns an error instead of the answer. A harness that runs a tool without asking can still run that one call before the cancel lands; the empty working directory and the prompt (which carries no file contents and no secrets) limit what it could see.
