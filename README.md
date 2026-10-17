@@ -7,6 +7,11 @@
   </a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/agentux-os/agentux-core/releases/latest"><img alt="RPM downloads" src="https://img.shields.io/github/downloads/agentux-os/agentux-core/total?label=RPM%20downloads&logo=linux&labelColor=0b0d10&color=c6f36b"></a>
+  <a href="https://github.com/agentux-os/agentux-core/releases/latest"><img alt="Latest RPM release" src="https://img.shields.io/github/v/release/agentux-os/agentux-core?include_prereleases&label=latest%20RPM&labelColor=0b0d10&color=4f7d0b"></a>
+</p>
+
 <h3 align="center">agentux-core: the daemon, CLI and agent bus that make coding agents work as one team</h3>
 
 <p align="center">
@@ -30,6 +35,13 @@
 The orchestration engine of [AgentUX](https://github.com/agentux-os/agentux): the daemon, CLI and integrations that let coding agents from different vendors work as one team.
 
 > **Status:** early. `agentuxd` runs pipelines from `agentux.yaml` as persisted state machines in run worktrees, with gates, bounded loops, approvals and crash recovery, and `aux` drives it over a local socket. Agent steps run in real harness sessions over ACP (tried with OpenCode; Claude Code and Codex go through their ACP adapters), with agent permission requests in the approvals inbox, session events in the event log, budgets enforced from reported cost, and pull requests opened with `gh`. Agents talk to each other and to you through the agent bus, an MCP server the daemon gives every session. `--fake-agents` swaps in a scripted fake. Design decisions live in [agentux/docs/adr](https://github.com/agentux-os/agentux/tree/main/docs/adr).
+
+## Releases and packages
+
+Every versioned release is built and smoke-tested by [`.github/workflows/release.yml`](.github/workflows/release.yml), then published automatically with RPMs for `x86_64` and `aarch64`. The links always resolve to the newest GitHub release; no README edit is needed when a new `v*` tag is published.
+
+- [Latest release and RPMs](https://github.com/agentux-os/agentux-core/releases/latest)
+- [Release workflow](https://github.com/agentux-os/agentux-core/actions/workflows/release.yml)
 
 ## At a glance
 
