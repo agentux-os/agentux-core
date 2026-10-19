@@ -21,6 +21,7 @@ agentuxd.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 serde_json.workspace = true
+sigpipe.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
 
 [dev-dependencies]
