@@ -357,3 +357,26 @@ fn questions_keep_their_options_and_bus_messages_are_listed_per_run() {
             .is_empty()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_slow_transaction_does_not_stall_other_tasks() {
+    use std::time::Instant;
+    let store = Store::open_in_memory().unwrap();
+    // The runtime has one worker. A write that holds it for the whole
+    // transaction would keep the timer task from running until it ends.
+    let writer = tokio::spawn(async move {
+        store
+            .write(|_| {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok::<_, Error>(())
+            })
+            .unwrap();
+        Instant::now()
+    });
+    let timer = tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        Instant::now()
+    });
+    let (written, ticked) = (writer.await.unwrap(), timer.await.unwrap());
+    assert!(ticked < written, "the timer waited for the transaction");
+}
