@@ -953,7 +953,11 @@ impl Tx<'_> {
         self.unused_id_from(table, new_id)
     }
 
-    fn unused_id_from(&self, table: Table, mut candidate: impl FnMut() -> String) -> Result<String> {
+    fn unused_id_from(
+        &self,
+        table: Table,
+        mut candidate: impl FnMut() -> String,
+    ) -> Result<String> {
         let sql = format!("SELECT 1 FROM {} WHERE id = ?1", table.name());
         loop {
             let id = candidate();
