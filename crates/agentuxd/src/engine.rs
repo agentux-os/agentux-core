@@ -27,7 +27,7 @@ use agentux_api::{
     RequestStatus, Run, RunStatus, Session, SessionEvent, SessionState, StepAttempt, StepKind,
 };
 use agentux_config::{Config, DEVCONTAINER_FILES, FILE_NAME, IsolationMode, Loop, Step};
-use agentux_store::{NewRequest, Phase, RunRecord, Store, Tx, new_id, now_ms};
+use agentux_store::{NewRequest, Phase, RunRecord, Store, Table, Tx, now_ms};
 use agentux_worktree::Worktrees;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -313,9 +313,10 @@ impl Engine {
             .unwrap_or_default();
         let steps = step_kinds(&config);
         let now = now_ms();
-        let record = RunRecord {
+        let mut record = RunRecord {
             run: Run {
-                id: new_id(),
+                // Replaced by an unused id when the run is inserted.
+                id: String::new(),
                 project_id: project.id,
                 title,
                 prompt,
@@ -352,7 +353,10 @@ impl Engine {
             config_yaml: yaml,
             base_commit: None,
         };
-        self.inner.store.write(|tx| tx.insert_run(&record))?;
+        self.inner.store.write(|tx| {
+            record.run.id = tx.unused_id(Table::Runs)?;
+            tx.insert_run(&record)
+        })?;
         self.spawn(&record.run.id);
         Ok(record.run)
     }
@@ -1498,8 +1502,9 @@ impl StepHost for RunHost {
         model: Option<&str>,
     ) -> std::result::Result<OpenedSession, String> {
         let now = now_ms();
-        let session = Session {
-            id: new_id(),
+        let mut session = Session {
+            // Replaced by an unused id when the session is inserted.
+            id: String::new(),
             run_id: self.run_id.clone(),
             project_id: self.project_id.clone(),
             role: self.role.clone(),
@@ -1517,6 +1522,7 @@ impl StepHost for RunHost {
             .inner
             .store
             .write(|tx| {
+                session.id = tx.unused_id(Table::Sessions)?;
                 tx.insert_session(&session)?;
                 if let Some(mut record) = tx.run(&self.run_id)? {
                     record
