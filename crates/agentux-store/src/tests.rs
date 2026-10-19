@@ -380,3 +380,17 @@ async fn a_slow_transaction_does_not_stall_other_tasks() {
     let (written, ticked) = (writer.await.unwrap(), timer.await.unwrap());
     assert!(ticked < written, "the timer waited for the transaction");
 }
+
+#[test]
+fn an_id_already_in_use_is_drawn_again() {
+    let store = Store::open_in_memory().unwrap();
+    let taken = store
+        .write(|tx| tx.register_project("demo", "/srv/demo"))
+        .unwrap()
+        .id;
+    let mut candidates = vec!["0000beef".to_string(), taken.clone()];
+    let id = store
+        .read(|tx| tx.unused_id_from(Table::Projects, || candidates.pop().unwrap()))
+        .unwrap();
+    assert_eq!(id, "0000beef");
+}

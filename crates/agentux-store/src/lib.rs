@@ -341,7 +341,7 @@ impl Tx<'_> {
             return Ok(project);
         }
         let project = Project {
-            id: new_id(),
+            id: self.unused_id(Table::Projects)?,
             name: name.into(),
             path: path.into(),
             created_at: now_ms(),
@@ -533,7 +533,7 @@ impl Tx<'_> {
 
     pub fn create_request(&mut self, new: NewRequest) -> Result<PermissionRequest> {
         let request = PermissionRequest {
-            id: new_id(),
+            id: self.unused_id(Table::Requests)?,
             kind: new.kind,
             run_id: new.run_id,
             project_id: new.project_id,
@@ -925,8 +925,57 @@ pub fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
+/// Tables whose rows are keyed by a [`new_id`].
+#[derive(Clone, Copy, Debug)]
+pub enum Table {
+    Projects,
+    Runs,
+    Requests,
+    Sessions,
+}
+
+impl Table {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Projects => "projects",
+            Self::Runs => "runs",
+            Self::Requests => "requests",
+            Self::Sessions => "sessions",
+        }
+    }
+}
+
+impl Tx<'_> {
+    /// A [`new_id`] that no row of `table` uses yet. Ids are 32 bits so they
+    /// stay short; past a few thousand rows a random one starts to collide,
+    /// and an insert with it would fail on the primary key.
+    pub fn unused_id(&self, table: Table) -> Result<String> {
+        self.unused_id_from(table, new_id)
+    }
+
+    fn unused_id_from(
+        &self,
+        table: Table,
+        mut candidate: impl FnMut() -> String,
+    ) -> Result<String> {
+        let sql = format!("SELECT 1 FROM {} WHERE id = ?1", table.name());
+        loop {
+            let id = candidate();
+            let taken = self
+                .tx
+                .query_row(&sql, [&id], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if !taken {
+                return Ok(id);
+            }
+        }
+    }
+}
+
 /// A random 8-hex-digit id. Short enough to type (`aux approve 3f9a0c12`),
-/// valid as a branch and directory name.
+/// valid as a branch and directory name. Rows take theirs from
+/// [`Tx::unused_id`], which skips ids already in use.
 pub fn new_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
