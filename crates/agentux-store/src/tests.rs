@@ -379,6 +379,8 @@ async fn a_slow_transaction_does_not_stall_other_tasks() {
     });
     let (written, ticked) = (writer.await.unwrap(), timer.await.unwrap());
     assert!(ticked < written, "the timer waited for the transaction");
+}
+
 #[test]
 fn an_id_already_in_use_is_drawn_again() {
     let store = Store::open_in_memory().unwrap();
