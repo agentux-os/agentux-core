@@ -270,3 +270,25 @@ fn worktree_create_list_remove() {
     let output = aux(&["worktree", "list", "--repo", repo]);
     assert_eq!(stdout(&output), "");
 }
+
+#[cfg(unix)]
+#[test]
+fn printing_to_a_closed_pipe_ends_quietly() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("agentux.yaml"), VALID).unwrap();
+    // stdout is a pipe nobody reads any more, as in `aux ps | head -n1`
+    // once head has exited.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_aux"))
+        .args(["validate", path(dir.path())])
+        .stdout(writer)
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!stderr(&output).contains("panicked"), "{}", stderr(&output));
+    assert_eq!(output.status.signal(), Some(13), "{:?}", output.status);
+}

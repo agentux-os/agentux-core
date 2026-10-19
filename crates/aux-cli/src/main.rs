@@ -196,6 +196,14 @@ struct RepoArg {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // Rust ignores SIGPIPE, so printing to a reader that has gone (`aux ps |
+    // head`, `| grep -q`, `| awk '{ ...; exit }'`) panics with "failed
+    // printing to stdout". The client commands take the default action
+    // instead and end quietly, like other CLIs. Not the daemon: a write to a
+    // harness's closed pipe must stay an error it handles, not end it.
+    if !matches!(cli.command, Command::Daemon { .. }) {
+        sigpipe::reset();
+    }
     let result = match cli.command {
         Command::Validate { path } => validate(&path),
         Command::Worktree(command) => worktree(command),
