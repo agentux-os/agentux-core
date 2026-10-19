@@ -6,6 +6,11 @@
 //! transaction and broadcast to subscribers only after it commits, so a
 //! subscriber never sees a state that was rolled back, and a restarted daemon
 //! finds exactly the state it last announced.
+//!
+//! The API is synchronous, and a committed write waits for an fsync. Called
+//! from a worker of tokio's multi-thread runtime, as `agentuxd` does, the
+//! database work runs inside [`tokio::task::block_in_place`], so the worker's
+//! other tasks move to another thread instead of stalling behind the disk.
 
 use std::collections::BTreeMap;
 use std::collections::hash_map::RandomState;
@@ -168,7 +173,7 @@ impl Store {
         &self,
         f: impl FnOnce(&mut Tx<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
-        let (value, events) = {
+        let (value, events) = off_runtime(|| {
             let mut conn = self.lock();
             let mut tx = Tx {
                 tx: conn.transaction().map_err(Error::from)?,
@@ -177,8 +182,8 @@ impl Store {
             let value = f(&mut tx)?;
             let Tx { tx, events } = tx;
             tx.commit().map_err(Error::from)?;
-            (value, events)
-        };
+            Ok::<_, E>((value, events))
+        })?;
         for event in events {
             // No subscribers is fine.
             let _ = self.events.send(event);
@@ -188,18 +193,34 @@ impl Store {
 
     /// Runs `f` in a read-only snapshot.
     pub fn read<T, E: From<Error>>(&self, f: impl FnOnce(&Tx<'_>) -> Result<T, E>) -> Result<T, E> {
-        let mut conn = self.lock();
-        let tx = Tx {
-            tx: conn.transaction().map_err(Error::from)?,
-            events: Vec::new(),
-        };
-        f(&tx)
+        off_runtime(|| {
+            let mut conn = self.lock();
+            let tx = Tx {
+                tx: conn.transaction().map_err(Error::from)?,
+                events: Vec::new(),
+            };
+            f(&tx)
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, Connection> {
         // A panic while holding the lock leaves no partial transaction behind
         // (it is rolled back on drop), so the connection is still usable.
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Runs blocking database work without stalling the async runtime: on a
+/// multi-thread runtime worker it goes through `block_in_place`. Elsewhere (no
+/// runtime, a blocking-pool thread, or a current-thread runtime, where
+/// `block_in_place` would panic) it runs directly.
+fn off_runtime<R>(f: impl FnOnce() -> R) -> R {
+    use tokio::runtime::{Handle, RuntimeFlavor};
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 
