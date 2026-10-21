@@ -198,7 +198,7 @@ pub struct AcpExecutor {
     /// Held while a session starts, so that a step and a wake for the same
     /// role do not both start one.
     starting: tokio::sync::Mutex<()>,
-    stall: StallLimits,
+    stall: Arc<dyn Fn() -> StallLimits + Send + Sync>,
 }
 
 /// How long a turn may go without a sign of life from the agent before the
@@ -210,6 +210,20 @@ pub struct AcpExecutor {
 pub struct StallLimits {
     pub idle: Duration,
     pub tool: Duration,
+}
+
+impl StallLimits {
+    /// The defaults, with the user's preferences on top.
+    pub fn from_prefs(prefs: &agentux_api::rpc::AgentPrefs) -> Self {
+        let mut limits = Self::default();
+        if let Some(minutes) = prefs.idle_minutes {
+            limits.idle = Duration::from_secs(minutes * 60);
+        }
+        if let Some(minutes) = prefs.tool_minutes {
+            limits.tool = Duration::from_secs(minutes * 60);
+        }
+        limits
+    }
 }
 
 impl Default for StallLimits {
@@ -236,13 +250,22 @@ impl AcpExecutor {
             launcher: Box::new(launcher),
             sessions: Mutex::new(HashMap::new()),
             starting: tokio::sync::Mutex::new(()),
-            stall: StallLimits::default(),
+            stall: Arc::new(StallLimits::default),
         }
     }
 
     /// Replaces the default [`StallLimits`].
     pub fn with_stall_limits(mut self, stall: StallLimits) -> Self {
-        self.stall = stall;
+        self.stall = Arc::new(move || stall);
+        self
+    }
+
+    /// Takes the [`StallLimits`] from `source` at each turn.
+    pub fn with_stall_source(
+        mut self,
+        source: impl Fn() -> StallLimits + Send + Sync + 'static,
+    ) -> Self {
+        self.stall = Arc::new(source);
         self
     }
 
@@ -328,7 +351,7 @@ impl AcpExecutor {
         host: &Arc<dyn StepHost>,
     ) -> Result<AgentOutcome, TurnError> {
         let prompt = slot.with_intro(&prompts::step_prompt(task));
-        let watch = Watch::new(slot, self.stall);
+        let watch = Watch::new(slot, (self.stall)());
         let reply = turn(live, &slot.id, host, &prompt, true, &watch).await?;
         match task.step {
             StepKind::Review => {
@@ -527,7 +550,7 @@ impl StepExecutor for AcpExecutor {
                 let _host = HostGuard::set(&slot, &host);
                 let prompt = slot.with_intro(&task.prompt);
                 // The human's message is recorded when it is accepted.
-                let watch = Watch::new(&slot, self.stall);
+                let watch = Watch::new(&slot, (self.stall)());
                 let result = turn(&mut live, &slot.id, &host, &prompt, !task.human, &watch).await;
                 if !matches!(result, Err(TurnError::Broken(_))) {
                     host.session_state(&slot.id, SessionState::Idle);

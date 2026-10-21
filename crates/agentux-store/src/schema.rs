@@ -127,6 +127,10 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (harness, model)
     );
     ",
+    // 6: a run's per-role model overrides.
+    "
+    ALTER TABLE runs ADD COLUMN models TEXT NOT NULL DEFAULT '{}';
+    ",
 ];
 
 /// The schema version this build writes.

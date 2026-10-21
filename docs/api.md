@@ -20,10 +20,13 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 |---|---|---|
 | `projects.register` | `{ path }` — absolute path inside a git repository | `Project` (idempotent per repository) |
 | `projects.list` | — | `Project[]` |
-| `runs.start` | `{ projectId, prompt?, issue?, title?, roles? }` — `prompt` or `issue` required; `roles` maps role names to harness ids for this run | `Run` |
+| `runs.start` | `{ projectId, prompt?, issue?, title?, roles?, models? }` — `prompt` or `issue` required; `roles` maps role names to harness ids for this run, `models` role names to models | `Run` |
+| `harnesses.test` | `{ harness, model? }` | `{ harness, ok, detail, seconds, limit }`: one short prompt, answered like a helper question (no tools); a usage limit in the answer is recorded |
+| `preferences.get` | none | `AgentPrefs`: the user's agent preferences; see [Agent preferences](#agent-preferences) |
+| `preferences.set` | `AgentPrefs` | `AgentPrefs`, as written to the file; an unknown harness or 0 minutes is `-32602` |
 | `limits.list` | none | `HarnessLimit[]`: the usage limits in force; see [Usage limits](#usage-limits) |
 | `limits.clear` | `{ harness, model? }` — without `model`, every limit of the harness | `HarnessLimit[]` still in force; runs waiting for the harness go on |
-| `harnesses.list` | none | `[{ id, command, installed, signedIn, experimental, limits }]`: the built-in harnesses, whether each one's vendor program (`command`) is on the daemon's `PATH`, and whether the user signed in to it (`null`: cannot tell) |
+| `harnesses.list` | none | `[{ id, command, installed, signedIn, experimental, limits, version, usage: { todayUsd, weekUsd, weekSessions }, quota: [{ label, usedPercent, resetsAt, seenAt }] }]`: the built-in harnesses, whether each one's vendor program (`command`) is on the daemon's `PATH`, whether the user signed in to it (`null`: cannot tell), its `--version`, what its sessions cost, and its plan's usage windows where the harness's own files say (Codex) |
 | `runs.list` | `{ projectId? }` | `Run[]`, newest first |
 | `runs.get` | `{ runId }` | `{ run: Run, attempts: StepAttempt[], requests: PermissionRequest[], sessions: Session[] }` |
 | `runs.cancel` | `{ runId }` | `Run` |
@@ -280,6 +283,26 @@ roles:
     harness: antigravity
     fallback: [opencode, claude-code]
 ```
+
+### Agent preferences
+
+`$XDG_CONFIG_HOME/agentux/agents.yaml` (`~/.config/agentux/agents.yaml`) holds the user's choices for every project; a project's `agentux.yaml` comes first. The daemon reads it each time, so edits apply to the next run (and the next turn, for the minutes). The cockpit's Agents view writes it through `preferences.set`.
+
+```yaml
+order: [opencode, claude-code]     # most preferred first; the others follow
+roles:                             # projects without agentux.yaml
+  planner:
+    harness: claude-code
+    model: opus
+fallback: [opencode]               # roles with no fallback of their own
+idle_minutes: 10                   # a turn with no sign of life is given up on
+tool_minutes: 60                   # the same while a tool call runs
+notifications: true                # desktop notifications
+```
+
+`order` is the order automatic picks and fallbacks try harnesses in. A preferred role harness that is not usable (not installed, signed out, at a limit) is replaced like a default one, and its model goes with it. **Notifications** go to the desktop (`org.freedesktop.Notifications`) when an agent reaches a limit or stops responding, when another takes over, when a run waits for a limit and when it goes on.
+
+**Plan usage.** Codex writes its 5-hour and weekly windows into its session logs (`$CODEX_HOME/sessions`); `harnesses.list` shows them, and a spent window keeps Codex out of use until its reset before a step even starts.
 
 ### Talking to a session
 

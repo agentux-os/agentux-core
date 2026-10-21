@@ -233,7 +233,7 @@ pub struct Tx<'a> {
 const RUN_COLUMNS: &str = "id, project_id, title, prompt, issue, config_yaml, status, phase, \
      step_index, steps, roles, branch, worktree, loops, feedback, checks, gate_attempt, \
      gate_max_attempts, review_round, review_max_rounds, budget_usd, activity, error, \
-     pull_request, started_at, updated_at, finished_at, sessions, cost_usd, base_commit";
+     pull_request, started_at, updated_at, finished_at, sessions, cost_usd, base_commit, models";
 
 const ATTEMPT_COLUMNS: &str =
     "id, run_id, step_index, step, status, output, started_at, finished_at";
@@ -387,7 +387,7 @@ impl Tx<'_> {
             &format!(
                 "INSERT INTO runs ({RUN_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
                  ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, \
-                 ?25, ?26, ?27, ?28, ?29, ?30)"
+                 ?25, ?26, ?27, ?28, ?29, ?30, ?31)"
             ),
             rusqlite::params_from_iter(run_params(record)?),
         )?;
@@ -409,7 +409,7 @@ impl Tx<'_> {
              checks = ?16, gate_attempt = ?17, gate_max_attempts = ?18, review_round = ?19, \
              review_max_rounds = ?20, budget_usd = ?21, activity = ?22, error = ?23, \
              pull_request = ?24, started_at = ?25, updated_at = ?26, finished_at = ?27, \
-             sessions = ?28, cost_usd = ?29, base_commit = ?30 \
+             sessions = ?28, cost_usd = ?29, base_commit = ?30, models = ?31 \
              WHERE id = ?1",
             rusqlite::params_from_iter(run_params(record)?),
         )?;
@@ -866,6 +866,7 @@ fn run_params(record: &RunRecord) -> Result<Vec<Box<dyn rusqlite::ToSql>>> {
         Box::new(to_json(&run.sessions)?),
         Box::new(run.cost_usd),
         Box::new(record.base_commit.clone()),
+        Box::new(to_json(&run.models)?),
     ])
 }
 
@@ -915,6 +916,7 @@ fn run_from_row(row: &Row<'_>) -> Result<RunRecord> {
             finished_at: row.get(26)?,
             sessions: from_json(&text(27)?)?,
             cost_usd: row.get(28)?,
+            models: from_json(&text(30)?)?,
         },
         phase: Phase::parse(&phase).ok_or_else(|| Error::Data(format!("bad phase {phase:?}")))?,
         loops,

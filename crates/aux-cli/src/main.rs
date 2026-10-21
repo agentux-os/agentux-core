@@ -83,6 +83,34 @@ enum Command {
         /// Follow the run after starting it, like `aux watch`
         #[arg(long, short)]
         watch: bool,
+        /// The agent of a role for this run, as ROLE=HARNESS
+        /// (`--agent implementer=opencode`); repeatable
+        #[arg(long = "agent", value_name = "ROLE=HARNESS")]
+        agents: Vec<String>,
+        /// The model of a role for this run, as ROLE=MODEL
+        /// (`--model planner=opus`); repeatable
+        #[arg(long = "model", value_name = "ROLE=MODEL")]
+        models: Vec<String>,
+    },
+    /// List the agent CLIs: installed, signed in, version, spending, usage
+    /// limits
+    Agents {
+        /// Print the daemon's `harnesses.list` as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the agents' usage limits in force, or lift one
+    Limits {
+        #[command(subcommand)]
+        command: Option<LimitsCommand>,
+    },
+    /// Send an agent a short test prompt, to see that it is set up and
+    /// answers
+    Test {
+        /// claude-code, codex, opencode or antigravity
+        harness: String,
+        #[arg(long)]
+        model: Option<String>,
     },
     /// List active runs and pending approvals
     Ps {
@@ -152,6 +180,18 @@ enum Command {
     },
     /// Cancel a run (its worktree and branch are kept)
     Cancel { run_id: String },
+}
+
+#[derive(Subcommand)]
+enum LimitsCommand {
+    /// Say a limit no longer holds (credits added, the limit reset on the
+    /// vendor's site): the agent is used again, and waiting runs go on
+    Clear {
+        harness: String,
+        /// Only this model's limit
+        #[arg(long)]
+        model: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -252,7 +292,23 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
                 issue,
                 title,
                 watch,
-            } => remote.run(&project_dir, prompt, issue, title, watch).await,
+                agents,
+                models,
+            } => {
+                let start = remote::RunChoices {
+                    roles: pairs(&agents, "--agent")?,
+                    models: pairs(&models, "--model")?,
+                };
+                remote
+                    .run(&project_dir, prompt, issue, title, watch, start)
+                    .await
+            }
+            Command::Agents { json } => remote.agents(json).await,
+            Command::Limits { command: None } => remote.limits().await,
+            Command::Limits {
+                command: Some(LimitsCommand::Clear { harness, model }),
+            } => remote.clear_limit(&harness, model).await,
+            Command::Test { harness, model } => remote.test(&harness, model).await,
             Command::Ps { all, .. } => remote.ps(all).await,
             Command::Approve {
                 request_id,
@@ -289,6 +345,19 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
             }
         }
     })
+}
+
+/// `KEY=VALUE` arguments as a map.
+fn pairs(items: &[String], flag: &str) -> Result<std::collections::BTreeMap<String, String>> {
+    items
+        .iter()
+        .map(|item| match item.split_once('=') {
+            Some((key, value)) if !key.trim().is_empty() && !value.trim().is_empty() => {
+                Ok((key.trim().to_string(), value.trim().to_string()))
+            }
+            _ => Err(format!("{flag} takes ROLE=VALUE, not {item:?}").into()),
+        })
+        .collect()
 }
 
 fn validate(path: &Path) -> Result {

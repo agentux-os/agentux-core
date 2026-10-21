@@ -22,7 +22,10 @@ pub mod forge;
 pub mod helper;
 mod human;
 pub mod limits;
+pub mod notify;
+pub mod prefs;
 pub mod prompts;
+pub mod quota;
 pub mod server;
 mod terminal;
 
@@ -71,14 +74,25 @@ pub async fn run(options: Options) -> Result<(), Box<dyn Error>> {
 
     let store =
         Store::open(&database).map_err(|e| format!("cannot open {}: {e}", database.display()))?;
+    let prefs_path = prefs::default_path();
+    let stall_prefs = prefs_path.clone();
     let executor: Arc<dyn StepExecutor> = if options.fake_agents {
         Arc::new(FakeExecutor::default())
     } else {
-        Arc::new(AcpExecutor::default())
+        // Read each turn, so an edit applies without a restart.
+        Arc::new(AcpExecutor::default().with_stall_source(move || {
+            stall_prefs
+                .as_deref()
+                .and_then(|path| prefs::load(path).ok())
+                .map(|p| acp::StallLimits::from_prefs(&p))
+                .unwrap_or_default()
+        }))
     };
     let settings = Settings {
         auto_approve_permissions: options.auto_approve_permissions,
         bus: Some(BusLink::new(socket.clone())),
+        prefs: prefs_path,
+        notifier: notify::Notifier::desktop(),
         ..Settings::default()
     };
     let engine = Engine::with_settings(store, executor, settings);

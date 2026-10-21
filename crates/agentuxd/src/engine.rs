@@ -21,7 +21,9 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::{fmt, fs, io};
 
-use agentux_api::rpc::{ClearLimit, HarnessInfo, StartRun};
+use agentux_api::rpc::{
+    AgentPrefs, ClearLimit, HarnessInfo, HarnessTest, HarnessUsage, StartRun, TestHarness,
+};
 use agentux_api::{
     AttemptStatus, CheckResult, CheckStatus, EventBody, HarnessLimit, PermissionRequest, Project,
     RequestKind, RequestStatus, Run, RunStatus, Session, SessionEvent, SessionState, StepAttempt,
@@ -40,7 +42,9 @@ use crate::executor::{
     StepExecutor, StepHost,
 };
 use crate::limits;
+use crate::notify::Notifier;
 use crate::terminal::Terminals;
+use crate::{prefs, quota};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -91,6 +95,11 @@ pub struct Settings {
     /// What the daemon knows of each built-in harness (`harnesses.list`,
     /// and the roles of the built-in pipeline).
     pub harnesses: HarnessProbe,
+    /// The user's agent preferences file; `None`: the defaults, and
+    /// `preferences.set` refused.
+    pub prefs: Option<PathBuf>,
+    /// Desktop notifications.
+    pub notifier: Notifier,
 }
 
 /// Whether the built-in harness with this id is installed, and whether the
@@ -320,28 +329,157 @@ impl Engine {
         Ok(self.inner.store.read(|tx| tx.projects())?)
     }
 
-    /// The built-in harnesses, and whether each is installed and signed in
-    /// to (`harnesses.list`).
-    pub fn harnesses(&self) -> Vec<HarnessInfo> {
+    /// The built-in harnesses: installed, signed in to, their limits,
+    /// versions, spending and plan usage (`harnesses.list`).
+    pub async fn harnesses(&self) -> Vec<HarnessInfo> {
         let limits = self.limits().unwrap_or_default();
-        agentux_harness::HarnessSpec::builtin()
-            .into_iter()
-            .map(|spec| {
-                let (installed, signed_in) = self.inner.settings.harnesses.state(&spec.id);
-                (spec, installed, signed_in)
-            })
-            .map(|(spec, installed, signed_in)| HarnessInfo {
+        let usage = self.usage().unwrap_or_default();
+        let codex_quota = tokio::task::spawn_blocking(|| {
+            quota::codex_home()
+                .map(|home| quota::codex(&home))
+                .unwrap_or_default()
+        });
+        let mut out = Vec::new();
+        for spec in agentux_harness::HarnessSpec::builtin() {
+            let (installed, signed_in) = self.inner.settings.harnesses.state(&spec.id);
+            let version = if installed {
+                version_of(spec.cli()).await
+            } else {
+                None
+            };
+            out.push(HarnessInfo {
                 limits: limits
                     .iter()
                     .filter(|l| l.harness == spec.id)
                     .cloned()
                     .collect(),
+                usage: usage.get(&spec.id).cloned().unwrap_or_default(),
+                quota: Vec::new(),
+                version,
                 installed,
                 signed_in,
                 command: spec.cli().to_string(),
                 experimental: spec.experimental,
                 id: spec.id,
-            })
+            });
+        }
+        if let Ok(windows) = codex_quota.await
+            && let Some(codex) = out.iter_mut().find(|h| h.id == "codex")
+        {
+            codex.quota = windows;
+        }
+        out
+    }
+
+    /// What each harness's sessions cost: today and over 7 days.
+    fn usage(&self) -> Result<HashMap<String, HarnessUsage>> {
+        let now = jiff::Zoned::now();
+        let midnight = now
+            .start_of_day()
+            .map_or(0, |t| t.timestamp().as_millisecond());
+        let week = now.timestamp().as_millisecond() - 7 * 24 * 3_600_000;
+        let sessions = self.inner.store.read(|tx| tx.sessions(None))?;
+        let mut usage: HashMap<String, HarnessUsage> = HashMap::new();
+        for session in sessions.iter().filter(|s| s.started_at >= week) {
+            let entry = usage.entry(session.harness.clone()).or_default();
+            let cost = session.usage.cost_usd.unwrap_or(0.0);
+            entry.week_usd += cost;
+            entry.week_sessions += 1;
+            if session.started_at >= midnight {
+                entry.today_usd += cost;
+            }
+        }
+        Ok(usage)
+    }
+
+    /// One short prompt to a harness, as the helper asks (no tools, no
+    /// files), to see that it is set up and answers (`harnesses.test`). A
+    /// usage limit in the answer is recorded like a run's.
+    pub async fn test_harness(&self, params: TestHarness) -> Result<HarnessTest> {
+        let harness = params.harness.trim().to_string();
+        if agentux_harness::HarnessSpec::find(&harness).is_none() {
+            return Err(Error::InvalidParams(format!("unknown harness `{harness}`")));
+        }
+        let task = crate::executor::HelperTask {
+            harness: harness.clone(),
+            model: params.model.filter(|m| !m.trim().is_empty()),
+            question: "test".into(),
+            prompt: "This is a connection test from AgentUX. Reply with the single word OK.".into(),
+        };
+        let started = std::time::Instant::now();
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            self.inner.executor.ask_helper(&task),
+        )
+        .await
+        .unwrap_or_else(|_| Err(format!("{harness} did not answer within 120 seconds")));
+        let seconds = started.elapsed().as_secs_f64();
+        let now = jiff::Zoned::now();
+        let (ok, detail) = match answer {
+            Ok(reply) if !reply.trim().is_empty() => (true, reply.trim().to_string()),
+            Ok(_) => (false, format!("{harness} sent an empty answer")),
+            Err(e) => (false, e),
+        };
+        let found = limits::parse(&detail, ok, &now);
+        let limit = found.map(|found| limits::limit(&harness, &detail, found, &now));
+        if let Some(limit) = &limit {
+            self.inner.store.write(|tx| tx.set_limit(limit))?;
+        }
+        Ok(HarnessTest {
+            ok: ok && limit.is_none(),
+            harness,
+            detail,
+            seconds,
+            limit,
+        })
+    }
+
+    /// The user's agent preferences; the defaults when there are none or
+    /// they cannot be read (said once on stderr each time).
+    pub fn prefs(&self) -> AgentPrefs {
+        match &self.inner.settings.prefs {
+            Some(path) => prefs::load(path).unwrap_or_else(|e| {
+                eprintln!("agentuxd: {e}; using the default agent preferences");
+                AgentPrefs::default()
+            }),
+            None => AgentPrefs::default(),
+        }
+    }
+
+    /// `preferences.get`: refuses a file that does not read, so the user
+    /// sees why.
+    pub fn get_prefs(&self) -> Result<AgentPrefs> {
+        match &self.inner.settings.prefs {
+            Some(path) => prefs::load(path).map_err(Error::InvalidParams),
+            None => Ok(AgentPrefs::default()),
+        }
+    }
+
+    /// `preferences.set`.
+    pub fn set_prefs(&self, new: &AgentPrefs) -> Result<AgentPrefs> {
+        let Some(path) = &self.inner.settings.prefs else {
+            return Err(Error::Conflict(
+                "this agentuxd has no preferences file".into(),
+            ));
+        };
+        prefs::save(path, new).map_err(Error::InvalidParams)?;
+        // Agents the user put first may now take waiting roles.
+        self.wake_limited()?;
+        self.get_prefs()
+    }
+
+    fn notify(&self, title: &str, body: &str) {
+        if self.prefs().notifications {
+            self.inner.settings.notifier.notify(title, body);
+        }
+    }
+
+    /// Built-in harness ids the user can use now, in their order.
+    fn usable_harnesses(&self, prefs: &AgentPrefs, in_force: &[HarnessLimit]) -> Vec<String> {
+        prefs::ordered(prefs)
+            .into_iter()
+            .filter(|id| self.inner.settings.harnesses.usable(id))
+            .filter(|id| limits::blocking(in_force, id, None).is_none())
             .collect()
     }
 
@@ -407,10 +545,14 @@ impl Engine {
                 record.phase = Phase::Step;
                 record.run.activity = "the usage limit is over; going on".into();
                 tx.save_run(&mut record)?;
-                Ok(Some(request.run_id))
+                Ok(Some((request.run_id, record.run.title)))
             })?;
-            if let Some(run_id) = resumed {
+            if let Some((run_id, title)) = resumed {
                 self.spawn(&run_id);
+                self.notify(
+                    "A run goes on",
+                    &format!("\"{title}\": the usage limit is over."),
+                );
                 woken.push(run_id);
             }
         }
@@ -435,13 +577,10 @@ impl Engine {
     /// `fallback` list, or else any built-in harness the user can use, in
     /// order; never one at a limit itself.
     fn fallback(&self, role: &Role, in_force: &[HarnessLimit]) -> Option<String> {
-        let candidates: Vec<String> = match &role.fallback {
+        let prefs = self.prefs();
+        let candidates: Vec<String> = match role.fallback.as_ref().or(prefs.fallback.as_ref()) {
             Some(list) => list.clone(),
-            None => agentux_harness::HarnessSpec::builtin()
-                .into_iter()
-                .map(|spec| spec.id)
-                .filter(|id| self.inner.settings.harnesses.usable(id))
-                .collect(),
+            None => self.usable_harnesses(&prefs, in_force),
         };
         candidates.into_iter().find(|harness| {
             *harness != role.harness
@@ -486,15 +625,32 @@ impl Engine {
             .iter()
             .map(|(name, role)| (name.clone(), role.harness.clone()))
             .collect();
+        let mut models: BTreeMap<String, String> = BTreeMap::new();
         if yaml.is_none() {
+            // The user's preferred harness and model per role, where usable.
+            let prefs = self.prefs();
             let in_force = self.limits()?;
-            let installed: Vec<String> = agentux_harness::HarnessSpec::builtin()
-                .into_iter()
-                .map(|spec| spec.id)
-                .filter(|id| self.inner.settings.harnesses.usable(id))
-                .filter(|id| limits::blocking(&in_force, id, None).is_none())
-                .collect();
-            default_roles(&mut roles, &installed);
+            let usable = self.usable_harnesses(&prefs, &in_force);
+            for (name, pref) in &prefs.roles {
+                let Some(slot) = roles.get_mut(name) else {
+                    continue;
+                };
+                if let Some(harness) = pref.harness.as_ref().filter(|h| usable.contains(h)) {
+                    *slot = harness.clone();
+                }
+                if let Some(model) = &pref.model {
+                    models.insert(name.clone(), model.clone());
+                }
+            }
+            default_roles(&mut roles, &usable);
+            // A preferred model goes with its preferred harness.
+            for (name, pref) in &prefs.roles {
+                if let Some(harness) = &pref.harness
+                    && roles.get(name) != Some(harness)
+                {
+                    models.remove(name);
+                }
+            }
         }
         for (role, harness) in params.roles {
             let Some(slot) = roles.get_mut(&role) else {
@@ -508,7 +664,23 @@ impl Engine {
                     "unknown harness `{harness}` for role `{role}`"
                 )));
             }
+            if *slot != harness {
+                models.remove(&role);
+            }
             *slot = harness;
+        }
+        for (role, model) in params.models {
+            if !roles.contains_key(&role) {
+                return Err(Error::InvalidParams(format!(
+                    "the pipeline has no role `{role}` (roles: {})",
+                    roles.keys().cloned().collect::<Vec<_>>().join(", ")
+                )));
+            }
+            if model.trim().is_empty() {
+                models.remove(&role);
+            } else {
+                models.insert(role, model.trim().to_string());
+            }
         }
 
         let title = params
@@ -548,6 +720,7 @@ impl Engine {
                 error: None,
                 cost_usd: 0.0,
                 sessions: Default::default(),
+                models,
             },
             phase: Phase::Setup,
             loops: Default::default(),
@@ -1096,7 +1269,22 @@ impl Engine {
         }
 
         // A harness (or model) at its usage limit does not get the step:
-        // another one takes the role, or the run waits for the limit.
+        // another one takes the role, or the run waits for the limit. Codex
+        // says in its own logs when a window is spent: no need to hit it.
+        if role.harness == "codex" {
+            let windows = tokio::task::spawn_blocking(|| {
+                quota::codex_home()
+                    .map(|home| quota::codex(&home))
+                    .unwrap_or_default()
+            })
+            .await
+            .unwrap_or_default();
+            if let Some(limit) = quota::spent("codex", &windows, now_ms())
+                && limits::blocking(&self.limits()?, "codex", None).is_none()
+            {
+                self.inner.store.write(|tx| tx.set_limit(&limit))?;
+            }
+        }
         let in_force = self.limits()?;
         if let Some(blocked) = limits::blocking(&in_force, &role.harness, role.model.as_deref()) {
             let blocked = blocked.clone();
@@ -1112,8 +1300,13 @@ impl Engine {
                     Some(harness) => {
                         tx.log(&run_id, format!("{why}; {harness} takes the {role_name} role"))?;
                         record.run.roles.insert(role_name.clone(), harness.clone());
+                        // The role's model was for the harness it replaces.
+                        record.run.models.remove(role_name);
                         record.run.activity = format!("{why}; {harness} takes over");
-                        Ok(())
+                        Ok((
+                            format!("{harness} takes over"),
+                            format!("{why}. \"{}\": {harness} is the {role_name} now.", record.run.title),
+                        ))
                     }
                     None => {
                         tx.log(&run_id, format!("{why}; no other agent can take the {role_name} role"))?;
@@ -1130,10 +1323,16 @@ impl Engine {
                         );
                         ask(tx, record, RequestKind::Limit, detail)?;
                         record.run.activity = format!("waiting: {why}");
-                        Ok(())
+                        Ok((
+                            "A run waits for a usage limit".to_string(),
+                            format!("\"{}\": {why}.", record.run.title),
+                        ))
                     }
                 }
             })?;
+            if let Some((title, body)) = &done {
+                self.notify(title, body);
+            }
             return Ok(done.is_some());
         }
 
@@ -1256,6 +1455,17 @@ impl Engine {
                 record.run.activity = format!("{} reached its usage limit", limit.harness);
                 Ok(())
             })?;
+            if done.is_some() {
+                let what = if limit.kind == agentux_api::LimitKind::Stalled {
+                    "stopped responding".to_string()
+                } else {
+                    format!("reached its {} limit", limit.kind)
+                };
+                self.notify(
+                    &format!("{} {what}", limit.harness),
+                    &format!("Out of use{}.", until_text(&limit)),
+                );
+            }
             return Ok(done.is_some());
         }
 
@@ -1664,8 +1874,29 @@ pub(crate) fn config_of(record: &RunRecord, project_root: &Path) -> Result<Confi
             role.harness = harness.clone();
             role.model = None;
         }
+        if let Some(model) = record.run.models.get(name) {
+            role.model = Some(model.clone());
+        }
     }
     Ok(config)
+}
+
+/// First line of `<program> --version`, within 5 seconds.
+async fn version_of(program: &str) -> Option<String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(program)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(line.chars().take(80).collect())
 }
 
 /// Gives the built-in pipeline's roles usable harnesses (installed, and not
