@@ -368,6 +368,7 @@ dependencies = [
  "crossterm",
  "jiff",
  "rmcp",
+ "serde",
  "serde-saphyr",
  "serde_json",
  "sigpipe",
