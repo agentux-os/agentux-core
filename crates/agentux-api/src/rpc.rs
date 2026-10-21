@@ -1,5 +1,6 @@
 //! JSON-RPC 2.0 envelope, error codes, method names and their parameters.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,9 @@ pub mod method {
     pub const PROJECTS_REGISTER: &str = "projects.register";
     pub const PROJECTS_LIST: &str = "projects.list";
     pub const RUNS_START: &str = "runs.start";
+    /// The built-in harnesses and whether each is installed
+    /// ([`super::HarnessInfo`]).
+    pub const HARNESSES_LIST: &str = "harnesses.list";
     pub const RUNS_LIST: &str = "runs.list";
     pub const RUNS_GET: &str = "runs.get";
     pub const RUNS_CANCEL: &str = "runs.cancel";
@@ -162,6 +166,25 @@ pub struct StartRun {
     pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issue: Option<u64>,
+    /// Role name to harness id, replacing the pipeline's harness for those
+    /// roles in this run. Only roles the pipeline has; the others keep
+    /// theirs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, String>,
+}
+
+/// One entry of `harnesses.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessInfo {
+    /// The id roles use, e.g. `claude-code`.
+    pub id: String,
+    /// The vendor program it needs, e.g. `claude`.
+    pub command: String,
+    /// Whether that program is on the daemon's `PATH`.
+    pub installed: bool,
+    /// Not expected to work reliably yet.
+    pub experimental: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

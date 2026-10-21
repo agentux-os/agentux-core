@@ -15,13 +15,13 @@
 //! step: the agent waits for the answer. After implement and custom steps the
 //! daemon commits whatever changed in the worktree.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::{fmt, fs, io};
 
-use agentux_api::rpc::StartRun;
+use agentux_api::rpc::{HarnessInfo, StartRun};
 use agentux_api::{
     AttemptStatus, CheckResult, CheckStatus, EventBody, PermissionRequest, Project, RequestKind,
     RequestStatus, Run, RunStatus, Session, SessionEvent, SessionState, StepAttempt, StepKind,
@@ -86,6 +86,40 @@ pub struct Settings {
     pub bus: Option<BusLink>,
     /// How a harness's TUI resumes a session (`terminals.open`).
     pub tui: TuiCommands,
+    /// Which built-in harnesses are installed (`harnesses.list`, and the
+    /// roles of the built-in pipeline).
+    pub harnesses: HarnessProbe,
+}
+
+/// Whether the built-in harness with this id is installed. The default is
+/// [`agentux_harness::HarnessSpec::installed`]; tests plug in their own.
+#[derive(Clone)]
+pub struct HarnessProbe(Arc<ProbeFn>);
+
+type ProbeFn = dyn Fn(&str) -> bool + Send + Sync;
+
+impl HarnessProbe {
+    pub fn new(f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub fn installed(&self, harness: &str) -> bool {
+        (self.0)(harness)
+    }
+}
+
+impl Default for HarnessProbe {
+    fn default() -> Self {
+        Self::new(|harness| {
+            agentux_harness::HarnessSpec::find(harness).is_some_and(|spec| spec.installed())
+        })
+    }
+}
+
+impl fmt::Debug for HarnessProbe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("HarnessProbe(..)")
+    }
 }
 
 /// The command line that opens a harness's own TUI on an existing session:
@@ -273,6 +307,20 @@ impl Engine {
         Ok(self.inner.store.read(|tx| tx.projects())?)
     }
 
+    /// The built-in harnesses and whether each is installed
+    /// (`harnesses.list`).
+    pub fn harnesses(&self) -> Vec<HarnessInfo> {
+        agentux_harness::HarnessSpec::builtin()
+            .into_iter()
+            .map(|spec| HarnessInfo {
+                installed: self.inner.settings.harnesses.installed(&spec.id),
+                command: spec.cli().to_string(),
+                experimental: spec.experimental,
+                id: spec.id,
+            })
+            .collect()
+    }
+
     /// Creates a run from the project's current `agentux.yaml` and starts it.
     pub fn start_run(&self, params: StartRun) -> Result<Run> {
         let prompt = params.prompt.filter(|p| !p.trim().is_empty());
@@ -304,6 +352,33 @@ impl Engine {
             })?,
             None => default_pipeline(Path::new(&project.path)),
         };
+        let mut roles: BTreeMap<String, String> = config
+            .roles
+            .iter()
+            .map(|(name, role)| (name.clone(), role.harness.clone()))
+            .collect();
+        if yaml.is_none() {
+            let installed: Vec<String> = agentux_harness::HarnessSpec::builtin()
+                .into_iter()
+                .map(|spec| spec.id)
+                .filter(|id| self.inner.settings.harnesses.installed(id))
+                .collect();
+            default_roles(&mut roles, &installed);
+        }
+        for (role, harness) in params.roles {
+            let Some(slot) = roles.get_mut(&role) else {
+                return Err(Error::InvalidParams(format!(
+                    "the pipeline has no role `{role}` (roles: {})",
+                    roles.keys().cloned().collect::<Vec<_>>().join(", ")
+                )));
+            };
+            if agentux_harness::HarnessSpec::find(&harness).is_none() {
+                return Err(Error::InvalidParams(format!(
+                    "unknown harness `{harness}` for role `{role}`"
+                )));
+            }
+            *slot = harness;
+        }
 
         let title = params
             .title
@@ -327,11 +402,7 @@ impl Engine {
                 steps,
                 step_index: 0,
                 status: RunStatus::Running,
-                roles: config
-                    .roles
-                    .iter()
-                    .map(|(name, role)| (name.clone(), role.harness.clone()))
-                    .collect(),
+                roles,
                 checks: Vec::new(),
                 gate_attempt: 0,
                 gate_max_attempts: first_limit(&config, StepKind::Gate),
@@ -1336,7 +1407,7 @@ fn pending_request(tx: &Tx<'_>, request_id: &str) -> Result<(PermissionRequest, 
 
 /// The pipeline the run started with.
 pub(crate) fn config_of(record: &RunRecord, project_root: &Path) -> Result<Config> {
-    let config = match &record.config_yaml {
+    let mut config = match &record.config_yaml {
         Some(yaml) => Config::from_yaml(yaml)
             .map_err(|e| Error::Internal(format!("the run's stored pipeline is invalid: {e}")))?,
         None => default_pipeline(project_root),
@@ -1350,7 +1421,40 @@ pub(crate) fn config_of(record: &RunRecord, project_root: &Path) -> Result<Confi
             "the built-in default pipeline changed since this run started".into(),
         ));
     }
+    // The harness each role was given when the run started (installed ones
+    // for the built-in pipeline, or the human's choice). A model belongs to
+    // the harness it was written for.
+    for (name, role) in config.roles.iter_mut() {
+        if let Some(harness) = record.run.roles.get(name)
+            && *harness != role.harness
+        {
+            role.harness = harness.clone();
+            role.model = None;
+        }
+    }
     Ok(config)
+}
+
+/// Gives the built-in pipeline's roles installed harnesses: a role keeps its
+/// harness if that is installed, else takes the first installed one, and the
+/// reviewer prefers a different harness than the implementer. With nothing
+/// installed, the roles stay as they are (and the run says what is missing
+/// when it reaches them).
+fn default_roles(roles: &mut BTreeMap<String, String>, installed: &[String]) {
+    let Some(first) = installed.first() else {
+        return;
+    };
+    for harness in roles.values_mut() {
+        if !installed.contains(harness) {
+            harness.clone_from(first);
+        }
+    }
+    if let Some(implementer) = roles.get("implementer").cloned()
+        && roles.get("reviewer") == Some(&implementer)
+        && let Some(other) = installed.iter().find(|h| **h != implementer)
+    {
+        roles.insert("reviewer".into(), other.clone());
+    }
 }
 
 /// The built-in pipeline for a project without `agentux.yaml`.

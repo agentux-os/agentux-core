@@ -87,6 +87,10 @@ impl Client {
         self.call(method::PROJECTS_LIST, &()).await
     }
 
+    pub async fn harnesses(&mut self) -> Result<Vec<rpc::HarnessInfo>, ClientError> {
+        self.call(method::HARNESSES_LIST, &()).await
+    }
+
     pub async fn start_run(&mut self, params: &rpc::StartRun) -> Result<Run, ClientError> {
         self.call(method::RUNS_START, params).await
     }
