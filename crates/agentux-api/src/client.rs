@@ -91,6 +91,13 @@ impl Client {
         self.call(method::HARNESSES_LIST, &()).await
     }
 
+    pub async fn test_harness(
+        &mut self,
+        params: &rpc::TestHarness,
+    ) -> Result<rpc::HarnessTest, ClientError> {
+        self.call(method::HARNESSES_TEST, params).await
+    }
+
     pub async fn limits(&mut self) -> Result<Vec<crate::HarnessLimit>, ClientError> {
         self.call(method::LIMITS_LIST, &()).await
     }

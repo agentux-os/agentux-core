@@ -30,6 +30,7 @@ fn sample_run(project_id: &str) -> RunRecord {
             error: None,
             cost_usd: 0.0,
             sessions: BTreeMap::new(),
+            models: BTreeMap::new(),
         },
         phase: Phase::Setup,
         loops: BTreeMap::new(),

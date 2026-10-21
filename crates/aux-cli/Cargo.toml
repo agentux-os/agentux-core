@@ -18,6 +18,7 @@ agentux-config.workspace = true
 agentux-harness.workspace = true
 agentux-worktree.workspace = true
 agentuxd.workspace = true
+jiff.workspace = true
 clap.workspace = true
 crossterm.workspace = true
 serde_json.workspace = true

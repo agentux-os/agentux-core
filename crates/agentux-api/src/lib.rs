@@ -274,6 +274,10 @@ pub struct Run {
     /// each role.
     #[serde(default)]
     pub sessions: BTreeMap<String, String>,
+    /// Role name to the model it uses in this run, where it is not the
+    /// pipeline's (`runs.start`'s `models`, the user's preferences).
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
     pub started_at: i64,
     pub updated_at: i64,
     pub finished_at: Option<i64>,

@@ -1,6 +1,6 @@
 //! Commands that talk to `agentuxd` over its socket.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -137,6 +137,58 @@ fn ps_document(
     json!({ "daemon": "up", "runs": runs, "pending": pending })
 }
 
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+/// Per-role agents and models for `aux run`.
+#[derive(Default)]
+pub struct RunChoices {
+    pub roles: BTreeMap<String, String>,
+    pub models: BTreeMap<String, String>,
+}
+
+/// "weekly limit until 2026-10-27 09:00 (in 6d 3h)".
+fn limit_line(limit: &agentux_api::HarnessLimit, now: i64) -> String {
+    let what = match limit.kind {
+        agentux_api::LimitKind::Stalled => "stopped responding".to_string(),
+        kind => format!("{kind} limit"),
+    };
+    let model = limit
+        .model
+        .as_deref()
+        .map(|m| format!(" ({m})"))
+        .unwrap_or_default();
+    match limit.until {
+        None => format!(
+            "{what}{model} until you lift it (aux limits clear {})",
+            limit.harness
+        ),
+        Some(until) => {
+            let left = (until - now).max(0) / 60_000;
+            let when = jiff::Timestamp::from_millisecond(until)
+                .map(|t| {
+                    t.to_zoned(jiff::tz::TimeZone::system())
+                        .strftime("%Y-%m-%d %H:%M")
+                        .to_string()
+                })
+                .unwrap_or_default();
+            let verb = if limit.until_known {
+                "until"
+            } else {
+                "trying again at"
+            };
+            format!(
+                "{what}{model} {verb} {when} (in {}h {}m)",
+                left / 60,
+                left % 60
+            )
+        }
+    }
+}
+
 pub struct Remote {
     socket: PathBuf,
 }
@@ -168,6 +220,7 @@ impl Remote {
         issue: Option<u64>,
         title: Option<String>,
         watch: bool,
+        choices: RunChoices,
     ) -> Result {
         if prompt.is_none() && issue.is_none() {
             return Err("give the run a --prompt or an --issue".into());
@@ -182,7 +235,8 @@ impl Remote {
                 title,
                 prompt,
                 issue,
-                ..Default::default()
+                roles: choices.roles,
+                models: choices.models,
             })
             .await?;
         println!("{}", run.id);
@@ -194,6 +248,107 @@ impl Remote {
                 run.id, project.name, run.id
             );
             Ok(())
+        }
+    }
+
+    pub async fn agents(&self, json: bool) -> Result {
+        let mut client = self.connect().await?;
+        let agents = client.harnesses().await?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&agents)?);
+            return Ok(());
+        }
+        let now = now_ms();
+        println!(
+            "{:<12} {:<10} {:<9} {:<22} {:>8} {:>8}  LIMIT / PLAN USAGE",
+            "AGENT", "INSTALLED", "SIGNED IN", "VERSION", "TODAY", "7 DAYS"
+        );
+        for agent in &agents {
+            let signed = match agent.signed_in {
+                Some(true) => "yes",
+                Some(false) => "no",
+                None => "?",
+            };
+            let mut notes: Vec<String> = agent.limits.iter().map(|l| limit_line(l, now)).collect();
+            notes.extend(
+                agent
+                    .quota
+                    .iter()
+                    .map(|q| format!("{} window {:.0}% used", q.label, q.used_percent)),
+            );
+            println!(
+                "{:<12} {:<10} {:<9} {:<22} {:>8} {:>8}  {}",
+                agent.id,
+                if agent.installed { "yes" } else { "no" },
+                signed,
+                agent.version.as_deref().unwrap_or("-"),
+                format!("${:.2}", agent.usage.today_usd),
+                format!("${:.2}", agent.usage.week_usd),
+                notes.join("; ")
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn limits(&self) -> Result {
+        let mut client = self.connect().await?;
+        let limits = client.limits().await?;
+        if limits.is_empty() {
+            println!("no agent is at a usage limit");
+        }
+        let now = now_ms();
+        for limit in &limits {
+            println!("{}: {}", limit.harness, limit_line(limit, now));
+            println!("  {}", limit.message);
+        }
+        Ok(())
+    }
+
+    pub async fn clear_limit(&self, harness: &str, model: Option<String>) -> Result {
+        let mut client = self.connect().await?;
+        let left = client
+            .clear_limit(&agentux_api::rpc::ClearLimit {
+                harness: harness.to_string(),
+                model,
+            })
+            .await?;
+        println!(
+            "{harness} is in use again{}",
+            if left.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; still limited: {}",
+                    left.iter()
+                        .map(|l| l.harness.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        );
+        Ok(())
+    }
+
+    pub async fn test(&self, harness: &str, model: Option<String>) -> Result {
+        let mut client = self.connect().await?;
+        eprintln!("asking {harness} for a short answer...");
+        let test = client
+            .test_harness(&agentux_api::rpc::TestHarness {
+                harness: harness.to_string(),
+                model,
+            })
+            .await?;
+        if test.ok {
+            println!(
+                "{harness} answered in {:.1}s: {}",
+                test.seconds, test.detail
+            );
+            Ok(())
+        } else {
+            if let Some(limit) = &test.limit {
+                println!("{harness}: {}", limit_line(limit, now_ms()));
+            }
+            Err(format!("{harness} did not answer: {}", test.detail).into())
         }
     }
 

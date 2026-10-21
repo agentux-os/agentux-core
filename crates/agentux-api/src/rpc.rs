@@ -23,6 +23,13 @@ pub mod method {
     pub const LIMITS_LIST: &str = "limits.list";
     /// The human says a limit no longer holds ([`super::ClearLimit`]).
     pub const LIMITS_CLEAR: &str = "limits.clear";
+    /// One short prompt to a harness, to see that it answers
+    /// ([`super::TestHarness`], [`super::HarnessTest`]).
+    pub const HARNESSES_TEST: &str = "harnesses.test";
+    /// The user's agent preferences ([`super::AgentPrefs`]).
+    pub const PREFERENCES_GET: &str = "preferences.get";
+    /// Replaces the user's agent preferences ([`super::AgentPrefs`]).
+    pub const PREFERENCES_SET: &str = "preferences.set";
     pub const RUNS_LIST: &str = "runs.list";
     pub const RUNS_GET: &str = "runs.get";
     pub const RUNS_CANCEL: &str = "runs.cancel";
@@ -175,10 +182,13 @@ pub struct StartRun {
     /// theirs.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub roles: BTreeMap<String, String>,
+    /// Role name to the model it uses in this run (`planner: "opus"`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, String>,
 }
 
 /// One entry of `harnesses.list`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessInfo {
     /// The id roles use, e.g. `claude-code`.
@@ -196,6 +206,119 @@ pub struct HarnessInfo {
     /// Its limits in force (the whole harness, or some of its models).
     #[serde(default)]
     pub limits: Vec<crate::HarnessLimit>,
+    /// What `<command> --version` printed (its first line).
+    #[serde(default)]
+    pub version: Option<String>,
+    /// What its sessions cost, as the harness reported it.
+    #[serde(default)]
+    pub usage: HarnessUsage,
+    /// How much of its plan's usage windows is used, where the harness's
+    /// own files tell (Codex).
+    #[serde(default)]
+    pub quota: Vec<QuotaWindow>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessUsage {
+    /// Since local midnight.
+    pub today_usd: f64,
+    /// Over the last 7 days.
+    pub week_usd: f64,
+    /// Sessions started over the last 7 days.
+    pub week_sessions: u32,
+}
+
+/// One usage window of a harness's plan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaWindow {
+    /// `5h`, `weekly`, or the window's length in minutes.
+    pub label: String,
+    pub used_percent: f64,
+    /// When the window resets (ms since the epoch), when known.
+    pub resets_at: Option<i64>,
+    /// When the harness last reported it.
+    pub seen_at: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TestHarness {
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Result of `harnesses.test`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessTest {
+    pub harness: String,
+    /// It answered.
+    pub ok: bool,
+    /// Its answer, or why there was none.
+    pub detail: String,
+    pub seconds: f64,
+    /// The usage limit it reported, now in force.
+    pub limit: Option<crate::HarnessLimit>,
+}
+
+/// The user's agent preferences, in `~/.config/agentux/agents.yaml`. They
+/// apply to every project; a project's `agentux.yaml` comes first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentPrefs {
+    /// Harness ids, most preferred first: the order automatic picks and
+    /// fallbacks try them in. Harnesses left out come after, in the built-in
+    /// order.
+    #[serde(default)]
+    pub order: Vec<String>,
+    /// Role name to its harness and model, for projects without an
+    /// `agentux.yaml`.
+    #[serde(default)]
+    pub roles: BTreeMap<String, RolePref>,
+    /// Harnesses that take a role while its own is at a limit, for roles
+    /// with no `fallback` of their own. Unset: every harness the user can
+    /// use, in `order`.
+    #[serde(default)]
+    pub fallback: Option<Vec<String>>,
+    /// Minutes without a sign of life before a turn is given up on.
+    #[serde(default, alias = "idle_minutes")]
+    pub idle_minutes: Option<u64>,
+    /// The same while a tool call runs.
+    #[serde(default, alias = "tool_minutes")]
+    pub tool_minutes: Option<u64>,
+    /// Desktop notifications for limits, agents taking over and runs that
+    /// wait or go on.
+    #[serde(default = "yes")]
+    pub notifications: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+impl Default for AgentPrefs {
+    fn default() -> Self {
+        Self {
+            order: Vec::new(),
+            roles: BTreeMap::new(),
+            fallback: None,
+            idle_minutes: None,
+            tool_minutes: None,
+            notifications: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RolePref {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -639,7 +639,7 @@ async fn the_built_in_pipeline_uses_installed_harnesses() {
             (planner, implementer, reviewer),
             "installed: {installed:?}"
         );
-        let harnesses = engine.harnesses();
+        let harnesses = engine.harnesses().await;
         assert_eq!(harnesses.len(), 4);
         for h in harnesses {
             let expected = installed.contains(&h.id.as_str()) || h.id == "codex";
@@ -705,6 +705,7 @@ async fn a_harness_at_its_limit_hands_the_role_to_its_fallback() {
     assert!(
         engine
             .harnesses()
+            .await
             .iter()
             .any(|h| h.id == "codex" && h.limits.len() == 1)
     );
@@ -781,4 +782,105 @@ async fn approving_a_limit_request_retries_with_the_harness() {
     let run = wait_until_settled(&engine, &run.id).await;
     assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
     assert_eq!(run.roles["implementer"], "codex");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_users_preferences_pick_agents_and_models() {
+    let f = fixture(&pipeline("true"));
+    std::fs::remove_file(f.repo.join("agentux.yaml")).unwrap();
+    let executor = Arc::new(FakeExecutor::default());
+    let settings = agentuxd::Settings {
+        // Codex is signed out.
+        harnesses: agentuxd::HarnessProbe::new(|id| (true, Some(id != "codex"))),
+        prefs: Some(f.tmp.path().join("config/agentux/agents.yaml")),
+        ..Default::default()
+    };
+    let engine = agentuxd::Engine::with_settings(
+        agentux_store::Store::open(&f.database).unwrap(),
+        executor.clone(),
+        settings,
+    );
+    let prefs = agentux_api::rpc::AgentPrefs {
+        order: vec!["opencode".into()],
+        roles: [(
+            "planner".to_string(),
+            agentux_api::rpc::RolePref {
+                harness: Some("claude-code".into()),
+                model: Some("opus".into()),
+            },
+        )]
+        .into(),
+        idle_minutes: Some(20),
+        ..Default::default()
+    };
+    assert_eq!(engine.set_prefs(&prefs).unwrap(), prefs);
+    let text = std::fs::read_to_string(f.tmp.path().join("config/agentux/agents.yaml")).unwrap();
+    assert!(text.contains("idle_minutes: 20"), "{text}");
+
+    let project = engine
+        .register_project(f.repo.to_str().unwrap())
+        .await
+        .unwrap();
+    let run = engine
+        .start_run(agentux_api::rpc::StartRun {
+            project_id: project.id.clone(),
+            prompt: Some("Fix it".into()),
+            models: [("implementer".to_string(), "fast".to_string())].into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(run.roles["planner"], "claude-code");
+    // Codex is out: the reviewer is the user's first choice.
+    assert_eq!(run.roles["reviewer"], "opencode");
+    assert_eq!(run.models["planner"], "opus");
+    assert_eq!(run.models["implementer"], "fast");
+
+    // The built-in pipeline asks to approve the plan.
+    let mut run = wait_until_settled(&engine, &run.id).await;
+    while run.status == RunStatus::Waiting {
+        let (_, _, requests) = engine.run(&run.id).unwrap();
+        let pending = requests
+            .iter()
+            .find(|r| r.status == RequestStatus::Pending)
+            .unwrap();
+        engine.approve(&pending.id, None).unwrap();
+        run = wait_until_settled(&engine, &run.id).await;
+    }
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+    let model = |step: StepKind| {
+        executor
+            .calls()
+            .into_iter()
+            .find(|c| c.step == step)
+            .and_then(|c| c.model)
+    };
+    assert_eq!(model(StepKind::Plan).as_deref(), Some("opus"));
+    assert_eq!(model(StepKind::Implement).as_deref(), Some("fast"));
+    engine.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agents_taking_over_are_notified() {
+    let f = fixture(&codex_implementer("[opencode]"));
+    let (executor, _) = codex_runs_out();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = seen.clone();
+    let settings = agentuxd::Settings {
+        notifier: agentuxd::notify::Notifier::new(move |title, _| {
+            sink.lock().unwrap().push(title.to_string())
+        }),
+        ..Default::default()
+    };
+    let engine = agentuxd::Engine::with_settings(
+        agentux_store::Store::open(&f.database).unwrap(),
+        executor,
+        settings,
+    );
+    let run = f.start(&engine).await;
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["codex reached its session limit", "opencode takes over"]
+    );
 }

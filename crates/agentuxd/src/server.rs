@@ -184,7 +184,13 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
         }
         method::PROJECTS_LIST => to_value(engine.projects()),
         method::RUNS_START => to_value(engine.start_run(parse(params)?)),
-        method::HARNESSES_LIST => to_value(Ok(engine.harnesses())),
+        method::HARNESSES_LIST => to_value(Ok(engine.harnesses().await)),
+        method::HARNESSES_TEST => to_value(engine.test_harness(parse(params)?).await),
+        method::PREFERENCES_GET => to_value(engine.get_prefs()),
+        method::PREFERENCES_SET => {
+            let params: rpc::AgentPrefs = parse(params)?;
+            to_value(engine.set_prefs(&params))
+        }
         method::LIMITS_LIST => to_value(engine.limits()),
         method::LIMITS_CLEAR => {
             let params: rpc::ClearLimit = parse(params)?;
