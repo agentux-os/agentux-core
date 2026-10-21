@@ -410,7 +410,7 @@ fn error(id: &Value, code: i64, message: &str) -> Value {
 /// applies the policy, and runs, holds or refuses it.
 pub async fn handle(
     client: &mut Client,
-    node_id: &str,
+    node: &crate::NodeConfig,
     policy: &Policy,
     pending: &Pending,
     answers: &mut Answers,
@@ -434,7 +434,25 @@ pub async fn handle(
     if command_id.is_empty() {
         return none(error(&id, INVALID_PARAMS, "commandId is required"));
     }
-    if params.get("nodeId").and_then(Value::as_str) != Some(node_id) {
+    // Only commands for this node, from its organization and, once pinned,
+    // from the Command server it enrolled with.
+    if let Some(pinned) = &node.command_instance_id
+        && params.get("commandInstanceId").and_then(Value::as_str) != Some(pinned.as_str())
+    {
+        return none(error(
+            &id,
+            DENIED,
+            "the command comes from another Command server",
+        ));
+    }
+    if params.get("organizationId").and_then(Value::as_str) != Some(node.organization_id.as_str()) {
+        return none(error(
+            &id,
+            DENIED,
+            "the command is for another organization",
+        ));
+    }
+    if params.get("nodeId").and_then(Value::as_str) != Some(node.node_id.as_str()) {
         return none(error(
             &id,
             INVALID_PARAMS,

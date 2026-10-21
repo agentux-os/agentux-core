@@ -86,7 +86,25 @@ pub async fn command_loop(
             }
         };
         let ws = match tokio_tungstenite::connect_async(request).await {
-            Ok((ws, _)) => ws,
+            Ok((ws, response)) => {
+                let named = response
+                    .headers()
+                    .get("X-AgentUX-Command-Instance")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                if let Some(pinned) = &config.command_instance_id
+                    && named.as_deref() != Some(pinned.as_str())
+                {
+                    let _ = out.send(Out::Log(format!(
+                        "{}: the command connection answers as {}, this node enrolled with {pinned}; taking no commands",
+                        crate::INSTANCE_MISMATCH,
+                        named.as_deref().unwrap_or("an unknown server")
+                    )));
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                    continue;
+                }
+                ws
+            }
             Err(e) => {
                 if !said_down {
                     let _ = out.send(Out::Log(format!(
@@ -118,7 +136,7 @@ pub async fn command_loop(
                     }
                     let handled = commands::handle(
                         &mut client,
-                        &config.node_id,
+                        &config,
                         &options.policy,
                         &pending,
                         &mut answers,
@@ -154,6 +172,7 @@ mod tests {
             organization_id: "o".into(),
             node_id: "node a/1".into(),
             token: "t".into(),
+            command_instance_id: None,
         };
         assert_eq!(
             connect_url(&config("https://command.example.org/")),

@@ -9,7 +9,12 @@ aux node gateway        # foreground; on AgentUX: systemctl --user enable --now 
 aux node leave
 ```
 
-`enroll` writes `~/.config/agentux/node.json` (mode 0600): Command's URL (https, or http to this machine only), the organization, the node id (`node-<hostname>` by default) and the node token. The token is read from `$AGENTUX_NODE_TOKEN` or stdin, never from the command line.
+`enroll` takes an **enrollment token** issued by the Command server (`auxe1_<instanceId>_...`, single use, expiring), read from `$AGENTUX_NODE_TOKEN` or stdin, never from the command line. Before sending it, the node asks the server for its instance id (`GET /v1/instance`) and stops when it is not the server the token names, so a token never goes to another Command server. It then trades the token at `/v1/enroll` for its own credential, its node id (unique on that server) and its organization, and writes `~/.config/agentux/node.json` (mode 0600) with them and the server's **instance id, pinned**:
+
+- every answer that names the server, and the command connection (`X-AgentUX-Command-Instance`), must carry that instance id; otherwise the gateway stops (a DNS name moved to another Command server takes no node with it);
+- every command must carry it (`commandInstanceId`) and the node's organization, or it is refused.
+
+Two Command servers in one institution therefore never share or take nodes. A node joins a server only with a token from it; there is no discovery. A static token set on the server (`AGENTUX_COMMAND_NODE_TOKENS`) still works with `--organization`, without pinning.
 
 ## What it sends (read-only phase)
 
