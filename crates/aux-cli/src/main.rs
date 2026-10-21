@@ -11,6 +11,7 @@ use clap::{Args, Parser, Subcommand};
 mod attach;
 mod bus_stdio;
 mod exec;
+mod provision;
 mod remote;
 
 type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
@@ -183,6 +184,11 @@ enum Command {
     /// Connect this node to AgentUX Command (the remote control plane)
     #[command(subcommand)]
     Node(NodeCommand),
+    /// Set this machine up from a provision file (profile, Command
+    /// enrollment, node policy, agent preferences), as root: for fleets of
+    /// virtual machines. See docs/provision.md
+    #[command(subcommand)]
+    Provision(ProvisionCommand),
     /// Show the agent preferences (~/.config/agentux/agents.yaml), or
     /// replace them with a YAML or JSON file (`-` for stdin)
     Preferences {
@@ -193,6 +199,20 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         set: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum ProvisionCommand {
+    /// Apply one provision file (YAML or JSON)
+    Apply {
+        file: PathBuf,
+        /// Only check the file
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Find a provision file (kernel command line, QEMU fw_cfg, a disk
+    /// labelled AGENTUX, /boot, /etc/agentux) and apply it, once
+    Auto,
 }
 
 #[derive(Subcommand)]
@@ -313,6 +333,10 @@ fn main() -> ExitCode {
         Command::Ps { all, json: true } => return remote::ps_json(cli.socket, all),
         Command::Node(command) => node(cli.socket, command),
         Command::Preferences { json, set } => preferences(json, set),
+        Command::Provision(ProvisionCommand::Apply { file, dry_run }) => {
+            provision::run_apply(&file, dry_run)
+        }
+        Command::Provision(ProvisionCommand::Auto) => provision::run_auto(),
         command => remote(cli.socket, command),
     };
     match result {
@@ -593,6 +617,7 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
             Command::Validate { .. }
             | Command::Node(_)
             | Command::Preferences { .. }
+            | Command::Provision(_)
             | Command::Worktree(_)
             | Command::Exec { .. }
             | Command::BusStdio(_)

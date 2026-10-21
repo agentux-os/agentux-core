@@ -69,14 +69,20 @@ impl Policy {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(policy),
             Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
         };
+        Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// The defaults with a policy file's text (YAML or JSON) on top.
+    pub fn parse(text: &str) -> Result<Policy, String> {
+        let mut policy = Policy::default();
         if text.trim().is_empty() {
             return Ok(policy);
         }
-        let file: File = serde_saphyr::from_str(&text)
-            .map_err(|e| format!("{} is invalid: {e}", path.display()))?;
+        let file: File =
+            serde_saphyr::from_str(text).map_err(|e| format!("invalid policy: {e}"))?;
         for (method, decision) in file.commands {
             if !policy.0.contains_key(&method) {
-                return Err(format!("{}: unknown command `{method}`", path.display()));
+                return Err(format!("unknown command `{method}`"));
             }
             policy.0.insert(method, decision);
         }
