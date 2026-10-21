@@ -34,7 +34,7 @@ static NOTICE: LazyLock<Regex> = LazyLock::new(|| {
         | reached\s+your\s+(?:\w+\s+){0,2}limit | quota\s+exceeded | exceeded\s+your\s+(?:current\s+)?quota
         | resource[_\s]exhausted | exhausted\s+your | rate[\s_-]limit(?:ed|\s+exceeded|_error)
         | too\s+many\s+requests | credit\s+balance\s+is\s+too\s+low | insufficient[_\s](?:quota|credits?|funds)
-        | out\s+of\s+credits",
+        | out\s+of\s+credits | quota\s+will\s+reset",
     )
     .expect("valid regex")
 });
@@ -343,7 +343,9 @@ mod tests {
         let found = parse(r#"RESOURCE_EXHAUSTED {"retryDelay": "30s"}"#, false, &now()).unwrap();
         assert_eq!(found.kind, LimitKind::Rate);
         assert_eq!(
-            at("Your quota will reset after 3h12m."),
+            at(
+                "You have exhausted your capacity on this model. Your quota will reset after 3h12m."
+            ),
             "2026-10-20T13:12:00-03:00[America/Sao_Paulo]"
         );
         assert_eq!(
