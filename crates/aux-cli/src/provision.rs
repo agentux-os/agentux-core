@@ -26,7 +26,6 @@
 //! `/etc/agentux/provision.yaml`. Each step is idempotent, and a machine is
 //! provisioned once (`/var/lib/agentux/provisioned.json`).
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -420,6 +419,7 @@ fn mark_done(file: &Path) -> Result {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[derive(Default)]
     struct Recorded {
