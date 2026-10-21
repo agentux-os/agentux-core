@@ -14,6 +14,14 @@
 //! bearer token. Events get a sequence number that survives restarts
 //! ([`State`]); unsent ones wait in order and go out when Command answers
 //! again.
+//!
+//! Commands from Command come over a WebSocket the node opens
+//! ([`channel`]); the node's [`policy`] runs, holds or refuses each, and
+//! [`commands`] runs it against agentuxd.
+
+pub mod channel;
+pub mod commands;
+pub mod policy;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -34,6 +42,15 @@ pub const CAPABILITIES: &[&str] = &[
     "harness.limits_changed",
     "run.updated",
     "approval.requested",
+    "run.snapshot",
+    "run.cancel",
+    "run.start",
+    "request.resolve",
+    "bus.post",
+    "harness.list",
+    "harness.test",
+    "limits.clear",
+    "preferences.set",
 ];
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 const HARNESSES_EVERY: Duration = Duration::from_secs(300);
@@ -322,6 +339,11 @@ impl Messages {
         self.event("harness.status", json!({ "harnesses": harnesses }))
     }
 
+    /// Any event, e.g. from the command connection.
+    pub fn custom_event(&mut self, method: &str, payload: Value) -> Value {
+        self.event(method, payload)
+    }
+
     pub fn limits_changed(&mut self, limits: &[HarnessLimit]) -> Value {
         let limits: Vec<Value> = limits.iter().map(limit_json).collect();
         self.event("harness.limits_changed", json!({ "limits": limits }))
@@ -479,13 +501,53 @@ impl Outbox {
 
 /// Runs the gateway until `agentuxd` goes away for good or `stop` fires.
 /// Reconnects to `agentuxd` and retries Command with backoff.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: NodeConfig,
     socket: PathBuf,
     sink: impl Sink,
     state_path: Option<PathBuf>,
     agentux_version: &str,
+    commands: Option<channel::CommandOptions>,
     mut log: impl FnMut(&str),
+    stop: impl std::future::Future<Output = ()>,
+) -> Result<(), String> {
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<channel::Out>();
+    let command_task = commands.map(|options| {
+        tokio::spawn(channel::command_loop(
+            config.clone(),
+            socket.clone(),
+            options,
+            out_tx.clone(),
+        ))
+    });
+    drop(out_tx);
+    let result = run_loop(
+        config,
+        socket,
+        sink,
+        state_path,
+        agentux_version,
+        &mut out_rx,
+        &mut log,
+        stop,
+    )
+    .await;
+    if let Some(task) = command_task {
+        task.abort();
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_loop(
+    config: NodeConfig,
+    socket: PathBuf,
+    sink: impl Sink,
+    state_path: Option<PathBuf>,
+    agentux_version: &str,
+    out_rx: &mut tokio::sync::mpsc::UnboundedReceiver<channel::Out>,
+    log: &mut impl FnMut(&str),
     stop: impl std::future::Future<Output = ()>,
 ) -> Result<(), String> {
     let mut messages = Messages::new(config, state_path);
@@ -554,6 +616,10 @@ pub async fn run(
                         log("agentuxd closed the event stream; reconnecting");
                         break;
                     }
+                },
+                Some(out) = out_rx.recv() => match out {
+                    channel::Out::Event(method, payload) => outbox.push(messages.custom_event(&method, payload)),
+                    channel::Out::Log(line) => log(&line),
                 },
                 _ = retry.tick() => {}
             }
