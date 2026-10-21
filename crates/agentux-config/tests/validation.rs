@@ -469,15 +469,8 @@ fn roles_need_a_harness() {
 #[test]
 fn fallbacks_are_harness_names() {
     let config = Config::from_yaml(
-        "version: 1
-roles:
-  implementer:
-    harness: antigravity
-    fallback: [opencode, codex]
-         pipeline:
-  - step: implement
-    role: implementer
-",
+        "version: 1\nroles:\n  implementer:\n    harness: antigravity\n    fallback: [opencode, codex]\n\
+         pipeline:\n  - step: implement\n    role: implementer\n",
     )
     .unwrap();
     assert_eq!(
@@ -485,15 +478,8 @@ roles:
         Some(&["opencode".to_string(), "codex".to_string()][..])
     );
     assert_issue(
-        "version: 1
-roles:
-  implementer:
-    harness: codex
-    fallback: ['']
-         pipeline:
-  - step: implement
-    role: implementer
-",
+        "version: 1\nroles:\n  implementer:\n    harness: codex\n    fallback: ['']\n\
+         pipeline:\n  - step: implement\n    role: implementer\n",
         "roles.implementer.fallback[0]",
         "must not be empty",
     );
