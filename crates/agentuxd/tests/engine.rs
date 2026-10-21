@@ -757,7 +757,10 @@ async fn a_waiting_run_goes_on_when_the_limit_resets() {
     let mut limit = engine.limits().unwrap().remove(0);
     limit.until = Some(agentux_store::now_ms() - 1);
     engine.store().write(|tx| tx.set_limit(&limit)).unwrap();
-    assert_eq!(engine.wake_limited().unwrap(), [run.id.clone()]);
+    assert_eq!(
+        engine.wake_limited().unwrap(),
+        std::slice::from_ref(&run.id)
+    );
     let run = wait_until_settled(&engine, &run.id).await;
     assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
 }
