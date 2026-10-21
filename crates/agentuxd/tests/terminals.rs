@@ -125,6 +125,23 @@ async fn read_until(events: &mut TerminalEvents, pattern: &str) -> String {
     seen
 }
 
+/// Reads terminal output for up to `wait`; whether it contained `pattern`.
+async fn read_for(events: &mut TerminalEvents, pattern: &str, wait: Duration) -> bool {
+    let mut seen = String::new();
+    tokio::time::timeout(wait, async {
+        while !seen.contains(pattern) {
+            match events.next().await.unwrap() {
+                Some(TerminalNotice::Output(bytes)) => {
+                    seen.push_str(&String::from_utf8_lossy(&bytes));
+                }
+                other => panic!("expected output, got {other:?}; so far: {seen:?}"),
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
 /// Skips output until the exit.
 async fn exit_code(events: &mut TerminalEvents) -> Option<i32> {
     tokio::time::timeout(Duration::from_secs(15), async {
@@ -197,8 +214,17 @@ async fn a_shell_round_trip_with_resize_and_exit() {
     read_until(&mut events, &format!("round-42:{}:{worktree}:end", run.id)).await;
 
     input.resize(100, 30).await.unwrap();
-    input.write(b"stty size | tr ' ' x\n").await.unwrap();
-    read_until(&mut events, "30x100").await;
+    // The size is asked again until the shell sees it: on a loaded CI runner
+    // the first `stty size` has answered with the old 24x80.
+    let mut resized = false;
+    for _ in 0..10 {
+        input.write(b"stty size | tr ' ' x\n").await.unwrap();
+        if read_for(&mut events, "30x100", Duration::from_secs(2)).await {
+            resized = true;
+            break;
+        }
+    }
+    assert!(resized, "the shell never saw the new size");
 
     let mut lister = Client::connect(&socket).await.unwrap();
     let listed = lister.list_terminals(&Default::default()).await.unwrap();
