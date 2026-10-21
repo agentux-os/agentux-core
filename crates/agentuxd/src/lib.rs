@@ -26,7 +26,7 @@ pub mod prompts;
 pub mod server;
 mod terminal;
 
-pub use acp::{AcpExecutor, HarnessLauncher, LaunchSpec, Launcher};
+pub use acp::{AcpExecutor, HarnessLauncher, LaunchSpec, Launcher, StallLimits};
 pub use bus::{BusLink, aux_binary};
 pub use engine::{Engine, HarnessProbe, Settings, TuiCommands};
 pub use executor::{FakeExecutor, HelperTask, StepExecutor, StepHost};

@@ -96,6 +96,15 @@ pub fn parse(text: &str, reply: bool, now: &Zoned) -> Option<Found> {
     if reply && text.trim().chars().count() > REPLY_MAX {
         return None;
     }
+    // A turn the daemon gave up on: the harness is out of use for a while
+    // (the next step goes to another agent), then tried again.
+    if !reply && text.contains(crate::acp::STALLED) {
+        return Some(Found {
+            kind: LimitKind::Stalled,
+            model: None,
+            resets: None,
+        });
+    }
     if !NOTICE.is_match(text) && (reply || !ERROR_ONLY.is_match(text)) {
         return None;
     }
@@ -208,6 +217,7 @@ pub fn guess(kind: LimitKind) -> Option<Span> {
         LimitKind::Session => Some(Span::new().hours(1)),
         LimitKind::Weekly => Some(Span::new().hours(24)),
         LimitKind::Credits => None,
+        LimitKind::Stalled => Some(Span::new().minutes(15)),
     }
 }
 
@@ -361,6 +371,22 @@ mod tests {
             at("API error 429: retry-after: 120"),
             "2026-10-20T10:02:00-03:00[America/Sao_Paulo]"
         );
+    }
+
+    #[test]
+    fn a_stalled_turn_keeps_the_harness_out_for_a_while() {
+        let text = format!(
+            "the opencode session failed: {}: no activity for 10 minute(s)",
+            crate::acp::STALLED
+        );
+        let found = parse(&text, false, &now()).unwrap();
+        assert_eq!((found.kind, found.resets), (LimitKind::Stalled, None));
+        let limit = limit("opencode", &text, found, &now());
+        assert_eq!(
+            limit.until,
+            Some(now().timestamp().as_millisecond() + 15 * 60_000)
+        );
+        assert!(parse(&text, true, &now()).is_none());
     }
 
     #[test]

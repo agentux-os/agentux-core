@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -122,6 +122,9 @@ struct Slot {
     host: HostSlot,
     /// The bus system prompt, prepended to the session's first prompt.
     intro: Mutex<Option<String>>,
+    /// Permission requests of the session waiting for the human: the turn
+    /// is not stalled while there are any.
+    asking: Arc<AtomicUsize>,
     /// Held for a whole turn (or a step's turns): a wake for a session that
     /// is mid-turn waits here. Held as long as the session is open in its
     /// TUI, so turns wait for that too.
@@ -195,7 +198,31 @@ pub struct AcpExecutor {
     /// Held while a session starts, so that a step and a wake for the same
     /// role do not both start one.
     starting: tokio::sync::Mutex<()>,
+    stall: StallLimits,
 }
+
+/// How long a turn may go without a sign of life from the agent before the
+/// daemon gives up on it ([`STALLED`]): `idle` with nothing in flight, `tool`
+/// while a tool call runs (a long build or test suite says nothing until it
+/// ends). Time spent waiting for the human (a permission request, a bus
+/// `ask_human`) does not count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StallLimits {
+    pub idle: Duration,
+    pub tool: Duration,
+}
+
+impl Default for StallLimits {
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(10 * 60),
+            tool: Duration::from_secs(60 * 60),
+        }
+    }
+}
+
+/// How a stalled turn's error begins; [`crate::limits`] reads it.
+pub const STALLED: &str = "the agent stopped responding";
 
 impl Default for AcpExecutor {
     fn default() -> Self {
@@ -209,7 +236,14 @@ impl AcpExecutor {
             launcher: Box::new(launcher),
             sessions: Mutex::new(HashMap::new()),
             starting: tokio::sync::Mutex::new(()),
+            stall: StallLimits::default(),
         }
+    }
+
+    /// Replaces the default [`StallLimits`].
+    pub fn with_stall_limits(mut self, stall: StallLimits) -> Self {
+        self.stall = stall;
+        self
     }
 
     fn sessions(&self) -> MutexGuard<'_, HashMap<(String, String), Arc<Slot>>> {
@@ -227,8 +261,10 @@ impl AcpExecutor {
         }
         let opened = host.open_session(want.harness, want.model)?;
         let host_slot: HostSlot = Arc::default();
+        let asking = Arc::new(AtomicUsize::new(0));
         let handler = permissions(
             Arc::clone(&host_slot),
+            Arc::clone(&asking),
             opened.id.clone(),
             want.role.to_string(),
             want.harness.to_string(),
@@ -263,6 +299,7 @@ impl AcpExecutor {
                     can_load: session.can_load(),
                     attached: AtomicBool::new(false),
                     host: host_slot,
+                    asking,
                     intro: Mutex::new(opened.system_prompt),
                     live: Arc::new(tokio::sync::Mutex::new(Live {
                         session: Some(session),
@@ -291,14 +328,22 @@ impl AcpExecutor {
         host: &Arc<dyn StepHost>,
     ) -> Result<AgentOutcome, TurnError> {
         let prompt = slot.with_intro(&prompts::step_prompt(task));
-        let reply = turn(live, &slot.id, host, &prompt, true).await?;
+        let watch = Watch::new(slot, self.stall);
+        let reply = turn(live, &slot.id, host, &prompt, true, &watch).await?;
         match task.step {
             StepKind::Review => {
                 let verdict = match prompts::parse_verdict(&reply) {
                     Some(verdict) => verdict,
                     None => {
-                        let again =
-                            turn(live, &slot.id, host, prompts::VERDICT_REMINDER, true).await?;
+                        let again = turn(
+                            live,
+                            &slot.id,
+                            host,
+                            prompts::VERDICT_REMINDER,
+                            true,
+                            &watch,
+                        )
+                        .await?;
                         prompts::parse_verdict(&again).ok_or_else(|| {
                             TurnError::Failed(format!(
                                 "the reviewer gave no verdict (expected APPROVE or CHANGES_REQUESTED); it replied: {}",
@@ -482,7 +527,8 @@ impl StepExecutor for AcpExecutor {
                 let _host = HostGuard::set(&slot, &host);
                 let prompt = slot.with_intro(&task.prompt);
                 // The human's message is recorded when it is accepted.
-                let result = turn(&mut live, &slot.id, &host, &prompt, !task.human).await;
+                let watch = Watch::new(&slot, self.stall);
+                let result = turn(&mut live, &slot.id, &host, &prompt, !task.human, &watch).await;
                 if !matches!(result, Err(TurnError::Broken(_))) {
                     host.session_state(&slot.id, SessionState::Idle);
                 }
@@ -559,6 +605,7 @@ impl StepExecutor for AcpExecutor {
             };
             let handler = permissions(
                 Arc::clone(&slot.host),
+                Arc::clone(&slot.asking),
                 slot.id.clone(),
                 slot.role.clone(),
                 slot.harness.clone(),
@@ -687,6 +734,90 @@ enum TurnError {
     Broken(String),
 }
 
+/// What a turn's stall check needs from its session.
+struct Watch {
+    limits: StallLimits,
+    asking: Arc<AtomicUsize>,
+}
+
+impl Watch {
+    fn new(slot: &Slot, limits: StallLimits) -> Self {
+        Self {
+            limits,
+            asking: Arc::clone(&slot.asking),
+        }
+    }
+
+    fn waiting_for_human(&self) -> bool {
+        self.asking.load(Ordering::SeqCst) > 0
+    }
+}
+
+/// The agent's last sign of life in a turn, and its tool calls in flight.
+struct Alive {
+    last: tokio::time::Instant,
+    /// Tool call id to title.
+    tools: HashMap<String, String>,
+}
+
+impl Alive {
+    fn new() -> Self {
+        Self {
+            last: tokio::time::Instant::now(),
+            tools: HashMap::new(),
+        }
+    }
+
+    fn touch(&mut self) {
+        self.last = tokio::time::Instant::now();
+    }
+
+    fn saw(&mut self, event: &Event) {
+        self.touch();
+        match event {
+            Event::ToolCall(call) => {
+                use agentux_harness::ToolStatus as S;
+                if !matches!(call.status, S::Completed | S::Failed) {
+                    self.tools.insert(call.id.clone(), call.title.clone());
+                }
+            }
+            Event::ToolCallUpdate(update) => {
+                use agentux_harness::ToolStatus as S;
+                if matches!(update.status, Some(S::Completed | S::Failed)) {
+                    self.tools.remove(&update.id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The agent asked the human on the bus (`ask_human`) and waits.
+    fn asking_human(&self) -> bool {
+        self.tools.values().any(|title| title.contains("ask_human"))
+    }
+
+    fn limit(&self, watch: &Watch) -> Duration {
+        if self.tools.is_empty() {
+            watch.limits.idle
+        } else {
+            watch.limits.tool
+        }
+    }
+
+    fn deadline(&self, watch: &Watch) -> tokio::time::Instant {
+        self.last + self.limit(watch)
+    }
+
+    fn stalled(&self, watch: &Watch) -> String {
+        let minutes = self.limit(watch).as_secs().div_ceil(60);
+        let what = match self.tools.values().next() {
+            Some(title) => format!(" while running {}", excerpt(title)),
+            None => String::new(),
+        };
+        format!("{STALLED}: no activity for {minutes} minute(s){what}")
+    }
+}
+
 /// Sends one prompt and streams the turn's events to the host, recording the
 /// prompt as a `user` message when `record` is set. Returns the agent's reply
 /// text.
@@ -696,6 +827,7 @@ async fn turn(
     host: &Arc<dyn StepHost>,
     text: &str,
     record: bool,
+    watch: &Watch,
 ) -> Result<String, TurnError> {
     let Live { session, events } = live;
     let session = session
@@ -723,14 +855,29 @@ async fn turn(
         tokio::time::Instant::now() + MESSAGE_FLUSH_EVERY,
         MESSAGE_FLUSH_EVERY,
     );
+    let mut alive = Alive::new();
     let stop = {
         let prompt = session.prompt(text);
         tokio::pin!(prompt);
         loop {
+            let deadline = alive.deadline(watch);
             tokio::select! {
-                stop = &mut prompt => break stop,
-                Some(event) = events.recv() => sink.push(event),
+                stop = &mut prompt => break Ok(stop),
+                Some(event) = events.recv() => {
+                    alive.saw(&event);
+                    sink.push(event);
+                }
                 _ = tick.tick() => sink.flush(),
+                _ = tokio::time::sleep_until(deadline) => {
+                    if watch.waiting_for_human() || alive.asking_human() {
+                        alive.touch();
+                        continue;
+                    }
+                    // Give the agent a chance to end the turn cleanly.
+                    let _ = session.cancel();
+                    let _ = tokio::time::timeout(Duration::from_secs(30), &mut prompt).await;
+                    break Err(alive.stalled(watch));
+                }
             }
         }
     };
@@ -738,6 +885,11 @@ async fn turn(
         sink.push(event);
     }
     sink.flush();
+    let stop = match stop {
+        Ok(stop) => stop,
+        // The session is not trusted any more: the next turn gets a new one.
+        Err(message) => return Err(TurnError::Broken(message)),
+    };
     match stop {
         Err(e) => Err(TurnError::Broken(e.to_string())),
         Ok(StopReason::Refusal) => Err(TurnError::Failed("the agent refused".into())),
@@ -860,6 +1012,7 @@ impl<'a> Sink<'a> {
 /// Routes the session's permission requests to the current step's host.
 fn permissions(
     host: HostSlot,
+    asking: Arc<AtomicUsize>,
     session_id: String,
     role: String,
     harness: String,
@@ -868,11 +1021,15 @@ fn permissions(
         let current = lock(&host).clone();
         let (title, detail) = describe(&role, &harness, &request);
         let session_id = session_id.clone();
+        let asking = Arc::clone(&asking);
         async move {
             let Some(host) = current else {
                 return Decision::Deny;
             };
-            if host.ask_permission(&session_id, title, detail).await {
+            asking.fetch_add(1, Ordering::SeqCst);
+            let allowed = host.ask_permission(&session_id, title, detail).await;
+            asking.fetch_sub(1, Ordering::SeqCst);
+            if allowed {
                 Decision::Allow
             } else {
                 Decision::Deny

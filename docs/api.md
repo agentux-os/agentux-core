@@ -110,7 +110,7 @@ interface Project { id: string; name: string; path: string; createdAt: number }
 interface HarnessLimit {
   harness: string;           // e.g. "claude-code"
   model: string | null;      // the model the limit is for; null: the whole harness
-  kind: "session" | "weekly" | "credits" | "rate";
+  kind: "session" | "weekly" | "credits" | "rate" | "stalled";
   until: number | null;      // when it ends; null: only when cleared (credits)
   untilKnown: boolean;       // the harness said when; false: a guess, then tried again
   message: string;           // what the harness said
@@ -269,6 +269,8 @@ When an agent step's harness answers with a usage limit instead of work (an erro
 - **Which limit** (`kind`): `session` (Claude Code's 5-hour window, Codex's usage limit), `weekly`, `credits` (credit balance too low, insufficient quota, billing), or `rate` (HTTP 429, quota exceeded).
 - **For what:** a model the notice names (`opus`, `gemini-2.5-pro`, `gpt-5-codex`) when the role uses that model, else the whole harness.
 - **Until when** (`until`, `untilKnown: true`): Claude Code's `limit reached|<epoch>`, `resets 3pm (America/Sao_Paulo)`, `resets Oct 27, 9am`; Codex's `try again in 2 days 3 hours` or `try again at 3:05 PM`; Gemini's `retry in 41.5s`, `reset after 3h12m`, `"retryDelay": "30s"`; `retry-after: 120`. Times without a zone are in the daemon's local time zone. Without a time, the daemon tries the harness again after a guess (`untilKnown: false`): 2 minutes for `rate`, an hour for `session`, a day for `weekly`. `credits` have no time: they hold until `limits.clear`.
+
+**Stalled agents.** A turn that goes 10 minutes without a sign of life from the agent (no message, tool call or update), or 60 minutes while one of its tool calls runs (a long build or test suite says nothing until it ends), is given up on: the daemon cancels it, closes the session and records a `stalled` limit for the harness, for 15 minutes. Time the agent spends waiting for the human (a permission request, a bus `ask_human`) does not count. The step then goes on like any other limit: another agent, or a wait.
 
 While a limit holds, the harness (or model) is out of use: the built-in pipeline does not pick it, and an agent step of a role it plays gives the role to the role's `fallback` harnesses in `agentux.yaml`, in order, or, without the key, to the first other harness the user can use (`harnesses.list` order); `fallback: []` keeps the role. When no harness can take it, the run waits on a `limit` request saying why and until when. It goes on by itself once the limit is over (checked every 15 seconds), or when the human approves the request or calls `limits.clear` (after adding credits or resetting the limit on the vendor's site). Denying the request fails the run.
 

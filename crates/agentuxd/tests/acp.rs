@@ -17,7 +17,7 @@ use agentux_fake_agent::{Script, Turn, acp, script};
 use agentux_harness::{AcpSession, Events, PermissionHandler};
 use agentux_store::Store;
 use agentuxd::executor::BoxFuture;
-use agentuxd::{AcpExecutor, Engine, LaunchSpec, Launcher, Settings, server};
+use agentuxd::{AcpExecutor, Engine, LaunchSpec, Launcher, Settings, StallLimits, server};
 use common::{Fixture, fixture, wait_for, wait_until_settled};
 use tokio::sync::oneshot;
 
@@ -66,6 +66,14 @@ fn executor(
     seen: &Shared,
     agent: fn(String, Turn, Shared) -> BoxFuture<'static, Result>,
 ) -> (Arc<AcpExecutor>, Launched) {
+    executor_with(seen, agent, StallLimits::default())
+}
+
+fn executor_with(
+    seen: &Shared,
+    agent: fn(String, Turn, Shared) -> BoxFuture<'static, Result>,
+    stall: StallLimits,
+) -> (Arc<AcpExecutor>, Launched) {
     let launched = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(seen);
     let launcher = FakeLauncher {
@@ -82,7 +90,10 @@ fn executor(
         }),
         launched: Arc::clone(&launched),
     };
-    (Arc::new(AcpExecutor::new(launcher)), launched)
+    (
+        Arc::new(AcpExecutor::new(launcher).with_stall_limits(stall)),
+        launched,
+    )
 }
 
 /// Planner, implementer (writes `hello.txt`) and reviewer (requests changes
@@ -536,4 +547,75 @@ budget:
     assert!((run.cost_usd - 0.9).abs() < 1e-9);
     let sessions = engine.sessions(Some(&run.id)).unwrap();
     assert!(sessions.iter().all(|s| s.usage.cost_usd == Some(0.30)));
+}
+
+/// Hangs in its first turn after starting a tool call that never ends; then
+/// works.
+fn hangs_once(_: String, turn: Turn, seen: Shared) -> BoxFuture<'static, Result> {
+    Box::pin(async move {
+        let first = seen.lock().unwrap().prompts.len() == 1;
+        if first {
+            turn.tool_call("t1", "Run the tests", acp::ToolKind::Execute, None)?;
+            turn.cancelled().await;
+            return Ok(acp::StopReason::Cancelled);
+        }
+        turn.message("Done.")?;
+        Ok(acp::StopReason::EndTurn)
+    })
+}
+
+const STALL_PIPELINE: &str = "version: 1
+roles:
+  implementer:
+    harness: fake-hang
+    fallback: []
+pipeline:
+  - step: implement
+    role: implementer
+";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_agent_is_given_up_on_and_the_run_waits() {
+    let f = fixture(STALL_PIPELINE);
+    let seen = Shared::default();
+    let (executor, launched) = executor_with(
+        &seen,
+        hangs_once,
+        StallLimits {
+            idle: Duration::from_millis(300),
+            tool: Duration::from_millis(600),
+        },
+    );
+    let engine = f.engine(executor);
+    let run = start(&f, &engine, "Fix it").await;
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Waiting, "{:?}", run.error);
+
+    let (_, attempts, requests) = engine.run(&run.id).unwrap();
+    let failed = attempts
+        .iter()
+        .find(|a| a.status == AttemptStatus::Failed)
+        .unwrap();
+    let output = failed.output.as_deref().unwrap_or_default();
+    assert!(output.contains("stopped responding"), "{output}");
+    assert!(output.contains("Run the tests"), "{output}");
+    assert!(
+        requests
+            .iter()
+            .any(|r| r.kind == RequestKind::Limit && r.status == RequestStatus::Pending)
+    );
+    let limits = engine.limits().unwrap();
+    assert_eq!(limits.len(), 1);
+    assert_eq!(limits[0].kind, agentux_api::LimitKind::Stalled);
+
+    // Tried again: a new session, which works.
+    engine
+        .clear_limit(&agentux_api::rpc::ClearLimit {
+            harness: "fake-hang".into(),
+            model: None,
+        })
+        .unwrap();
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+    assert_eq!(launched.lock().unwrap().len(), 2);
 }
