@@ -86,33 +86,44 @@ pub struct Settings {
     pub bus: Option<BusLink>,
     /// How a harness's TUI resumes a session (`terminals.open`).
     pub tui: TuiCommands,
-    /// Which built-in harnesses are installed (`harnesses.list`, and the
-    /// roles of the built-in pipeline).
+    /// What the daemon knows of each built-in harness (`harnesses.list`,
+    /// and the roles of the built-in pipeline).
     pub harnesses: HarnessProbe,
 }
 
-/// Whether the built-in harness with this id is installed. The default is
-/// [`agentux_harness::HarnessSpec::installed`]; tests plug in their own.
+/// Whether the built-in harness with this id is installed, and whether the
+/// user signed in to it (`None`: cannot tell). The default asks
+/// [`agentux_harness::HarnessSpec`]; tests plug in their own.
 #[derive(Clone)]
 pub struct HarnessProbe(Arc<ProbeFn>);
 
-type ProbeFn = dyn Fn(&str) -> bool + Send + Sync;
+type ProbeFn = dyn Fn(&str) -> (bool, Option<bool>) + Send + Sync;
 
 impl HarnessProbe {
-    pub fn new(f: impl Fn(&str) -> bool + Send + Sync + 'static) -> Self {
+    pub fn new(f: impl Fn(&str) -> (bool, Option<bool>) + Send + Sync + 'static) -> Self {
         Self(Arc::new(f))
     }
 
-    pub fn installed(&self, harness: &str) -> bool {
+    /// `(installed, signed in)`.
+    pub fn state(&self, harness: &str) -> (bool, Option<bool>) {
         (self.0)(harness)
+    }
+
+    /// Installed, and not known to be signed out: what a run can use.
+    pub fn usable(&self, harness: &str) -> bool {
+        let (installed, signed_in) = self.state(harness);
+        installed && signed_in != Some(false)
     }
 }
 
 impl Default for HarnessProbe {
     fn default() -> Self {
-        Self::new(|harness| {
-            agentux_harness::HarnessSpec::find(harness).is_some_and(|spec| spec.installed())
-        })
+        Self::new(
+            |harness| match agentux_harness::HarnessSpec::find(harness) {
+                Some(spec) => (spec.installed(), spec.signed_in()),
+                None => (false, None),
+            },
+        )
     }
 }
 
@@ -307,13 +318,18 @@ impl Engine {
         Ok(self.inner.store.read(|tx| tx.projects())?)
     }
 
-    /// The built-in harnesses and whether each is installed
-    /// (`harnesses.list`).
+    /// The built-in harnesses, and whether each is installed and signed in
+    /// to (`harnesses.list`).
     pub fn harnesses(&self) -> Vec<HarnessInfo> {
         agentux_harness::HarnessSpec::builtin()
             .into_iter()
-            .map(|spec| HarnessInfo {
-                installed: self.inner.settings.harnesses.installed(&spec.id),
+            .map(|spec| {
+                let (installed, signed_in) = self.inner.settings.harnesses.state(&spec.id);
+                (spec, installed, signed_in)
+            })
+            .map(|(spec, installed, signed_in)| HarnessInfo {
+                installed,
+                signed_in,
                 command: spec.cli().to_string(),
                 experimental: spec.experimental,
                 id: spec.id,
@@ -361,7 +377,7 @@ impl Engine {
             let installed: Vec<String> = agentux_harness::HarnessSpec::builtin()
                 .into_iter()
                 .map(|spec| spec.id)
-                .filter(|id| self.inner.settings.harnesses.installed(id))
+                .filter(|id| self.inner.settings.harnesses.usable(id))
                 .collect();
             default_roles(&mut roles, &installed);
         }
@@ -1435,11 +1451,11 @@ pub(crate) fn config_of(record: &RunRecord, project_root: &Path) -> Result<Confi
     Ok(config)
 }
 
-/// Gives the built-in pipeline's roles installed harnesses: a role keeps its
-/// harness if that is installed, else takes the first installed one, and the
-/// reviewer prefers a different harness than the implementer. With nothing
-/// installed, the roles stay as they are (and the run says what is missing
-/// when it reaches them).
+/// Gives the built-in pipeline's roles usable harnesses (installed, and not
+/// known to be signed out): a role keeps its harness if that is usable, else
+/// takes the first usable one, and the reviewer prefers a different harness
+/// than the implementer. With none usable, the roles stay as they are (and
+/// the run says what is missing when it reaches them).
 fn default_roles(roles: &mut BTreeMap<String, String>, installed: &[String]) {
     let Some(first) = installed.first() else {
         return;

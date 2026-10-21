@@ -183,6 +183,10 @@ pub struct HarnessInfo {
     pub command: String,
     /// Whether that program is on the daemon's `PATH`.
     pub installed: bool,
+    /// Whether the user signed in to it: from where the CLI keeps its
+    /// sign-in, or the API key variables it reads. `None` when that cannot
+    /// be told.
+    pub signed_in: Option<bool>,
     /// Not expected to work reliably yet.
     pub experimental: bool,
 }

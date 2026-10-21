@@ -90,6 +90,37 @@ impl HarnessSpec {
         on_path(self.cli()) && on_path(&self.command)
     }
 
+    /// Whether the user signed in to the vendor's CLI, from where each CLI
+    /// keeps its sign-in, or the API key variables it reads. `None` when
+    /// that cannot be told: OpenCode can take its keys from its config, and
+    /// a missing Antigravity token file may only be a newer layout.
+    pub fn signed_in(&self) -> Option<bool> {
+        use std::path::PathBuf;
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+        let file = |path: PathBuf| path.metadata().is_ok_and(|m| m.len() > 0);
+        match self.id.as_str() {
+            "claude-code" => Some(
+                file(home.join(".claude/.credentials.json"))
+                    || var("ANTHROPIC_API_KEY").is_some()
+                    || var("CLAUDE_CODE_OAUTH_TOKEN").is_some(),
+            ),
+            "codex" => {
+                let dir = var("CODEX_HOME").map_or_else(|| home.join(".codex"), PathBuf::from);
+                Some(file(dir.join("auth.json")) || var("OPENAI_API_KEY").is_some())
+            }
+            "opencode" => {
+                let data =
+                    var("XDG_DATA_HOME").map_or_else(|| home.join(".local/share"), PathBuf::from);
+                file(data.join("opencode/auth.json")).then_some(true)
+            }
+            "antigravity" => {
+                file(home.join(".gemini/antigravity-cli/antigravity-oauth-token")).then_some(true)
+            }
+            _ => None,
+        }
+    }
+
     /// The command line, for messages.
     pub fn command_line(&self) -> String {
         std::iter::once(self.command.as_str())

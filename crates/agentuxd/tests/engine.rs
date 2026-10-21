@@ -606,7 +606,11 @@ async fn the_built_in_pipeline_uses_installed_harnesses() {
     ] {
         let list: Vec<String> = installed.iter().map(|s| s.to_string()).collect();
         let settings = agentuxd::Settings {
-            harnesses: agentuxd::engine::HarnessProbe::new(move |id| list.iter().any(|h| h == id)),
+            harnesses: agentuxd::HarnessProbe::new(move |id| match id {
+                // Installed but signed out: never picked.
+                "codex" if !list.iter().any(|h| h == id) => (true, Some(false)),
+                _ => (list.iter().any(|h| h == id), None),
+            }),
             ..Default::default()
         };
         let database = f.tmp.path().join(format!("db-{}", installed.join("-")));
@@ -638,7 +642,8 @@ async fn the_built_in_pipeline_uses_installed_harnesses() {
         let harnesses = engine.harnesses();
         assert_eq!(harnesses.len(), 4);
         for h in harnesses {
-            assert_eq!(h.installed, installed.contains(&h.id.as_str()), "{}", h.id);
+            let expected = installed.contains(&h.id.as_str()) || h.id == "codex";
+            assert_eq!(h.installed, expected, "{}", h.id);
         }
         engine.shutdown();
     }
