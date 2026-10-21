@@ -63,6 +63,7 @@ fn adr_example_parses_into_the_expected_config() {
             Role {
                 harness: "claude-code".into(),
                 model: None,
+                fallback: None,
             },
         ),
         (
@@ -70,6 +71,7 @@ fn adr_example_parses_into_the_expected_config() {
             Role {
                 harness: "codex".into(),
                 model: None,
+                fallback: None,
             },
         ),
         (
@@ -77,6 +79,7 @@ fn adr_example_parses_into_the_expected_config() {
             Role {
                 harness: "claude-code".into(),
                 model: Some("opus".into()),
+                fallback: None,
             },
         ),
     ]);
@@ -461,6 +464,25 @@ fn roles_need_a_harness() {
          pipeline:\n  - step: implement\n    role: implementer\n",
     );
     assert!(message.contains("harness"), "{message}");
+}
+
+#[test]
+fn fallbacks_are_harness_names() {
+    let config = Config::from_yaml(
+        "version: 1\nroles:\n  implementer:\n    harness: antigravity\n    fallback: [opencode, codex]\n\
+         pipeline:\n  - step: implement\n    role: implementer\n",
+    )
+    .unwrap();
+    assert_eq!(
+        config.roles["implementer"].fallback.as_deref(),
+        Some(&["opencode".to_string(), "codex".to_string()][..])
+    );
+    assert_issue(
+        "version: 1\nroles:\n  implementer:\n    harness: codex\n    fallback: ['']\n\
+         pipeline:\n  - step: implement\n    role: implementer\n",
+        "roles.implementer.fallback[0]",
+        "must not be empty",
+    );
 }
 
 #[test]

@@ -15,7 +15,9 @@ agentux-harness.workspace = true
 agentux-store.workspace = true
 agentux-worktree.workspace = true
 clap.workspace = true
+jiff.workspace = true
 portable-pty.workspace = true
+regex.workspace = true
 rustix = { version = "1", default-features = false, features = ["std", "process"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -91,6 +91,17 @@ impl Client {
         self.call(method::HARNESSES_LIST, &()).await
     }
 
+    pub async fn limits(&mut self) -> Result<Vec<crate::HarnessLimit>, ClientError> {
+        self.call(method::LIMITS_LIST, &()).await
+    }
+
+    pub async fn clear_limit(
+        &mut self,
+        params: &rpc::ClearLimit,
+    ) -> Result<Vec<crate::HarnessLimit>, ClientError> {
+        self.call(method::LIMITS_CLEAR, params).await
+    }
+
     pub async fn start_run(&mut self, params: &rpc::StartRun) -> Result<Run, ClientError> {
         self.call(method::RUNS_START, params).await
     }

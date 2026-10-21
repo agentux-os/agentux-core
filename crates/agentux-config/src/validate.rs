@@ -105,6 +105,11 @@ impl RawConfig {
             if role.model.as_deref().is_some_and(|m| m.trim().is_empty()) {
                 issues.push(format!("roles.{name}.model"), "must not be empty when set");
             }
+            for (i, harness) in role.fallback.iter().flatten().enumerate() {
+                if harness.trim().is_empty() {
+                    issues.push(format!("roles.{name}.fallback[{i}]"), "must not be empty");
+                }
+            }
         }
 
         let mut check_names = HashSet::new();

@@ -21,12 +21,13 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::{fmt, fs, io};
 
-use agentux_api::rpc::{HarnessInfo, StartRun};
+use agentux_api::rpc::{ClearLimit, HarnessInfo, StartRun};
 use agentux_api::{
-    AttemptStatus, CheckResult, CheckStatus, EventBody, PermissionRequest, Project, RequestKind,
-    RequestStatus, Run, RunStatus, Session, SessionEvent, SessionState, StepAttempt, StepKind,
+    AttemptStatus, CheckResult, CheckStatus, EventBody, HarnessLimit, PermissionRequest, Project,
+    RequestKind, RequestStatus, Run, RunStatus, Session, SessionEvent, SessionState, StepAttempt,
+    StepKind,
 };
-use agentux_config::{Config, DEVCONTAINER_FILES, FILE_NAME, IsolationMode, Loop, Step};
+use agentux_config::{Config, DEVCONTAINER_FILES, FILE_NAME, IsolationMode, Loop, Role, Step};
 use agentux_store::{NewRequest, Phase, RunRecord, Store, Table, Tx, now_ms};
 use agentux_worktree::Worktrees;
 use tokio::sync::oneshot;
@@ -38,6 +39,7 @@ use crate::executor::{
     AgentOutcome, AgentTask, BoxFuture, OpenedSession, PullRequestOutcome, PullRequestTask,
     StepExecutor, StepHost,
 };
+use crate::limits;
 use crate::terminal::Terminals;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +323,7 @@ impl Engine {
     /// The built-in harnesses, and whether each is installed and signed in
     /// to (`harnesses.list`).
     pub fn harnesses(&self) -> Vec<HarnessInfo> {
+        let limits = self.limits().unwrap_or_default();
         agentux_harness::HarnessSpec::builtin()
             .into_iter()
             .map(|spec| {
@@ -328,6 +331,11 @@ impl Engine {
                 (spec, installed, signed_in)
             })
             .map(|(spec, installed, signed_in)| HarnessInfo {
+                limits: limits
+                    .iter()
+                    .filter(|l| l.harness == spec.id)
+                    .cloned()
+                    .collect(),
                 installed,
                 signed_in,
                 command: spec.cli().to_string(),
@@ -335,6 +343,111 @@ impl Engine {
                 id: spec.id,
             })
             .collect()
+    }
+
+    /// The harness limits in force.
+    pub fn limits(&self) -> Result<Vec<HarnessLimit>> {
+        Ok(self.inner.store.read(|tx| tx.limits(now_ms()))?)
+    }
+
+    /// The human says a limit no longer holds (credits added, a plan's
+    /// limit reset): the harness is in use again, and runs waiting for it go
+    /// on. Returns the limits still in force.
+    pub fn clear_limit(&self, params: &ClearLimit) -> Result<Vec<HarnessLimit>> {
+        self.inner
+            .store
+            .write(|tx| tx.clear_limits(&params.harness, params.model.as_deref()))?;
+        self.wake_limited()?;
+        self.limits()
+    }
+
+    /// Lets go of limits whose time passed, and starts again the runs that
+    /// wait for a limit that is gone, or for a role another agent can now
+    /// take. The daemon calls it every few seconds ([`Engine::watch_limits`]).
+    pub fn wake_limited(&self) -> Result<Vec<String>> {
+        let now = now_ms();
+        self.inner.store.write(|tx| tx.expire_limits(now))?;
+        let in_force = self.limits()?;
+        let waiting: Vec<PermissionRequest> = self
+            .inner
+            .store
+            .read(|tx| tx.requests(None, Some(RequestStatus::Pending)))?
+            .into_iter()
+            .filter(|r| r.kind == RequestKind::Limit)
+            .collect();
+        let mut woken = Vec::new();
+        for request in waiting {
+            let free = self.inner.store.read(|tx| {
+                let Some(record) = tx.run(&request.run_id)? else {
+                    return Ok::<_, Error>(false);
+                };
+                let config = config_of(&record, &project_root(tx, &record)?)?;
+                Ok(match step_role(&config, request.step_index) {
+                    Some(role) => {
+                        limits::blocking(&in_force, &role.harness, role.model.as_deref()).is_none()
+                            || self.fallback(role, &in_force).is_some()
+                    }
+                    None => true,
+                })
+            })?;
+            if !free {
+                continue;
+            }
+            let resumed = self.inner.store.write(|tx| {
+                let Ok((request, mut record)) = pending_request(tx, &request.id) else {
+                    return Ok::<_, Error>(None);
+                };
+                tx.resolve_request(
+                    &request.id,
+                    RequestStatus::Approved,
+                    Some("the usage limit is over"),
+                )?;
+                tx.log(&request.run_id, "the usage limit is over; going on")?;
+                record.run.status = RunStatus::Running;
+                record.phase = Phase::Step;
+                record.run.activity = "the usage limit is over; going on".into();
+                tx.save_run(&mut record)?;
+                Ok(Some(request.run_id))
+            })?;
+            if let Some(run_id) = resumed {
+                self.spawn(&run_id);
+                woken.push(run_id);
+            }
+        }
+        Ok(woken)
+    }
+
+    /// Calls [`Engine::wake_limited`] every 15 seconds while the daemon runs.
+    pub fn watch_limits(&self) -> JoinHandle<()> {
+        let engine = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                if let Err(e) = engine.wake_limited() {
+                    eprintln!("agentuxd: cannot check usage limits: {e}");
+                }
+            }
+        })
+    }
+
+    /// The harness that takes `role` while its own is at a limit: the role's
+    /// `fallback` list, or else any built-in harness the user can use, in
+    /// order; never one at a limit itself.
+    fn fallback(&self, role: &Role, in_force: &[HarnessLimit]) -> Option<String> {
+        let candidates: Vec<String> = match &role.fallback {
+            Some(list) => list.clone(),
+            None => agentux_harness::HarnessSpec::builtin()
+                .into_iter()
+                .map(|spec| spec.id)
+                .filter(|id| self.inner.settings.harnesses.usable(id))
+                .collect(),
+        };
+        candidates.into_iter().find(|harness| {
+            *harness != role.harness
+                && agentux_harness::HarnessSpec::find(harness).is_some()
+                && limits::blocking(in_force, harness, None).is_none()
+        })
     }
 
     /// Creates a run from the project's current `agentux.yaml` and starts it.
@@ -374,10 +487,12 @@ impl Engine {
             .map(|(name, role)| (name.clone(), role.harness.clone()))
             .collect();
         if yaml.is_none() {
+            let in_force = self.limits()?;
             let installed: Vec<String> = agentux_harness::HarnessSpec::builtin()
                 .into_iter()
                 .map(|spec| spec.id)
                 .filter(|id| self.inner.settings.harnesses.usable(id))
+                .filter(|id| limits::blocking(&in_force, id, None).is_none())
                 .collect();
             default_roles(&mut roles, &installed);
         }
@@ -507,6 +622,14 @@ impl Engine {
                 record.run.budget_usd = Some(budget);
                 record.phase = Phase::Step;
                 record.run.activity = format!("budget raised to ${budget:.2}; continuing");
+            } else if request.kind == RequestKind::Limit {
+                // The human lifted the limit (or wants a retry): the role's
+                // harness is in use again, and the step runs.
+                if let Some(role) = step_role(&config, request.step_index) {
+                    tx.clear_limits(&role.harness, None)?;
+                }
+                record.phase = Phase::Step;
+                record.run.activity = "retrying after the usage limit".into();
             } else {
                 match config.pipeline.get(request.step_index) {
                     // Steps that ask before acting now get to act.
@@ -972,6 +1095,48 @@ impl Engine {
             return Ok(done.is_some());
         }
 
+        // A harness (or model) at its usage limit does not get the step:
+        // another one takes the role, or the run waits for the limit.
+        let in_force = self.limits()?;
+        if let Some(blocked) = limits::blocking(&in_force, &role.harness, role.model.as_deref()) {
+            let blocked = blocked.clone();
+            let next = self.fallback(role, &in_force);
+            let done = self.transition(&run_id, |tx, record| {
+                let why = format!(
+                    "{} is at its {} limit{}",
+                    role.harness,
+                    blocked.kind,
+                    until_text(&blocked)
+                );
+                match &next {
+                    Some(harness) => {
+                        tx.log(&run_id, format!("{why}; {harness} takes the {role_name} role"))?;
+                        record.run.roles.insert(role_name.clone(), harness.clone());
+                        record.run.activity = format!("{why}; {harness} takes over");
+                        Ok(())
+                    }
+                    None => {
+                        tx.log(&run_id, format!("{why}; no other agent can take the {role_name} role"))?;
+                        let detail = format!(
+                            "{why}, and no other agent can take the {role_name} role.\n\n\
+                             {}\n\n\
+                             Approve once the limit is lifted (credits added, the plan's limit reset) \
+                             to retry now. The run also goes on by itself {}. Deny to stop the run.",
+                            blocked.message,
+                            match blocked.until {
+                                Some(_) => format!("when the limit resets{}", until_text(&blocked)),
+                                None => "only when you say so: this limit has no reset time".into(),
+                            }
+                        );
+                        ask(tx, record, RequestKind::Limit, detail)?;
+                        record.run.activity = format!("waiting: {why}");
+                        Ok(())
+                    }
+                }
+            })?;
+            return Ok(done.is_some());
+        }
+
         let Some((attempt, number, plan, feedback_from)) =
             self.transition(&run_id, |tx, record| {
                 let attempts = tx.attempts(&run_id)?;
@@ -1042,6 +1207,57 @@ impl Engine {
             },
             Err(e) => (Err(e), None),
         };
+
+        // The harness said it ran out: keep it out of use until its reset,
+        // and run the step again (with another agent, or after the reset).
+        let hit = {
+            let now = jiff::Zoned::now();
+            let found = match &outcome {
+                Err(message) => limits::parse(message, false, &now).map(|f| (f, message.clone())),
+                Ok(AgentOutcome::Done { summary: text })
+                | Ok(AgentOutcome::ChangesRequested { comments: text }) => {
+                    limits::parse(text, true, &now).map(|f| (f, text.clone()))
+                }
+            };
+            found.map(|(found, message)| {
+                let mut limit = limits::limit(&role.harness, &message, found, &now);
+                // A model's limit that does not stop this role (another
+                // model, or the harness's default) would let it hit the
+                // limit again at once: it stops the harness.
+                if limits::blocking(
+                    std::slice::from_ref(&limit),
+                    &role.harness,
+                    role.model.as_deref(),
+                )
+                .is_none()
+                {
+                    limit.model = None;
+                }
+                limit
+            })
+        };
+        if let Some(limit) = hit {
+            let done = self.transition(&run_id, |tx, record| {
+                if let Some(commit) = &commit {
+                    tx.log(&run_id, format!("committed {commit}"))?;
+                }
+                tx.finish_attempt(attempt.id, AttemptStatus::Failed, Some(&limit.message))?;
+                tx.set_limit(&limit)?;
+                tx.log(
+                    &run_id,
+                    format!(
+                        "{} reached its {} limit{}: {}",
+                        limit.harness,
+                        limit.kind,
+                        until_text(&limit),
+                        limit.message
+                    ),
+                )?;
+                record.run.activity = format!("{} reached its usage limit", limit.harness);
+                Ok(())
+            })?;
+            return Ok(done.is_some());
+        }
 
         let changes_loop = match step {
             Step::Review {
@@ -1381,6 +1597,7 @@ fn ask(tx: &mut Tx<'_>, record: &mut RunRecord, kind: RequestKind, detail: Strin
         RequestKind::Budget => format!("\"{}\" is over its budget", record.run.title),
         RequestKind::Permission => format!("Permission for \"{}\"", record.run.title),
         RequestKind::Question => format!("A question about \"{}\"", record.run.title),
+        RequestKind::Limit => format!("\"{}\" waits for an agent's usage limit", record.run.title),
     };
     let request = tx.create_request(NewRequest {
         kind,
@@ -1549,6 +1766,35 @@ fn step_request_kind(kind: StepKind) -> RequestKind {
         RequestKind::Plan
     } else {
         RequestKind::Step
+    }
+}
+
+/// The role of the agent step at `index`, if it is one.
+fn step_role(config: &Config, index: usize) -> Option<&Role> {
+    let name = match config.pipeline.get(index)? {
+        Step::Plan { role, .. }
+        | Step::Implement { role, .. }
+        | Step::Review { role, .. }
+        | Step::Custom { role, .. } => role,
+        Step::Gate { .. } | Step::PullRequest { .. } => return None,
+    };
+    config.roles.get(name)
+}
+
+/// ` until 14:05 (UTC)`-style text for a limit, empty without a time.
+fn until_text(limit: &HarnessLimit) -> String {
+    let Some(until) = limit.until else {
+        return String::new();
+    };
+    let Ok(at) = jiff::Timestamp::from_millisecond(until) else {
+        return String::new();
+    };
+    let local = at.to_zoned(jiff::tz::TimeZone::system());
+    let when = local.strftime("%Y-%m-%d %H:%M %Z").to_string();
+    if limit.until_known {
+        format!(" until {when}")
+    } else {
+        format!(" (trying it again at {when})")
     }
 }
 
