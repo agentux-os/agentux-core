@@ -68,6 +68,7 @@ async fn api_round_trip_over_a_unix_socket() {
             title: Some("Login fix".into()),
             prompt: Some("Fix the login bug".into()),
             issue: Some(12),
+            ..Default::default()
         })
         .await
         .unwrap();

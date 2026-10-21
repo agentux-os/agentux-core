@@ -534,3 +534,117 @@ async fn a_container_that_cannot_start_fails_the_run_without_looping() {
     // Not the agent's fault, so no attempt to fix it.
     assert_eq!(kinds(&executor), [StepKind::Plan, StepKind::Implement]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runs_can_choose_the_harness_of_a_role() {
+    let f = fixture(&pipeline("true"));
+    let executor = Arc::new(FakeExecutor::default());
+    let engine = f.engine(executor.clone());
+    let project = engine
+        .register_project(f.repo.to_str().unwrap())
+        .await
+        .unwrap();
+    let run = engine
+        .start_run(agentux_api::rpc::StartRun {
+            project_id: project.id.clone(),
+            prompt: Some("Fix it".into()),
+            roles: [("implementer".to_string(), "opencode".to_string())].into(),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(run.roles["implementer"], "opencode");
+    assert_eq!(run.roles["planner"], "fake-a");
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+    let implement = executor
+        .calls()
+        .into_iter()
+        .find(|c| c.step == StepKind::Implement)
+        .unwrap();
+    assert_eq!(implement.harness, "opencode");
+
+    for (role, harness) in [("nobody", "opencode"), ("implementer", "no-such-harness")] {
+        let result = engine.start_run(agentux_api::rpc::StartRun {
+            project_id: project.id.clone(),
+            prompt: Some("Fix it".into()),
+            roles: [(role.to_string(), harness.to_string())].into(),
+            ..Default::default()
+        });
+        assert!(
+            matches!(result, Err(Error::InvalidParams(_))),
+            "{role} {harness}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_built_in_pipeline_uses_installed_harnesses() {
+    let f = fixture(&pipeline("true"));
+    std::fs::remove_file(f.repo.join("agentux.yaml")).unwrap();
+    for (installed, planner, implementer, reviewer) in [
+        (&["opencode"][..], "opencode", "opencode", "opencode"),
+        (
+            &["opencode", "antigravity"][..],
+            "opencode",
+            "opencode",
+            "antigravity",
+        ),
+        (
+            &["claude-code", "opencode"][..],
+            "claude-code",
+            "claude-code",
+            "opencode",
+        ),
+        (
+            &["claude-code", "codex"][..],
+            "claude-code",
+            "claude-code",
+            "codex",
+        ),
+        // Nothing installed: the defaults stay, and the run says what is missing.
+        (&[][..], "claude-code", "claude-code", "codex"),
+    ] {
+        let list: Vec<String> = installed.iter().map(|s| s.to_string()).collect();
+        let settings = agentuxd::Settings {
+            harnesses: agentuxd::HarnessProbe::new(move |id| match id {
+                // Installed but signed out: never picked.
+                "codex" if !list.iter().any(|h| h == id) => (true, Some(false)),
+                _ => (list.iter().any(|h| h == id), None),
+            }),
+            ..Default::default()
+        };
+        let database = f.tmp.path().join(format!("db-{}", installed.join("-")));
+        let engine = agentuxd::Engine::with_settings(
+            agentux_store::Store::open(&database).unwrap(),
+            Arc::new(FakeExecutor::default()),
+            settings,
+        );
+        let project = engine
+            .register_project(f.repo.to_str().unwrap())
+            .await
+            .unwrap();
+        let run = engine
+            .start_run(agentux_api::rpc::StartRun {
+                project_id: project.id,
+                prompt: Some("Fix it".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            (
+                run.roles["planner"].as_str(),
+                run.roles["implementer"].as_str(),
+                run.roles["reviewer"].as_str()
+            ),
+            (planner, implementer, reviewer),
+            "installed: {installed:?}"
+        );
+        let harnesses = engine.harnesses();
+        assert_eq!(harnesses.len(), 4);
+        for h in harnesses {
+            let expected = installed.contains(&h.id.as_str()) || h.id == "codex";
+            assert_eq!(h.installed, expected, "{}", h.id);
+        }
+        engine.shutdown();
+    }
+}

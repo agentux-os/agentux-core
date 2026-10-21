@@ -20,7 +20,8 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 |---|---|---|
 | `projects.register` | `{ path }` — absolute path inside a git repository | `Project` (idempotent per repository) |
 | `projects.list` | — | `Project[]` |
-| `runs.start` | `{ projectId, prompt?, issue?, title? }` — `prompt` or `issue` required | `Run` |
+| `runs.start` | `{ projectId, prompt?, issue?, title?, roles? }` — `prompt` or `issue` required; `roles` maps role names to harness ids for this run | `Run` |
+| `harnesses.list` | none | `[{ id, command, installed, signedIn, experimental }]`: the built-in harnesses, whether each one's vendor program (`command`) is on the daemon's `PATH`, and whether the user signed in to it (`null`: cannot tell) |
 | `runs.list` | `{ projectId? }` | `Run[]`, newest first |
 | `runs.get` | `{ runId }` | `{ run: Run, attempts: StepAttempt[], requests: PermissionRequest[], sessions: Session[] }` |
 | `runs.cancel` | `{ runId }` | `Run` |
@@ -43,7 +44,11 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `bus.hello` | `{ sessionToken }` | `{ identity, allowedTools, maxTurnsPerExchange }` — bus bridge only, see [Agent bus](#agent-bus) |
 | `bus.call` | `{ sessionToken, call }` | `{ ok: <tool result> }` or `{ err: <refusal> }` — bus bridge only |
 
-`runs.start` reads the project's `agentux.yaml` at that moment and stores it with the run; editing the file later does not affect a run in progress. Without the file, the built-in default pipeline applies.
+`runs.start` reads the project's `agentux.yaml` at that moment and stores it with the run; editing the file later does not affect a run in progress. Without the file, the built-in default pipeline applies, with the harnesses you can use: installed, and not known to be signed out (`harnesses.list`). Each role keeps its default harness (Claude Code to plan and implement, Codex to review) when that one is usable, and otherwise takes the first usable one, in the order of `harnesses.list`; the reviewer prefers a different harness than the implementer. When none is usable, the defaults stay, and the run fails with what is missing when it reaches a role.
+
+Sign-in is read from where each CLI keeps it: `~/.claude/.credentials.json` or `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` for Claude Code, `$CODEX_HOME/auth.json` (`~/.codex`) or `OPENAI_API_KEY` for Codex, OpenCode's `auth.json` under `$XDG_DATA_HOME/opencode`, and `~/.gemini/antigravity-cli/antigravity-oauth-token` for Antigravity. OpenCode can also take keys from its config, and Antigravity may keep its token elsewhere, so for those two a missing file is `null`, not signed out.
+
+`roles` overrides the harness of the pipeline's roles for this run (`{"implementer": "opencode", "reviewer": "antigravity"}`). A role the pipeline does not have, or an unknown harness id, is `-32602`. A role's `model` is dropped when its harness is replaced. The run's `roles` field shows what each role got.
 
 ### Errors
 

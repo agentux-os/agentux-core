@@ -74,6 +74,53 @@ impl HarnessSpec {
         Some(line.iter().map(|s| s.to_string()).collect())
     }
 
+    /// The program the user installs and signs in to for this harness: the
+    /// vendor's CLI. The npx adapters of Claude Code and Codex use the CLI's
+    /// sign-in, so without it a run would start and fail.
+    pub fn cli(&self) -> &str {
+        match self.id.as_str() {
+            "claude-code" => "claude",
+            "codex" => "codex",
+            _ => &self.command,
+        }
+    }
+
+    /// Whether [`HarnessSpec::cli`] and the command are on `PATH`.
+    pub fn installed(&self) -> bool {
+        on_path(self.cli()) && on_path(&self.command)
+    }
+
+    /// Whether the user signed in to the vendor's CLI, from where each CLI
+    /// keeps its sign-in, or the API key variables it reads. `None` when
+    /// that cannot be told: OpenCode can take its keys from its config, and
+    /// a missing Antigravity token file may only be a newer layout.
+    pub fn signed_in(&self) -> Option<bool> {
+        use std::path::PathBuf;
+        let home = std::env::var_os("HOME").map(PathBuf::from)?;
+        let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+        let file = |path: PathBuf| path.metadata().is_ok_and(|m| m.len() > 0);
+        match self.id.as_str() {
+            "claude-code" => Some(
+                file(home.join(".claude/.credentials.json"))
+                    || var("ANTHROPIC_API_KEY").is_some()
+                    || var("CLAUDE_CODE_OAUTH_TOKEN").is_some(),
+            ),
+            "codex" => {
+                let dir = var("CODEX_HOME").map_or_else(|| home.join(".codex"), PathBuf::from);
+                Some(file(dir.join("auth.json")) || var("OPENAI_API_KEY").is_some())
+            }
+            "opencode" => {
+                let data =
+                    var("XDG_DATA_HOME").map_or_else(|| home.join(".local/share"), PathBuf::from);
+                file(data.join("opencode/auth.json")).then_some(true)
+            }
+            "antigravity" => {
+                file(home.join(".gemini/antigravity-cli/antigravity-oauth-token")).then_some(true)
+            }
+            _ => None,
+        }
+    }
+
     /// The command line, for messages.
     pub fn command_line(&self) -> String {
         std::iter::once(self.command.as_str())
@@ -81,6 +128,30 @@ impl HarnessSpec {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// Whether `program` is an executable file in a `PATH` directory (or, with
+/// a slash, at that path).
+fn on_path(program: &str) -> bool {
+    use std::path::Path;
+    fn executable(path: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            path.metadata()
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            path.is_file()
+        }
+    }
+    if program.contains('/') {
+        return executable(Path::new(program));
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| executable(&dir.join(program)))
+    })
 }
 
 #[cfg(test)]
@@ -112,6 +183,23 @@ mod tests {
         assert_eq!(line("codex").unwrap(), ["codex", "resume", "abc"]);
         assert_eq!(line("opencode").unwrap(), ["opencode", "--session", "abc"]);
         assert_eq!(line("antigravity"), None);
+    }
+
+    #[test]
+    fn cli_is_the_vendor_program() {
+        let cli = |id: &str| HarnessSpec::find(id).unwrap().cli().to_string();
+        assert_eq!(cli("claude-code"), "claude");
+        assert_eq!(cli("codex"), "codex");
+        assert_eq!(cli("opencode"), "opencode");
+        assert_eq!(cli("antigravity"), "agy-acp-server");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_looks_on_path() {
+        assert!(on_path("sh"));
+        assert!(on_path("/bin/sh"));
+        assert!(!on_path("agentux-no-such-program"));
     }
 
     #[test]

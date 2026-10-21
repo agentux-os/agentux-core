@@ -27,7 +27,7 @@ mod terminal;
 
 pub use acp::{AcpExecutor, HarnessLauncher, LaunchSpec, Launcher};
 pub use bus::{BusLink, aux_binary};
-pub use engine::{Engine, Settings, TuiCommands};
+pub use engine::{Engine, HarnessProbe, Settings, TuiCommands};
 pub use executor::{FakeExecutor, HelperTask, StepExecutor, StepHost};
 
 /// Command-line options shared by `agentuxd` and `aux daemon`.

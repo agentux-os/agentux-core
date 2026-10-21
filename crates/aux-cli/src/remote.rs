@@ -182,6 +182,7 @@ impl Remote {
                 title,
                 prompt,
                 issue,
+                ..Default::default()
             })
             .await?;
         println!("{}", run.id);
