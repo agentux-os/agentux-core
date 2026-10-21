@@ -145,6 +145,9 @@ string_enum!(
         Credits => "credits",
         /// A short rate limit (HTTP 429), or a daily quota.
         Rate => "rate",
+        /// The agent stopped responding in a turn and the daemon gave up on
+        /// it; tried again after a while.
+        Stalled => "stalled",
     }
 );
 
