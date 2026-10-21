@@ -14,6 +14,7 @@ agentux-api = { path = "crates/agentux-api" }
 agentux-bus = { path = "crates/agentux-bus" }
 agentux-config = { path = "crates/agentux-config" }
 agentux-fake-agent = { path = "crates/agentux-fake-agent" }
+agentux-gateway = { path = "crates/agentux-gateway" }
 agentux-harness = { path = "crates/agentux-harness" }
 agentux-store = { path = "crates/agentux-store" }
 agentux-worktree = { path = "crates/agentux-worktree" }
@@ -25,6 +26,7 @@ crossterm = { version = "0.29", default-features = false }
 jiff = "0.2"
 portable-pty = "0.9"
 regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "3.5", default-features = false }
 rusqlite = { version = "0.40", features = ["bundled"] }
 schemars = "1"

@@ -37,22 +37,26 @@ drives it over a local Unix socket. Includes a systemd user unit for agentuxd.
 install -Dpm 0755 %{srcroot}/target/release/aux      %{buildroot}%{_bindir}/aux
 install -Dpm 0755 %{srcroot}/target/release/agentuxd %{buildroot}%{_bindir}/agentuxd
 install -Dpm 0644 %{srcroot}/contrib/agentuxd.service %{buildroot}%{_userunitdir}/agentuxd.service
+install -Dpm 0644 %{srcroot}/contrib/agentux-gateway.service %{buildroot}%{_userunitdir}/agentux-gateway.service
 install -Dpm 0644 %{srcroot}/LICENSE   %{buildroot}%{_licensedir}/%{name}/LICENSE
 install -Dpm 0644 %{srcroot}/README.md %{buildroot}%{_docdir}/%{name}/README.md
 install -Dpm 0644 %{srcroot}/docs/api.md %{buildroot}%{_docdir}/%{name}/api.md
+install -Dpm 0644 %{srcroot}/docs/gateway.md %{buildroot}%{_docdir}/%{name}/gateway.md
 
 %post
-%systemd_user_post agentuxd.service
+%systemd_user_post agentuxd.service agentux-gateway.service
 
 %preun
-%systemd_user_preun agentuxd.service
+%systemd_user_preun agentuxd.service agentux-gateway.service
 
 %files
 %{_bindir}/aux
 %{_bindir}/agentuxd
 %{_userunitdir}/agentuxd.service
+%{_userunitdir}/agentux-gateway.service
 %dir %{_licensedir}/%{name}
 %license %{_licensedir}/%{name}/LICENSE
 %dir %{_docdir}/%{name}
 %doc %{_docdir}/%{name}/README.md
 %doc %{_docdir}/%{name}/api.md
+%doc %{_docdir}/%{name}/gateway.md
