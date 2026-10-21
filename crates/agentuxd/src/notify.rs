@@ -9,7 +9,9 @@ use std::sync::Arc;
 /// Shows a notification `(title, body)`. The daemon's sends one to the
 /// desktop; the default (tests) does nothing.
 #[derive(Clone)]
-pub struct Notifier(Arc<dyn Fn(&str, &str) + Send + Sync>);
+pub struct Notifier(Arc<NotifyFn>);
+
+type NotifyFn = dyn Fn(&str, &str) + Send + Sync;
 
 impl Notifier {
     pub fn new(f: impl Fn(&str, &str) + Send + Sync + 'static) -> Self {
