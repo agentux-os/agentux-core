@@ -68,6 +68,7 @@ async fn reports_the_node_its_agents_and_limits() {
                     organization_id: "org-demo".into(),
                     node_id: "node-01".into(),
                     token: "t".into(),
+                    command_instance_id: None,
                 },
                 socket,
                 recorder,
@@ -175,10 +176,22 @@ async fn commands_run_wait_for_the_node_or_are_refused() {
     let policy = Policy::default();
     let pending = Pending::new(dir.path().join("pending.json"));
     let mut answers = Answers::default();
+    let node = NodeConfig {
+        command_url: "http://localhost:9".into(),
+        organization_id: "org".into(),
+        node_id: "node-01".into(),
+        token: "t".into(),
+        command_instance_id: Some("cmd-0123456789abcdef".into()),
+    };
+    let other_node = NodeConfig {
+        node_id: "node-02".into(),
+        ..node.clone()
+    };
     let request = |id: &str, method: &str, extra: serde_json::Value| {
         let mut params = json!({
             "protocolVersion": "v1", "organizationId": "org", "nodeId": "node-01",
             "messageId": id, "occurredAt": "2026-10-21T12:00:00Z", "commandId": id,
+            "commandInstanceId": "cmd-0123456789abcdef",
         });
         params
             .as_object_mut()
@@ -190,7 +203,7 @@ async fn commands_run_wait_for_the_node_or_are_refused() {
     // Allowed: runs at once.
     let listed = commands::handle(
         &mut client,
-        "node-01",
+        &node,
         &policy,
         &pending,
         &mut answers,
@@ -208,7 +221,7 @@ async fn commands_run_wait_for_the_node_or_are_refused() {
     // For another node, or with a credential: refused.
     let other = commands::handle(
         &mut client,
-        "node-02",
+        &other_node,
         &policy,
         &pending,
         &mut answers,
@@ -218,7 +231,7 @@ async fn commands_run_wait_for_the_node_or_are_refused() {
     assert_eq!(other.response["error"]["code"], commands::INVALID_PARAMS);
     let secret = commands::handle(
         &mut client,
-        "node-01",
+        &node,
         &policy,
         &pending,
         &mut answers,
@@ -227,10 +240,36 @@ async fn commands_run_wait_for_the_node_or_are_refused() {
     .await;
     assert_eq!(secret.response["error"]["code"], commands::INVALID_PARAMS);
 
+    // From another Command server, or for another organization: denied.
+    let mut foreign = request("c6", "harness.list", json!({}));
+    foreign["params"]["commandInstanceId"] = json!("cmd-ffffffffffffffff");
+    let refused = commands::handle(
+        &mut client,
+        &node,
+        &policy,
+        &pending,
+        &mut answers,
+        &foreign,
+    )
+    .await;
+    assert_eq!(refused.response["error"]["code"], commands::DENIED);
+    let mut other_org = request("c7", "harness.list", json!({}));
+    other_org["params"]["organizationId"] = json!("someone-else");
+    let refused = commands::handle(
+        &mut client,
+        &node,
+        &policy,
+        &pending,
+        &mut answers,
+        &other_org,
+    )
+    .await;
+    assert_eq!(refused.response["error"]["code"], commands::DENIED);
+
     // Unknown to the policy: denied, with an event.
     let shell = commands::handle(
         &mut client,
-        "node-01",
+        &node,
         &policy,
         &pending,
         &mut answers,
@@ -249,26 +288,10 @@ async fn commands_run_wait_for_the_node_or_are_refused() {
         "run.start",
         json!({"repository": "https://github.com/acme/app", "prompt": "Fix it"}),
     );
-    let held = commands::handle(
-        &mut client,
-        "node-01",
-        &policy,
-        &pending,
-        &mut answers,
-        &start,
-    )
-    .await;
+    let held = commands::handle(&mut client, &node, &policy, &pending, &mut answers, &start).await;
     assert_eq!(held.response["error"]["code"], commands::HELD);
     assert_eq!(held.event.as_ref().unwrap().0, "command.denied");
-    let again = commands::handle(
-        &mut client,
-        "node-01",
-        &policy,
-        &pending,
-        &mut answers,
-        &start,
-    )
-    .await;
+    let again = commands::handle(&mut client, &node, &policy, &pending, &mut answers, &start).await;
     assert_eq!(again.response, held.response);
     assert!(again.event.is_none());
     assert_eq!(pending.list().len(), 1);

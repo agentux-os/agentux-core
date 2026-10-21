@@ -197,16 +197,19 @@ enum Command {
 
 #[derive(Subcommand)]
 enum NodeCommand {
-    /// Register this node with a Command server. The node token is read
-    /// from $AGENTUX_NODE_TOKEN, or from the first line of stdin, so it
-    /// stays out of the shell history
+    /// Join a Command server with an enrollment token it issued
+    /// (auxe1_...). The token is read from $AGENTUX_NODE_TOKEN, or from the
+    /// first line of stdin, so it stays out of the shell history. The node
+    /// pins the server's instance id and takes commands from it only
     Enroll {
         /// Command's URL (https://...; http only to this machine)
         url: String,
-        /// The organization the node belongs to
+        /// The organization, only for a static token (an enrollment token
+        /// carries it)
         #[arg(long)]
-        organization: String,
-        /// The node's id at Command [default: node-<hostname>]
+        organization: Option<String>,
+        /// The node's name at Command [default: from the token, else
+        /// node-<hostname>]
         #[arg(long)]
         node_id: Option<String>,
     },
@@ -339,25 +342,65 @@ fn node(socket: Option<PathBuf>, command: NodeCommand) -> Result {
                     line
                 }
             };
-            let config = agentux_gateway::NodeConfig {
-                command_url: url.trim().trim_end_matches('/').to_string(),
-                organization_id: organization.trim().to_string(),
-                node_id: node_id.unwrap_or_else(agentux_gateway::default_node_id),
-                token: token.trim().to_string(),
+            let token = token.trim().to_string();
+            let (config, waiting) = if agentux_gateway::token_instance(&token).is_some() {
+                let hostname = agentux_gateway::default_node_id();
+                let hostname = hostname.trim_start_matches("node-").to_string();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(agentux_gateway::enroll(
+                        &url,
+                        &token,
+                        node_id.as_deref(),
+                        &hostname,
+                    ))?
+            } else {
+                // A static token, set on the server (AGENTUX_COMMAND_NODE_TOKENS).
+                let organization = organization.ok_or(
+                    "this is not an enrollment token (auxe1_...); a static token needs --organization",
+                )?;
+                let config = agentux_gateway::NodeConfig {
+                    command_url: url.trim().trim_end_matches('/').to_string(),
+                    organization_id: organization.trim().to_string(),
+                    node_id: node_id.unwrap_or_else(agentux_gateway::default_node_id),
+                    token,
+                    command_instance_id: None,
+                };
+                (config, false)
             };
             agentux_gateway::save_config(&config_path, &config)?;
             println!(
-                "enrolled {} in {} at {}; start the gateway with `aux node gateway` \
-                 (on AgentUX: systemctl --user enable --now agentux-gateway)",
-                config.node_id, config.organization_id, config.command_url
+                "enrolled {} in {} at {}{}",
+                config.node_id,
+                config.organization_id,
+                config.command_url,
+                config
+                    .command_instance_id
+                    .as_deref()
+                    .map(|i| format!(" (Command {i})"))
+                    .unwrap_or_default()
+            );
+            if waiting {
+                println!("an operator has to approve this node at Command before it reports");
+            }
+            println!(
+                "start the gateway with `aux node gateway` (on AgentUX: systemctl --user enable --now agentux-gateway)"
             );
             Ok(())
         }
         NodeCommand::Status => {
             match agentux_gateway::load_config(&config_path)? {
                 Some(config) => println!(
-                    "node {} of {} reports to {}",
-                    config.node_id, config.organization_id, config.command_url
+                    "node {} of {} reports to {}{}",
+                    config.node_id,
+                    config.organization_id,
+                    config.command_url,
+                    config
+                        .command_instance_id
+                        .as_deref()
+                        .map(|i| format!(" (Command {i}, pinned)"))
+                        .unwrap_or_else(|| " (static token, not pinned)".into())
                 ),
                 None => println!("not enrolled with a Command server (aux node enroll)"),
             }

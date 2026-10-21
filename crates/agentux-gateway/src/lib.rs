@@ -68,7 +68,105 @@ pub struct NodeConfig {
     pub node_id: String,
     /// The node's own, scoped credential at Command.
     pub token: String,
+    /// The Command server's instance id, pinned at enrollment: the node
+    /// stops talking to a server that answers with another one, and refuses
+    /// its commands. `None` for nodes set up with a static token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_instance_id: Option<String>,
 }
+
+/// What a Command server's enrollment gives a node.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Enrolled {
+    instance_id: String,
+    organization_id: String,
+    node_id: String,
+    node_secret: String,
+    approved: bool,
+}
+
+/// The instance id an enrollment token names (`auxe1_<instanceId>_<secret>`).
+pub fn token_instance(token: &str) -> Option<&str> {
+    let rest = token.trim().strip_prefix("auxe1_")?;
+    let (instance, secret) = rest.split_once('_')?;
+    (instance.starts_with("cmd-") && instance.len() == 20 && secret.len() == 64).then_some(instance)
+}
+
+/// Joins the Command server at `url` with an enrollment token it issued:
+/// first checks the server is the one the token names (so the token never
+/// goes to another server), then trades it for this node's credential.
+/// Returns the config to save, and whether an operator still has to approve
+/// the node.
+pub async fn enroll(
+    url: &str,
+    token: &str,
+    node_name: Option<&str>,
+    hostname: &str,
+) -> Result<(NodeConfig, bool), String> {
+    let url = url.trim().trim_end_matches('/').to_string();
+    let probe = NodeConfig {
+        command_url: url.clone(),
+        organization_id: "-".into(),
+        node_id: "-".into(),
+        token: "-".into(),
+        command_instance_id: None,
+    };
+    probe.validate()?;
+    let wanted = token_instance(token).ok_or("this is not an AgentUX Command enrollment token")?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .user_agent(concat!("agentux-gateway/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let instance: Value = client
+        .get(format!("{url}/v1/instance"))
+        .send()
+        .await
+        .map_err(|e| format!("cannot reach Command at {url}: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("{url} is not an AgentUX Command server: {e}"))?;
+    let actual = instance["instanceId"].as_str().unwrap_or_default();
+    if actual != wanted {
+        return Err(format!(
+            "{url} is Command server {actual}, but the token was issued by {wanted}: ask for a token from this server, or use that server's address"
+        ));
+    }
+    let response = client
+        .post(format!("{url}/v1/enroll"))
+        .json(&json!({ "token": token.trim(), "nodeName": node_name, "hostname": hostname }))
+        .send()
+        .await
+        .map_err(|e| format!("cannot reach Command at {url}: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body: Value = response.json().await.unwrap_or_default();
+        return Err(format!(
+            "Command refused the token ({status}): {}",
+            body["error"].as_str().unwrap_or("no reason given")
+        ));
+    }
+    let enrolled: Enrolled = response
+        .json()
+        .await
+        .map_err(|e| format!("unexpected answer from Command: {e}"))?;
+    if enrolled.instance_id != wanted {
+        return Err("Command answered for another instance".into());
+    }
+    let config = NodeConfig {
+        command_url: url,
+        organization_id: enrolled.organization_id,
+        node_id: enrolled.node_id,
+        token: enrolled.node_secret,
+        command_instance_id: Some(enrolled.instance_id),
+    };
+    config.validate()?;
+    Ok((config, !enrolled.approved))
+}
+
+/// The error a pinned node returns when it reached another Command server.
+pub const INSTANCE_MISMATCH: &str = "Command instance mismatch";
 
 impl NodeConfig {
     /// Checks the URL and names.
@@ -427,6 +525,7 @@ pub struct Http {
     client: reqwest::Client,
     url: String,
     token: String,
+    pinned: Option<String>,
 }
 
 impl Http {
@@ -440,6 +539,7 @@ impl Http {
             client,
             url: config.endpoint(),
             token: config.token.clone(),
+            pinned: config.command_instance_id.clone(),
         })
     }
 }
@@ -455,10 +555,25 @@ impl Sink for Http {
             .await
             .map_err(|e| format!("cannot reach Command: {e}"))?;
         let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        // A pinned node checks every answer that names the server.
+        if let Some(pinned) = &self.pinned {
+            let answer: Value = serde_json::from_str(&body).unwrap_or_default();
+            let named = answer["result"]["instanceId"]
+                .as_str()
+                .or_else(|| answer["instanceId"].as_str());
+            if let Some(named) = named
+                && named != pinned
+            {
+                return Err(format!(
+                    "{INSTANCE_MISMATCH}: {} answers as {named}, this node enrolled with {pinned}",
+                    self.url
+                ));
+            }
+        }
         if status.is_success() {
             return Ok(());
         }
-        let body = response.text().await.unwrap_or_default();
         Err(format!("Command answered {status}: {}", body.trim()))
     }
 }
@@ -630,6 +745,10 @@ async fn run_loop(
                         log("Command is reachable again");
                     }
                     Ok(_) => {}
+                    Err(e) if e.starts_with(INSTANCE_MISMATCH) => {
+                        log(&e);
+                        return Err(e);
+                    }
                     Err(e) if reachable => {
                         reachable = false;
                         log(&format!(
@@ -654,7 +773,17 @@ mod tests {
             organization_id: "org-demo".into(),
             node_id: "node-01".into(),
             token: "secret".into(),
+            command_instance_id: Some("cmd-0123456789abcdef".into()),
         }
+    }
+
+    #[test]
+    fn enrollment_tokens_name_their_server() {
+        let token = format!("auxe1_cmd-0123456789abcdef_{}", "a".repeat(64));
+        assert_eq!(token_instance(&token), Some("cmd-0123456789abcdef"));
+        assert_eq!(token_instance("auxn1_abc"), None);
+        assert_eq!(token_instance("auxe1_cmd-0123456789abcdef_short"), None);
+        assert_eq!(token_instance("a static token"), None);
     }
 
     #[test]
