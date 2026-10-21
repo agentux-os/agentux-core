@@ -61,7 +61,11 @@ pub fn lookup(var: &str) -> Option<String> {
 /// `$CREDENTIALS_DIRECTORY/<VAR>`, as systemd passes credentials to a unit.
 fn credential(var: &str) -> Option<String> {
     let dir = std::env::var_os("CREDENTIALS_DIRECTORY").filter(|v| !v.is_empty())?;
-    let key = std::fs::read_to_string(std::path::Path::new(&dir).join(var)).ok()?;
+    credential_in(std::path::Path::new(&dir), var)
+}
+
+fn credential_in(dir: &std::path::Path, var: &str) -> Option<String> {
+    let key = std::fs::read_to_string(dir.join(var)).ok()?;
     let key = key.trim();
     (!key.is_empty()).then(|| key.to_string())
 }
@@ -110,14 +114,26 @@ mod tests {
     }
 
     #[test]
-    fn systemd_credentials_come_first() {
+    fn systemd_credentials_are_read_trimmed() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("AGENTUX_TEST_CRED"), " sk-test\n").unwrap();
-        // SAFETY of the test: no other test reads this variable.
-        unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", dir.path()) };
-        assert_eq!(lookup("AGENTUX_TEST_CRED").as_deref(), Some("sk-test"));
-        unsafe { std::env::remove_var("CREDENTIALS_DIRECTORY") };
-        assert_eq!(credential("AGENTUX_TEST_CRED"), None);
+        std::fs::write(
+            dir.path().join("ANTHROPIC_API_KEY"),
+            " sk-test
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("OPENAI_API_KEY"),
+            "
+",
+        )
+        .unwrap();
+        assert_eq!(
+            credential_in(dir.path(), "ANTHROPIC_API_KEY").as_deref(),
+            Some("sk-test")
+        );
+        assert_eq!(credential_in(dir.path(), "OPENAI_API_KEY"), None);
+        assert_eq!(credential_in(dir.path(), "GEMINI_API_KEY"), None);
     }
 
     #[test]
