@@ -705,6 +705,7 @@ async fn a_harness_at_its_limit_hands_the_role_to_its_fallback() {
     assert!(
         engine
             .harnesses()
+            .await
             .iter()
             .any(|h| h.id == "codex" && h.limits.len() == 1)
     );
