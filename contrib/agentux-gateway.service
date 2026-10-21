@@ -1,0 +1,22 @@
+# systemd user unit for the AgentUX node gateway: reports this node to
+# AgentUX Command (docs/gateway.md). It only starts once the node is enrolled
+# (aux node enroll writes ~/.config/agentux/node.json):
+#
+#   systemctl --user enable --now agentux-gateway.service
+
+[Unit]
+Description=AgentUX node gateway (reports this node to AgentUX Command)
+Documentation=https://github.com/agentux-os/agentux-core/blob/main/docs/gateway.md
+ConditionUser=!@system
+ConditionPathExists=%h/.config/agentux/node.json
+Wants=agentuxd.service
+After=agentuxd.service network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/aux --socket %t/agentux/agentuxd.sock node gateway
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
