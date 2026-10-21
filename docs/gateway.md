@@ -24,4 +24,33 @@ aux node leave
 
 Messages are POSTed to `<command>/v1/protocol/messages` with `Authorization: Bearer <node token>`. Events carry a `sequence` that keeps growing across restarts (`~/.local/state/agentux/gateway.json`) and an `eventId` of `<nodeId>-<sequence>`. While Command is unreachable they wait in order (up to 5000, oldest dropped first) and go out when it answers again; runs go on regardless.
 
-Commands from Command (`run.start`, `request.resolve`, `preferences.set`, ...) come with the next phase, over a WebSocket the node opens, checked against the node's policy in `/etc/agentux/node-policy.yaml` (see the protocol's "Node policy").
+## Commands from Command
+
+The gateway also keeps a command connection open: a WebSocket to `<command>/v1/protocol/connect?nodeId=<id>` with the node token, reconnecting with backoff. Each command Command sends is checked, then run against the local agentuxd, held, or refused:
+
+- It must be for this node (`nodeId`), carry a `commandId`, and carry no credentials.
+- The node policy, `/etc/agentux/node-policy.yaml`, decides: `allow` runs it, `confirm` holds it, `deny` refuses it. Methods the policy does not know are refused. `aux node status` shows the policy in force.
+
+```yaml
+commands:
+  run.start: confirm        # default
+  preferences.set: confirm  # default
+  limits.clear: deny
+```
+
+| Method | Default | What it does on the node |
+|---|---|---|
+| `run.snapshot`, `harness.list`, `harness.test` | allow | `runs.get`, `harnesses.list`, `harnesses.test` |
+| `run.cancel`, `request.resolve`, `bus.post`, `limits.clear` | allow | cancel a run, approve or deny a request (`resolution`, `answer`), post on a run's bus (`message.body`, `message.to`), lift a limit |
+| `run.pause`, `run.resume` | allow | not implemented by agentuxd yet: `-32601` |
+| `run.start`, `preferences.set` | confirm | start a run on the project whose origin is `repository` (cloned into `~/src` when the node has none), with optional `agents` and `models` per role; replace the agent preferences |
+
+A held command answers `-32010` and sends `command.denied` (`awaiting_local_confirmation`); a refused one answers `-32011` (`denied_by_policy`). Held commands wait in `~/.local/state/agentux/gateway-pending.json`:
+
+```sh
+aux node pending              # what Command asked for
+aux node confirm <commandId>  # run it (within a few seconds)
+aux node reject <commandId>
+```
+
+Either way a `command.completed` event reports the outcome under the original `commandId`. A command sent again with the same `commandId` gets the first answer.

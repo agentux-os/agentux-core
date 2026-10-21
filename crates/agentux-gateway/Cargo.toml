@@ -9,11 +9,14 @@ publish.workspace = true
 
 [dependencies]
 agentux-api.workspace = true
+futures-util.workspace = true
 jiff.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde-saphyr.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "process", "rt", "sync", "time"] }
+tokio-tungstenite.workspace = true
 
 [dev-dependencies]
 agentux-store.workspace = true

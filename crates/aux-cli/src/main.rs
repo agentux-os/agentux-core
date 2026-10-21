@@ -204,6 +204,13 @@ enum NodeCommand {
     Status,
     /// Forget the Command server: the gateway stops reporting
     Leave,
+    /// List the commands from Command waiting for someone here to accept
+    /// them (the node policy's `confirm`)
+    Pending,
+    /// Accept a waiting command: the gateway runs it
+    Confirm { command_id: String },
+    /// Reject a waiting command
+    Reject { command_id: String },
     /// Run the gateway in the foreground: report this node to Command
     /// (agentux-os runs it as the agentux-gateway user service)
     Gateway,
@@ -343,8 +350,38 @@ fn node(socket: Option<PathBuf>, command: NodeCommand) -> Result {
                 ),
                 None => println!("not enrolled with a Command server (aux node enroll)"),
             }
+            let path = agentux_gateway::commands::policy_path();
+            let policy = agentux_gateway::policy::Policy::load(path)?;
+            println!("commands from Command ({}):", path.display());
+            for (method, decision) in policy.entries() {
+                println!("  {method:<16} {decision:?}");
+            }
             Ok(())
         }
+        NodeCommand::Pending => {
+            let pending = agentux_gateway::commands::Pending::new(
+                agentux_gateway::commands::pending_path().ok_or("HOME is not set")?,
+            );
+            let held = pending.list();
+            if held.is_empty() {
+                println!("no command from Command is waiting");
+            }
+            for h in held {
+                println!(
+                    "{}  {}  {}{}\n  {}",
+                    h.command_id,
+                    h.method,
+                    h.received_at,
+                    h.decision
+                        .map(|d| format!("  ({d}ed, running soon)"))
+                        .unwrap_or_default(),
+                    h.params
+                );
+            }
+            Ok(())
+        }
+        NodeCommand::Confirm { command_id } => decide_command(&command_id, true),
+        NodeCommand::Reject { command_id } => decide_command(&command_id, false),
         NodeCommand::Leave => {
             match std::fs::remove_file(&config_path) {
                 Ok(()) => println!("left Command; the gateway stops at its next start"),
@@ -362,6 +399,12 @@ fn node(socket: Option<PathBuf>, command: NodeCommand) -> Result {
                     .ok_or("XDG_RUNTIME_DIR is not set; pass --socket")?,
             };
             let sink = agentux_gateway::Http::new(&config)?;
+            let commands = agentux_gateway::channel::CommandOptions {
+                policy: agentux_gateway::policy::Policy::load(
+                    agentux_gateway::commands::policy_path(),
+                )?,
+                pending: agentux_gateway::commands::pending_path().ok_or("HOME is not set")?,
+            };
             eprintln!(
                 "agentux-gateway: reporting {} to {}",
                 config.node_id, config.command_url
@@ -375,6 +418,7 @@ fn node(socket: Option<PathBuf>, command: NodeCommand) -> Result {
                 sink,
                 agentux_gateway::state_path(),
                 env!("CARGO_PKG_VERSION"),
+                Some(commands),
                 |line| eprintln!("agentux-gateway: {line}"),
                 async {
                     let _ = tokio::signal::ctrl_c().await;
@@ -383,6 +427,21 @@ fn node(socket: Option<PathBuf>, command: NodeCommand) -> Result {
             Ok(())
         }
     }
+}
+
+fn decide_command(command_id: &str, accept: bool) -> Result {
+    let pending = agentux_gateway::commands::Pending::new(
+        agentux_gateway::commands::pending_path().ok_or("HOME is not set")?,
+    );
+    let held = pending.decide(command_id, accept)?;
+    println!(
+        "{} {} ({}); the gateway {} it within a few seconds",
+        if accept { "accepted" } else { "rejected" },
+        held.command_id,
+        held.method,
+        if accept { "runs" } else { "reports" }
+    );
+    Ok(())
 }
 
 fn daemon(options: agentuxd::Options) -> Result {

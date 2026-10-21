@@ -73,6 +73,7 @@ async fn reports_the_node_its_agents_and_limits() {
                 recorder,
                 Some(state),
                 "0.4.8",
+                None,
                 |_| {},
                 async {
                     let _ = stop.await;
@@ -140,6 +141,147 @@ async fn reports_the_node_its_agents_and_limits() {
 
     stop_gateway.send(()).unwrap();
     gateway.await.unwrap().unwrap();
+    stop_daemon.send(()).unwrap();
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commands_run_wait_for_the_node_or_are_refused() {
+    use agentux_gateway::commands::{self, Answers, Pending};
+    use agentux_gateway::policy::Policy;
+    use serde_json::json;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agentuxd.sock");
+    let engine = Engine::new(
+        Store::open(&dir.path().join("agentuxd.db")).unwrap(),
+        Arc::new(FakeExecutor::default()),
+    );
+    let (stop_daemon, stopped) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let engine = engine.clone();
+        let socket = socket.clone();
+        async move {
+            agentuxd::server::serve(engine, &socket, async {
+                let _ = stopped.await;
+            })
+            .await
+        }
+    });
+    while !socket.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut client = agentux_api::Client::connect(&socket).await.unwrap();
+    let policy = Policy::default();
+    let pending = Pending::new(dir.path().join("pending.json"));
+    let mut answers = Answers::default();
+    let request = |id: &str, method: &str, extra: serde_json::Value| {
+        let mut params = json!({
+            "protocolVersion": "v1", "organizationId": "org", "nodeId": "node-01",
+            "messageId": id, "occurredAt": "2026-10-21T12:00:00Z", "commandId": id,
+        });
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    };
+
+    // Allowed: runs at once.
+    let listed = commands::handle(
+        &mut client,
+        "node-01",
+        &policy,
+        &pending,
+        &mut answers,
+        &request("c1", "harness.list", json!({})),
+    )
+    .await;
+    assert_eq!(
+        listed.response["result"].as_array().map(Vec::len),
+        Some(4),
+        "{}",
+        listed.response
+    );
+    assert!(listed.event.is_none());
+
+    // For another node, or with a credential: refused.
+    let other = commands::handle(
+        &mut client,
+        "node-02",
+        &policy,
+        &pending,
+        &mut answers,
+        &request("c2", "harness.list", json!({})),
+    )
+    .await;
+    assert_eq!(other.response["error"]["code"], commands::INVALID_PARAMS);
+    let secret = commands::handle(
+        &mut client,
+        "node-01",
+        &policy,
+        &pending,
+        &mut answers,
+        &request("c3", "harness.list", json!({"apiKey": "x"})),
+    )
+    .await;
+    assert_eq!(secret.response["error"]["code"], commands::INVALID_PARAMS);
+
+    // Unknown to the policy: denied, with an event.
+    let shell = commands::handle(
+        &mut client,
+        "node-01",
+        &policy,
+        &pending,
+        &mut answers,
+        &request("c4", "shell.exec", json!({})),
+    )
+    .await;
+    assert_eq!(shell.response["error"]["code"], commands::DENIED);
+    assert_eq!(
+        shell.event.as_ref().unwrap().1["reason"],
+        "denied_by_policy"
+    );
+
+    // Starting a run waits for the node; the same commandId gets the same answer.
+    let start = request(
+        "c5",
+        "run.start",
+        json!({"repository": "https://github.com/acme/app", "prompt": "Fix it"}),
+    );
+    let held = commands::handle(
+        &mut client,
+        "node-01",
+        &policy,
+        &pending,
+        &mut answers,
+        &start,
+    )
+    .await;
+    assert_eq!(held.response["error"]["code"], commands::HELD);
+    assert_eq!(held.event.as_ref().unwrap().0, "command.denied");
+    let again = commands::handle(
+        &mut client,
+        "node-01",
+        &policy,
+        &pending,
+        &mut answers,
+        &start,
+    )
+    .await;
+    assert_eq!(again.response, held.response);
+    assert!(again.event.is_none());
+    assert_eq!(pending.list().len(), 1);
+
+    // Rejected at the node: reported, not run.
+    pending.decide("c5", false).unwrap();
+    let events = commands::run_decided(&mut client, &pending).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "command.completed");
+    assert_eq!(events[0].1["ok"], false);
+    assert!(pending.list().is_empty());
+    assert!(engine.runs(None).unwrap().is_empty());
+
     stop_daemon.send(()).unwrap();
     server.await.unwrap().unwrap();
 }
