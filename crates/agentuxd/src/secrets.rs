@@ -116,18 +116,8 @@ mod tests {
     #[test]
     fn systemd_credentials_are_read_trimmed() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("ANTHROPIC_API_KEY"),
-            " sk-test
-",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("OPENAI_API_KEY"),
-            "
-",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("ANTHROPIC_API_KEY"), " sk-test\n").unwrap();
+        std::fs::write(dir.path().join("OPENAI_API_KEY"), "\n").unwrap();
         assert_eq!(
             credential_in(dir.path(), "ANTHROPIC_API_KEY").as_deref(),
             Some("sk-test")
