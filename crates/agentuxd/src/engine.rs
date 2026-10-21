@@ -131,7 +131,15 @@ impl Default for HarnessProbe {
     fn default() -> Self {
         Self::new(
             |harness| match agentux_harness::HarnessSpec::find(harness) {
-                Some(spec) => (spec.installed(), spec.signed_in()),
+                Some(spec) => {
+                    // A key in the secret service is a sign-in too.
+                    let signed_in = match spec.signed_in() {
+                        Some(true) => Some(true),
+                        _ if crate::secrets::has_key(harness) => Some(true),
+                        other => other,
+                    };
+                    (spec.installed(), signed_in)
+                }
                 None => (false, None),
             },
         )
