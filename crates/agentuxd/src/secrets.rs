@@ -50,9 +50,25 @@ pub fn has_key(harness: &str) -> bool {
     variables(harness).iter().any(|var| lookup(var).is_some())
 }
 
+/// The key for `var`: a systemd credential of that name first (servers
+/// without a desktop: `LoadCredential=` / `LoadCredentialEncrypted=` on
+/// agentuxd.service puts it in `$CREDENTIALS_DIRECTORY`), else the secret
+/// service. `None` when there is no such key.
+pub fn lookup(var: &str) -> Option<String> {
+    credential(var).or_else(|| keyring(var))
+}
+
+/// `$CREDENTIALS_DIRECTORY/<VAR>`, as systemd passes credentials to a unit.
+fn credential(var: &str) -> Option<String> {
+    let dir = std::env::var_os("CREDENTIALS_DIRECTORY").filter(|v| !v.is_empty())?;
+    let key = std::fs::read_to_string(std::path::Path::new(&dir).join(var)).ok()?;
+    let key = key.trim();
+    (!key.is_empty()).then(|| key.to_string())
+}
+
 /// `secret-tool lookup agentux-key VAR`; `None` when there is no such key,
 /// no secret service, no `secret-tool`, or no answer in time.
-pub fn lookup(var: &str) -> Option<String> {
+fn keyring(var: &str) -> Option<String> {
     let mut child = Command::new("secret-tool")
         .args(["lookup", "agentux-key", var])
         .stdin(Stdio::null())
@@ -91,6 +107,17 @@ mod tests {
         assert_eq!(variables("codex"), ["OPENAI_API_KEY"]);
         assert_eq!(variables("opencode").len(), VARIABLES.len());
         assert!(variables("fake").is_empty());
+    }
+
+    #[test]
+    fn systemd_credentials_come_first() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTUX_TEST_CRED"), " sk-test\n").unwrap();
+        // SAFETY of the test: no other test reads this variable.
+        unsafe { std::env::set_var("CREDENTIALS_DIRECTORY", dir.path()) };
+        assert_eq!(lookup("AGENTUX_TEST_CRED").as_deref(), Some("sk-test"));
+        unsafe { std::env::remove_var("CREDENTIALS_DIRECTORY") };
+        assert_eq!(credential("AGENTUX_TEST_CRED"), None);
     }
 
     #[test]

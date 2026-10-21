@@ -55,6 +55,13 @@ Sign-in is read from where each CLI keeps it: `~/.claude/.credentials.json` or `
 
 **API keys in the secret service.** A user service does not read `~/.bashrc`, so keys exported there never reach the daemon. Keys kept in the desktop's secret service under `agentux-key=<VARIABLE>` (the cockpit's Settings, or `secret-tool store --label="Anthropic API key" agentux-key ANTHROPIC_API_KEY`) are looked up when a harness starts and given to that harness's process only: `ANTHROPIC_API_KEY` to Claude Code, `OPENAI_API_KEY` to Codex, `GEMINI_API_KEY` to Antigravity, and all of them (with `OPENROUTER_API_KEY`) to OpenCode. A variable set in the daemon's own environment wins. Such a key counts as signed in.
 
+On a server without a desktop (no secret service), give agentuxd the keys as systemd credentials: they are read from `$CREDENTIALS_DIRECTORY/<VARIABLE>` first. For example, with `systemd-creds encrypt --user --name=ANTHROPIC_API_KEY key.txt ~/.config/credstore.encrypted/ANTHROPIC_API_KEY.cred` and a drop-in `~/.config/systemd/user/agentuxd.service.d/keys.conf`:
+
+```ini
+[Service]
+LoadCredentialEncrypted=ANTHROPIC_API_KEY:%h/.config/credstore.encrypted/ANTHROPIC_API_KEY.cred
+```
+
 `roles` overrides the harness of the pipeline's roles for this run (`{"implementer": "opencode", "reviewer": "antigravity"}`). A role the pipeline does not have, or an unknown harness id, is `-32602`. A role's `model` is dropped when its harness is replaced. The run's `roles` field shows what each role got.
 
 ### Errors
