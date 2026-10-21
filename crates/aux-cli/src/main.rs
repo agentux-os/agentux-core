@@ -180,6 +180,33 @@ enum Command {
     },
     /// Cancel a run (its worktree and branch are kept)
     Cancel { run_id: String },
+    /// Connect this node to AgentUX Command (the remote control plane)
+    #[command(subcommand)]
+    Node(NodeCommand),
+}
+
+#[derive(Subcommand)]
+enum NodeCommand {
+    /// Register this node with a Command server. The node token is read
+    /// from $AGENTUX_NODE_TOKEN, or from the first line of stdin, so it
+    /// stays out of the shell history
+    Enroll {
+        /// Command's URL (https://...; http only to this machine)
+        url: String,
+        /// The organization the node belongs to
+        #[arg(long)]
+        organization: String,
+        /// The node's id at Command [default: node-<hostname>]
+        #[arg(long)]
+        node_id: Option<String>,
+    },
+    /// Show where this node reports to (never the token)
+    Status,
+    /// Forget the Command server: the gateway stops reporting
+    Leave,
+    /// Run the gateway in the foreground: report this node to Command
+    /// (agentux-os runs it as the agentux-gateway user service)
+    Gateway,
 }
 
 #[derive(Subcommand)]
@@ -264,6 +291,7 @@ fn main() -> ExitCode {
             auto_approve_permissions,
         }),
         Command::Ps { all, json: true } => return remote::ps_json(cli.socket, all),
+        Command::Node(command) => node(cli.socket, command),
         command => remote(cli.socket, command),
     };
     match result {
@@ -271,6 +299,88 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+fn node(socket: Option<PathBuf>, command: NodeCommand) -> Result {
+    let config_path =
+        agentux_gateway::config_path().ok_or("neither XDG_CONFIG_HOME nor HOME is set")?;
+    match command {
+        NodeCommand::Enroll {
+            url,
+            organization,
+            node_id,
+        } => {
+            let token = match std::env::var("AGENTUX_NODE_TOKEN") {
+                Ok(token) if !token.trim().is_empty() => token,
+                _ => {
+                    eprint!("node token: ");
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line
+                }
+            };
+            let config = agentux_gateway::NodeConfig {
+                command_url: url.trim().trim_end_matches('/').to_string(),
+                organization_id: organization.trim().to_string(),
+                node_id: node_id.unwrap_or_else(agentux_gateway::default_node_id),
+                token: token.trim().to_string(),
+            };
+            agentux_gateway::save_config(&config_path, &config)?;
+            println!(
+                "enrolled {} in {} at {}; start the gateway with `aux node gateway` \
+                 (on AgentUX: systemctl --user enable --now agentux-gateway)",
+                config.node_id, config.organization_id, config.command_url
+            );
+            Ok(())
+        }
+        NodeCommand::Status => {
+            match agentux_gateway::load_config(&config_path)? {
+                Some(config) => println!(
+                    "node {} of {} reports to {}",
+                    config.node_id, config.organization_id, config.command_url
+                ),
+                None => println!("not enrolled with a Command server (aux node enroll)"),
+            }
+            Ok(())
+        }
+        NodeCommand::Leave => {
+            match std::fs::remove_file(&config_path) {
+                Ok(()) => println!("left Command; the gateway stops at its next start"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => println!("not enrolled"),
+                Err(e) => return Err(e.into()),
+            }
+            Ok(())
+        }
+        NodeCommand::Gateway => {
+            let config = agentux_gateway::load_config(&config_path)?
+                .ok_or("not enrolled with a Command server: run `aux node enroll` first")?;
+            let socket = match socket {
+                Some(socket) => socket,
+                None => agentux_api::default_socket_path()
+                    .ok_or("XDG_RUNTIME_DIR is not set; pass --socket")?,
+            };
+            let sink = agentux_gateway::Http::new(&config)?;
+            eprintln!(
+                "agentux-gateway: reporting {} to {}",
+                config.node_id, config.command_url
+            );
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(agentux_gateway::run(
+                config,
+                socket,
+                sink,
+                agentux_gateway::state_path(),
+                env!("CARGO_PKG_VERSION"),
+                |line| eprintln!("agentux-gateway: {line}"),
+                async {
+                    let _ = tokio::signal::ctrl_c().await;
+                },
+            ))?;
+            Ok(())
         }
     }
 }
@@ -337,6 +447,7 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
                 attach::attach(remote.socket(), &session_id, shell).await
             }
             Command::Validate { .. }
+            | Command::Node(_)
             | Command::Worktree(_)
             | Command::Exec { .. }
             | Command::BusStdio(_)
