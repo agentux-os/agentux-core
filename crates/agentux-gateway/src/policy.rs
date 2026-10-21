@@ -63,7 +63,7 @@ impl Default for Policy {
 impl Policy {
     /// The defaults with `path` on top; the defaults when there is no file.
     pub fn load(path: &Path) -> Result<Policy, String> {
-        let mut policy = Policy::default();
+        let policy = Policy::default();
         let text = match fs::read_to_string(path) {
             Ok(text) => text,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(policy),
