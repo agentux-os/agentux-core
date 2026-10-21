@@ -62,6 +62,11 @@ pub struct Role {
     pub harness: String,
     /// Passed to the harness if it supports choosing a model.
     pub model: Option<String>,
+    /// Harnesses that take the role, in order, while its harness (or model)
+    /// is at a usage limit. Unset: any other harness the user signed in to;
+    /// `[]`: none, the run waits for the limit to reset.
+    #[serde(default)]
+    pub fallback: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

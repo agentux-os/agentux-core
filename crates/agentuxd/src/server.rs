@@ -185,6 +185,11 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
         method::PROJECTS_LIST => to_value(engine.projects()),
         method::RUNS_START => to_value(engine.start_run(parse(params)?)),
         method::HARNESSES_LIST => to_value(Ok(engine.harnesses())),
+        method::LIMITS_LIST => to_value(engine.limits()),
+        method::LIMITS_CLEAR => {
+            let params: rpc::ClearLimit = parse(params)?;
+            to_value(engine.clear_limit(&params))
+        }
         method::RUNS_LIST => {
             let params: rpc::ListRuns = parse_or_default(params)?;
             to_value(engine.runs(params.project_id.as_deref()))

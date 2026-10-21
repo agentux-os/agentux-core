@@ -19,6 +19,10 @@ pub mod method {
     /// The built-in harnesses and whether each is installed
     /// ([`super::HarnessInfo`]).
     pub const HARNESSES_LIST: &str = "harnesses.list";
+    /// The harness limits in force ([`crate::HarnessLimit`]).
+    pub const LIMITS_LIST: &str = "limits.list";
+    /// The human says a limit no longer holds ([`super::ClearLimit`]).
+    pub const LIMITS_CLEAR: &str = "limits.clear";
     pub const RUNS_LIST: &str = "runs.list";
     pub const RUNS_GET: &str = "runs.get";
     pub const RUNS_CANCEL: &str = "runs.cancel";
@@ -189,6 +193,18 @@ pub struct HarnessInfo {
     pub signed_in: Option<bool>,
     /// Not expected to work reliably yet.
     pub experimental: bool,
+    /// Its limits in force (the whole harness, or some of its models).
+    #[serde(default)]
+    pub limits: Vec<crate::HarnessLimit>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClearLimit {
+    pub harness: String,
+    /// Only this model's limit; `None`: every limit of the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

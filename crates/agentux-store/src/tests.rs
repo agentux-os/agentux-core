@@ -394,3 +394,55 @@ fn an_id_already_in_use_is_drawn_again() {
         .unwrap();
     assert_eq!(id, "0000beef");
 }
+
+#[test]
+fn harness_limits_are_kept_until_their_time_or_cleared() {
+    let store = Store::open_in_memory().unwrap();
+    // An hour ahead, so the limits are in force for the emitted events too.
+    let t = now_ms() + 3_600_000;
+    let limit = |harness: &str, model: Option<&str>, until: Option<i64>| HarnessLimit {
+        harness: harness.into(),
+        model: model.map(str::to_string),
+        kind: agentux_api::LimitKind::Session,
+        until,
+        until_known: until.is_some(),
+        message: "limit reached".into(),
+        at: 1_000,
+    };
+    store
+        .write(|tx| {
+            tx.set_limit(&limit("claude-code", None, Some(t + 5_000)))?;
+            tx.set_limit(&limit("claude-code", Some("opus"), None))?;
+            tx.set_limit(&limit("codex", None, Some(t + 9_000)))?;
+            // The same harness and model again replaces it.
+            tx.set_limit(&limit("codex", None, Some(t + 8_000)))
+        })
+        .unwrap();
+    let at = |now| store.read(|tx| tx.limits(now)).unwrap();
+    assert_eq!(at(t + 2_000).len(), 3);
+    assert_eq!(at(t + 2_000)[2].until, Some(t + 8_000));
+    // Past its time a limit is not in force, whether or not it was expired.
+    assert_eq!(at(t + 6_000).len(), 2);
+
+    let expired = store.write(|tx| tx.expire_limits(t + 6_000)).unwrap();
+    assert_eq!(expired, [limit("claude-code", None, Some(t + 5_000))]);
+    assert_eq!(
+        store
+            .write(|tx| tx.clear_limits("codex", Some("opus")))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .write(|tx| tx.clear_limits("claude-code", None))
+            .unwrap(),
+        1
+    );
+    assert_eq!(at(t + 6_000), [limit("codex", None, Some(t + 8_000))]);
+
+    let last = store.read(|tx| tx.events_since(0, None)).unwrap();
+    match &last.last().unwrap().body {
+        EventBody::Limits { limits } => assert_eq!(limits.len(), 1),
+        other => panic!("expected the limits in force, got {other:?}"),
+    }
+}

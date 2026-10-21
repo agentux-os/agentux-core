@@ -21,6 +21,7 @@ pub mod executor;
 pub mod forge;
 pub mod helper;
 mod human;
+pub mod limits;
 pub mod prompts;
 pub mod server;
 mod terminal;
@@ -82,6 +83,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn Error>> {
     };
     let engine = Engine::with_settings(store, executor, settings);
     let resumed = engine.resume()?;
+    let _limits = engine.watch_limits();
     eprintln!(
         "agentuxd: listening on {} (database {}, {resumed} unfinished run(s) resumed{})",
         socket.display(),

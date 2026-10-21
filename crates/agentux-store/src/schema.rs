@@ -117,6 +117,16 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE sessions ADD COLUMN vendor_session_id TEXT;
     ",
+    // 5: harness usage limits in force (a `HarnessLimit` as JSON); model ''
+    // is the whole harness.
+    "
+    CREATE TABLE harness_limits (
+        harness  TEXT NOT NULL,
+        model    TEXT NOT NULL,
+        body     TEXT NOT NULL,
+        PRIMARY KEY (harness, model)
+    );
+    ",
 ];
 
 /// The schema version this build writes.

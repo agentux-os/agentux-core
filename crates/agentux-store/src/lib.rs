@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentux_api::{
-    AttemptStatus, BusMessage, CheckResult, Event, EventBody, PermissionRequest, Project,
-    PullRequest, RequestKind, RequestStatus, Run, RunStatus, Session, SessionState, SessionUsage,
-    StepAttempt, StepKind,
+    AttemptStatus, BusMessage, CheckResult, Event, EventBody, HarnessLimit, PermissionRequest,
+    Project, PullRequest, RequestKind, RequestStatus, Run, RunStatus, Session, SessionState,
+    SessionUsage, StepAttempt, StepKind,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
@@ -630,6 +630,81 @@ impl Tx<'_> {
             request_from_row,
         )?;
         rows.map(|r| r?.map_err(Error::Data)).collect()
+    }
+
+    // ---- harness limits ----
+
+    /// The limits in force at `now`, by harness and model. Limits past
+    /// their time are left for [`Tx::expire_limits`].
+    pub fn limits(&self, now: i64) -> Result<Vec<HarnessLimit>> {
+        let mut stmt = self
+            .tx
+            .prepare("SELECT body FROM harness_limits ORDER BY harness, model")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut limits = Vec::new();
+        for body in rows {
+            let limit: HarnessLimit = from_json(&body?)?;
+            if limit.until.is_none_or(|until| until > now) {
+                limits.push(limit);
+            }
+        }
+        Ok(limits)
+    }
+
+    /// Records a limit (replacing one for the same harness and model) and
+    /// emits the limits in force.
+    pub fn set_limit(&mut self, limit: &HarnessLimit) -> Result<()> {
+        self.tx.execute(
+            "INSERT OR REPLACE INTO harness_limits (harness, model, body) VALUES (?1, ?2, ?3)",
+            params![
+                limit.harness,
+                limit.model.as_deref().unwrap_or(""),
+                to_json(limit)?
+            ],
+        )?;
+        self.emit_limits(limit.at.max(now_ms()))
+    }
+
+    /// Removes the limits of `harness` (only `model`'s, when given); returns
+    /// how many. Emits the limits in force when any went.
+    pub fn clear_limits(&mut self, harness: &str, model: Option<&str>) -> Result<usize> {
+        let removed = self.tx.execute(
+            "DELETE FROM harness_limits WHERE harness = ?1 AND (?2 IS NULL OR model = ?2)",
+            params![harness, model],
+        )?;
+        if removed > 0 {
+            self.emit_limits(now_ms())?;
+        }
+        Ok(removed)
+    }
+
+    /// Removes the limits whose time passed at `now`; returns them.
+    pub fn expire_limits(&mut self, now: i64) -> Result<Vec<HarnessLimit>> {
+        let mut stmt = self.tx.prepare("SELECT body FROM harness_limits")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut expired = Vec::new();
+        for body in rows {
+            let limit: HarnessLimit = from_json(&body?)?;
+            if limit.until.is_some_and(|until| until <= now) {
+                expired.push(limit);
+            }
+        }
+        drop(stmt);
+        for limit in &expired {
+            self.tx.execute(
+                "DELETE FROM harness_limits WHERE harness = ?1 AND model = ?2",
+                params![limit.harness, limit.model.as_deref().unwrap_or("")],
+            )?;
+        }
+        if !expired.is_empty() {
+            self.emit_limits(now)?;
+        }
+        Ok(expired)
+    }
+
+    fn emit_limits(&mut self, now: i64) -> Result<()> {
+        let limits = self.limits(now)?;
+        self.emit(None, EventBody::Limits { limits })
     }
 
     // ---- sessions ----

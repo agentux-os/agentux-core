@@ -648,3 +648,134 @@ async fn the_built_in_pipeline_uses_installed_harnesses() {
         engine.shutdown();
     }
 }
+
+/// The test pipeline, with the implementer on Codex and these fallbacks.
+fn codex_implementer(fallback: &str) -> String {
+    pipeline("true").replace(
+        "  implementer:\n    harness: fake-a\n",
+        &format!("  implementer:\n    harness: codex\n    fallback: {fallback}\n"),
+    )
+}
+
+/// Codex answers its first implement turn with its usage limit.
+fn codex_runs_out() -> (Arc<FakeExecutor>, Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let hit = Arc::new(AtomicBool::new(false));
+    let seen = hit.clone();
+    let executor = Arc::new(FakeExecutor::new(move |task| {
+        if task.harness == "codex" && !seen.swap(true, Ordering::SeqCst) {
+            return Err(
+                "You've hit your usage limit. Upgrade to Pro or try again in 2 hours.".into(),
+            );
+        }
+        Ok(AgentOutcome::Done {
+            summary: format!("{} done by {}", task.step, task.harness),
+        })
+    }));
+    (executor, hit)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_harness_at_its_limit_hands_the_role_to_its_fallback() {
+    let f = fixture(&codex_implementer("[opencode]"));
+    let (executor, _) = codex_runs_out();
+    let engine = f.engine(executor.clone());
+    let run = f.start(&engine).await;
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+    assert_eq!(run.roles["implementer"], "opencode");
+
+    let implements: Vec<String> = executor
+        .calls()
+        .into_iter()
+        .filter(|c| c.step == StepKind::Implement)
+        .map(|c| c.harness)
+        .collect();
+    assert_eq!(implements, ["codex", "opencode"]);
+
+    let limits = engine.limits().unwrap();
+    assert_eq!(limits.len(), 1, "{limits:?}");
+    let limit = &limits[0];
+    assert_eq!(
+        (limit.harness.as_str(), limit.kind, limit.until_known),
+        ("codex", agentux_api::LimitKind::Session, true)
+    );
+    let left = limit.until.unwrap() - agentux_store::now_ms();
+    assert!((7_000_000..=7_200_000).contains(&left), "{left}");
+    assert!(
+        engine
+            .harnesses()
+            .iter()
+            .any(|h| h.id == "codex" && h.limits.len() == 1)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_fallback_the_run_waits_until_the_human_lifts_the_limit() {
+    let f = fixture(&codex_implementer("[]"));
+    let (executor, _) = codex_runs_out();
+    let engine = f.engine(executor.clone());
+    let run = f.start(&engine).await;
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Waiting, "{:?}", run.error);
+    let (_, _, requests) = engine.run(&run.id).unwrap();
+    let request = requests
+        .iter()
+        .find(|r| r.status == RequestStatus::Pending)
+        .unwrap();
+    assert_eq!(request.kind, RequestKind::Limit);
+    assert!(
+        request.detail.contains("hit your usage limit"),
+        "{}",
+        request.detail
+    );
+
+    // Nothing changes while the limit holds.
+    assert!(engine.wake_limited().unwrap().is_empty());
+
+    engine
+        .clear_limit(&agentux_api::rpc::ClearLimit {
+            harness: "codex".into(),
+            model: None,
+        })
+        .unwrap();
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+    assert!(engine.limits().unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_run_goes_on_when_the_limit_resets() {
+    let f = fixture(&codex_implementer("[]"));
+    let (executor, _) = codex_runs_out();
+    let engine = f.engine(executor.clone());
+    let run = f.start(&engine).await;
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Waiting, "{:?}", run.error);
+
+    // The reset time comes.
+    let mut limit = engine.limits().unwrap().remove(0);
+    limit.until = Some(agentux_store::now_ms() - 1);
+    engine.store().write(|tx| tx.set_limit(&limit)).unwrap();
+    assert_eq!(engine.wake_limited().unwrap(), [run.id.clone()]);
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approving_a_limit_request_retries_with_the_harness() {
+    let f = fixture(&codex_implementer("[]"));
+    let (executor, _) = codex_runs_out();
+    let engine = f.engine(executor.clone());
+    let run = f.start(&engine).await;
+    let run = wait_until_settled(&engine, &run.id).await;
+    let (_, _, requests) = engine.run(&run.id).unwrap();
+    let request = requests
+        .iter()
+        .find(|r| r.kind == RequestKind::Limit)
+        .unwrap();
+    engine.approve(&request.id, None).unwrap();
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+    assert_eq!(run.roles["implementer"], "codex");
+}

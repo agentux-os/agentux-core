@@ -21,7 +21,9 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `projects.register` | `{ path }` — absolute path inside a git repository | `Project` (idempotent per repository) |
 | `projects.list` | — | `Project[]` |
 | `runs.start` | `{ projectId, prompt?, issue?, title?, roles? }` — `prompt` or `issue` required; `roles` maps role names to harness ids for this run | `Run` |
-| `harnesses.list` | none | `[{ id, command, installed, signedIn, experimental }]`: the built-in harnesses, whether each one's vendor program (`command`) is on the daemon's `PATH`, and whether the user signed in to it (`null`: cannot tell) |
+| `limits.list` | none | `HarnessLimit[]`: the usage limits in force; see [Usage limits](#usage-limits) |
+| `limits.clear` | `{ harness, model? }` — without `model`, every limit of the harness | `HarnessLimit[]` still in force; runs waiting for the harness go on |
+| `harnesses.list` | none | `[{ id, command, installed, signedIn, experimental, limits }]`: the built-in harnesses, whether each one's vendor program (`command`) is on the daemon's `PATH`, and whether the user signed in to it (`null`: cannot tell) |
 | `runs.list` | `{ projectId? }` | `Run[]`, newest first |
 | `runs.get` | `{ runId }` | `{ run: Run, attempts: StepAttempt[], requests: PermissionRequest[], sessions: Session[] }` |
 | `runs.cancel` | `{ runId }` | `Run` |
@@ -91,6 +93,7 @@ Where the replay ends, the subscription gets one notification of its own, exactl
 | `session` | `session: Session` | A session started or changed state or usage (full snapshot) |
 | `session_event` | `sessionId`, `event: SessionEvent` | Something happened in a session |
 | `bus_message` | `message: BusMessage` | Traffic on the run's agent bus (see [Agent bus](#agent-bus)) |
+| `limits` | `limits: HarnessLimit[]` | The usage limits in force changed (no `runId`) |
 
 Session events are stored in the event log like the others, so `events.subscribe` with `since: 0` replays a run's sessions. Agent message chunks are coalesced (up to about 4 KB, or 750 ms); reasoning chunks are not recorded; tool output and diff texts are cut at 16 KB.
 
@@ -103,6 +106,16 @@ type StepKind = "plan" | "implement" | "gate" | "review" | "pull_request" | "cus
 type RunStatus = "running" | "waiting" | "done" | "failed" | "cancelled"; // waiting = paused on an approval
 
 interface Project { id: string; name: string; path: string; createdAt: number }
+
+interface HarnessLimit {
+  harness: string;           // e.g. "claude-code"
+  model: string | null;      // the model the limit is for; null: the whole harness
+  kind: "session" | "weekly" | "credits" | "rate";
+  until: number | null;      // when it ends; null: only when cleared (credits)
+  untilKnown: boolean;       // the harness said when; false: a guess, then tried again
+  message: string;           // what the harness said
+  at: number;
+}
 
 interface Run {
   id: string;              // 8 hex digits; the branch is aux/<id>
@@ -141,7 +154,7 @@ interface PermissionRequest {
   // plan = approve the plan; step = any other approve: true step;
   // permission = an agent asks before a tool call; budget = the run is over budget;
   // question = an agent asks the human through the bus (ask_human)
-  kind: "plan" | "step" | "permission" | "budget" | "question";
+  kind: "plan" | "step" | "permission" | "budget" | "question" | "limit";
   runId: string; projectId: string; stepIndex: number; step: StepKind;
   sessionId: string | null;  // the session that asked, for permission and question requests
   title: string; detail: string;
@@ -245,8 +258,26 @@ type BusEndpoint =
 5. **Permissions.** An agent asking before a tool call creates a `permission` request and the run is `waiting` while the agent waits (the step does not end). `requests.approve` lets the tool run; `requests.deny` tells the agent no and the step goes on. Requests still pending when the agent's turn ends, the run is cancelled or the daemon restarts become `cancelled`. With `--auto-approve-permissions` no request is created and a `log` event records each allowed call.
 6. **Budget.** Before each agent step, a run whose `costUsd` exceeds `budgetUsd` pauses on a `budget` request. Approving raises `budgetUsd` to `costUsd + budget.max_usd_per_run`; denying fails the run.
 
-7. **Agent bus.** Agents talk to each other and to the human through the `agentux` MCP server; see [Agent bus](#agent-bus).
-8. **The human in a session.** `sessions.prompt` sends the human's message to a live session; see [Talking to a session](#talking-to-a-session).
+7. **Usage limits.** A harness that says it ran out is kept out of use until its limit resets, and the step runs again with another agent, or waits; see [Usage limits](#usage-limits).
+8. **Agent bus.** Agents talk to each other and to the human through the `agentux` MCP server; see [Agent bus](#agent-bus).
+9. **The human in a session.** `sessions.prompt` sends the human's message to a live session; see [Talking to a session](#talking-to-a-session).
+
+### Usage limits
+
+When an agent step's harness answers with a usage limit instead of work (an error, or a short reply that is only the notice), the daemon records a `HarnessLimit` and runs the step again. It reads what Claude Code, Codex, Gemini / Antigravity and HTTP APIs say:
+
+- **Which limit** (`kind`): `session` (Claude Code's 5-hour window, Codex's usage limit), `weekly`, `credits` (credit balance too low, insufficient quota, billing), or `rate` (HTTP 429, quota exceeded).
+- **For what:** a model the notice names (`opus`, `gemini-2.5-pro`, `gpt-5-codex`) when the role uses that model, else the whole harness.
+- **Until when** (`until`, `untilKnown: true`): Claude Code's `limit reached|<epoch>`, `resets 3pm (America/Sao_Paulo)`, `resets Oct 27, 9am`; Codex's `try again in 2 days 3 hours` or `try again at 3:05 PM`; Gemini's `retry in 41.5s`, `reset after 3h12m`, `"retryDelay": "30s"`; `retry-after: 120`. Times without a zone are in the daemon's local time zone. Without a time, the daemon tries the harness again after a guess (`untilKnown: false`): 2 minutes for `rate`, an hour for `session`, a day for `weekly`. `credits` have no time: they hold until `limits.clear`.
+
+While a limit holds, the harness (or model) is out of use: the built-in pipeline does not pick it, and an agent step of a role it plays gives the role to the role's `fallback` harnesses in `agentux.yaml`, in order, or, without the key, to the first other harness the user can use (`harnesses.list` order); `fallback: []` keeps the role. When no harness can take it, the run waits on a `limit` request saying why and until when. It goes on by itself once the limit is over (checked every 15 seconds), or when the human approves the request or calls `limits.clear` (after adding credits or resetting the limit on the vendor's site). Denying the request fails the run.
+
+```yaml
+roles:
+  implementer:
+    harness: antigravity
+    fallback: [opencode, claude-code]
+```
 
 ### Talking to a session
 

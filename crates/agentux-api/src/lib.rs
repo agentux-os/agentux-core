@@ -125,8 +125,48 @@ string_enum!(
         Permission => "permission",
         Budget => "budget",
         Question => "question",
+        /// The agent of the next step is at its usage limit and no other
+        /// agent can take over: approve when the limit was reset (credits
+        /// added, a plan's reset) to retry now; the run also goes on by
+        /// itself when the limit's time passes.
+        Limit => "limit",
     }
 );
+
+string_enum!(
+    /// What ran out, as the harness said it.
+    LimitKind {
+        /// A usage window of a few hours (Claude's 5-hour limit, Codex's).
+        Session => "session",
+        /// A weekly allowance.
+        Weekly => "weekly",
+        /// Prepaid credits or a billing problem: back only when the human
+        /// says so.
+        Credits => "credits",
+        /// A short rate limit (HTTP 429), or a daily quota.
+        Rate => "rate",
+    }
+);
+
+/// A harness, or one of its models, out of use until a time or until the
+/// human clears it (`limits.clear`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessLimit {
+    pub harness: String,
+    /// The model the limit is for; `None`: the whole harness.
+    pub model: Option<String>,
+    pub kind: LimitKind,
+    /// When the harness said it resets, or when the daemon tries it again;
+    /// `None`: only when the human clears it.
+    pub until: Option<i64>,
+    /// Whether `until` is the harness's own reset time (not a guess).
+    pub until_known: bool,
+    /// The harness's message.
+    pub message: String,
+    /// When it was hit.
+    pub at: i64,
+}
 
 string_enum!(
     /// `active` while the agent works on a prompt, `waiting` while it waits
@@ -468,6 +508,10 @@ pub enum EventBody {
     /// and its answer, a refusal, a session joining or leaving.
     BusMessage {
         message: BusMessage,
+    },
+    /// The harness limits in force changed: every limit still in force.
+    Limits {
+        limits: Vec<HarnessLimit>,
     },
 }
 
