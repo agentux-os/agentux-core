@@ -50,9 +50,29 @@ pub fn has_key(harness: &str) -> bool {
     variables(harness).iter().any(|var| lookup(var).is_some())
 }
 
+/// The key for `var`: a systemd credential of that name first (servers
+/// without a desktop: `LoadCredential=` / `LoadCredentialEncrypted=` on
+/// agentuxd.service puts it in `$CREDENTIALS_DIRECTORY`), else the secret
+/// service. `None` when there is no such key.
+pub fn lookup(var: &str) -> Option<String> {
+    credential(var).or_else(|| keyring(var))
+}
+
+/// `$CREDENTIALS_DIRECTORY/<VAR>`, as systemd passes credentials to a unit.
+fn credential(var: &str) -> Option<String> {
+    let dir = std::env::var_os("CREDENTIALS_DIRECTORY").filter(|v| !v.is_empty())?;
+    credential_in(std::path::Path::new(&dir), var)
+}
+
+fn credential_in(dir: &std::path::Path, var: &str) -> Option<String> {
+    let key = std::fs::read_to_string(dir.join(var)).ok()?;
+    let key = key.trim();
+    (!key.is_empty()).then(|| key.to_string())
+}
+
 /// `secret-tool lookup agentux-key VAR`; `None` when there is no such key,
 /// no secret service, no `secret-tool`, or no answer in time.
-pub fn lookup(var: &str) -> Option<String> {
+fn keyring(var: &str) -> Option<String> {
     let mut child = Command::new("secret-tool")
         .args(["lookup", "agentux-key", var])
         .stdin(Stdio::null())
@@ -91,6 +111,19 @@ mod tests {
         assert_eq!(variables("codex"), ["OPENAI_API_KEY"]);
         assert_eq!(variables("opencode").len(), VARIABLES.len());
         assert!(variables("fake").is_empty());
+    }
+
+    #[test]
+    fn systemd_credentials_are_read_trimmed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ANTHROPIC_API_KEY"), " sk-test\n").unwrap();
+        std::fs::write(dir.path().join("OPENAI_API_KEY"), "\n").unwrap();
+        assert_eq!(
+            credential_in(dir.path(), "ANTHROPIC_API_KEY").as_deref(),
+            Some("sk-test")
+        );
+        assert_eq!(credential_in(dir.path(), "OPENAI_API_KEY"), None);
+        assert_eq!(credential_in(dir.path(), "GEMINI_API_KEY"), None);
     }
 
     #[test]

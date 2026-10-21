@@ -183,6 +183,16 @@ enum Command {
     /// Connect this node to AgentUX Command (the remote control plane)
     #[command(subcommand)]
     Node(NodeCommand),
+    /// Show the agent preferences (~/.config/agentux/agents.yaml), or
+    /// replace them with a YAML or JSON file (`-` for stdin)
+    Preferences {
+        /// Print JSON instead of YAML
+        #[arg(long)]
+        json: bool,
+        /// Replace the preferences with this file
+        #[arg(long, value_name = "FILE")]
+        set: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -299,6 +309,7 @@ fn main() -> ExitCode {
         }),
         Command::Ps { all, json: true } => return remote::ps_json(cli.socket, all),
         Command::Node(command) => node(cli.socket, command),
+        Command::Preferences { json, set } => preferences(json, set),
         command => remote(cli.socket, command),
     };
     match result {
@@ -429,6 +440,37 @@ fn node(socket: Option<PathBuf>, command: NodeCommand) -> Result {
     }
 }
 
+/// The agent preferences straight from their file, so it works without the
+/// daemon (agentuxd reads the same file each time it needs it).
+fn preferences(json: bool, set: Option<PathBuf>) -> Result {
+    let path = agentuxd::prefs::default_path().ok_or("neither XDG_CONFIG_HOME nor HOME is set")?;
+    if let Some(file) = set {
+        let text = if file.as_os_str() == "-" {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+            text
+        } else {
+            std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?
+        };
+        let prefs: agentux_api::rpc::AgentPrefs = match serde_json::from_str(&text) {
+            Ok(prefs) => prefs,
+            Err(_) => {
+                serde_saphyr::from_str(&text).map_err(|e| format!("not valid preferences: {e}"))?
+            }
+        };
+        agentuxd::prefs::save(&path, &prefs)?;
+        eprintln!("saved {}", path.display());
+    }
+    let prefs = agentuxd::prefs::load(&path)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&prefs)?);
+    } else {
+        print!("{}", agentuxd::prefs::to_yaml(&prefs));
+        eprintln!("({})", path.display());
+    }
+    Ok(())
+}
+
 fn decide_command(command_id: &str, accept: bool) -> Result {
     let pending = agentux_gateway::commands::Pending::new(
         agentux_gateway::commands::pending_path().ok_or("HOME is not set")?,
@@ -507,6 +549,7 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
             }
             Command::Validate { .. }
             | Command::Node(_)
+            | Command::Preferences { .. }
             | Command::Worktree(_)
             | Command::Exec { .. }
             | Command::BusStdio(_)
