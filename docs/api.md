@@ -53,6 +53,8 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 
 Sign-in is read from where each CLI keeps it: `~/.claude/.credentials.json` or `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN` for Claude Code, `$CODEX_HOME/auth.json` (`~/.codex`) or `OPENAI_API_KEY` for Codex, OpenCode's `auth.json` under `$XDG_DATA_HOME/opencode`, and `~/.gemini/antigravity-cli/antigravity-oauth-token` for Antigravity. OpenCode can also take keys from its config, and Antigravity may keep its token elsewhere, so for those two a missing file is `null`, not signed out.
 
+**API keys in the secret service.** A user service does not read `~/.bashrc`, so keys exported there never reach the daemon. Keys kept in the desktop's secret service under `agentux-key=<VARIABLE>` (the cockpit's Settings, or `secret-tool store --label="Anthropic API key" agentux-key ANTHROPIC_API_KEY`) are looked up when a harness starts and given to that harness's process only: `ANTHROPIC_API_KEY` to Claude Code, `OPENAI_API_KEY` to Codex, `GEMINI_API_KEY` to Antigravity, and all of them (with `OPENROUTER_API_KEY`) to OpenCode. A variable set in the daemon's own environment wins. Such a key counts as signed in.
+
 `roles` overrides the harness of the pipeline's roles for this run (`{"implementer": "opencode", "reviewer": "antigravity"}`). A role the pipeline does not have, or an unknown harness id, is `-32602`. A role's `model` is dropped when its harness is replaced. The run's `roles` field shows what each role got.
 
 ### Errors

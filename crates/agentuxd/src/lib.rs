@@ -26,6 +26,7 @@ pub mod notify;
 pub mod prefs;
 pub mod prompts;
 pub mod quota;
+pub mod secrets;
 pub mod server;
 mod terminal;
 

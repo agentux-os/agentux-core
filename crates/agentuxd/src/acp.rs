@@ -79,7 +79,7 @@ impl Launcher for HarnessLauncher {
         permissions: PermissionHandler,
     ) -> BoxFuture<'a, Result<(AcpSession, Events), String>> {
         Box::pin(async move {
-            let Some(harness) = HarnessSpec::find(spec.harness) else {
+            let Some(mut harness) = HarnessSpec::find(spec.harness) else {
                 let known: Vec<String> = HarnessSpec::builtin().into_iter().map(|s| s.id).collect();
                 return Err(format!(
                     "unknown harness `{}` (known: {})",
@@ -87,6 +87,12 @@ impl Launcher for HarnessLauncher {
                     known.join(", ")
                 ));
             };
+            // API keys from the secret service, for this harness only.
+            let id = harness.id.clone();
+            let keys = tokio::task::spawn_blocking(move || crate::secrets::env_for(&id))
+                .await
+                .unwrap_or_default();
+            harness.env.extend(keys);
             AcpHarness::new(harness)
                 .with_mcp_servers(spec.mcp_servers.to_vec())
                 .with_model(spec.model.map(str::to_string))
