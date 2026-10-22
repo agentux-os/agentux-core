@@ -43,6 +43,11 @@ install -Dpm 0644 %{srcroot}/README.md %{buildroot}%{_docdir}/%{name}/README.md
 install -Dpm 0644 %{srcroot}/docs/api.md %{buildroot}%{_docdir}/%{name}/api.md
 install -Dpm 0644 %{srcroot}/docs/gateway.md %{buildroot}%{_docdir}/%{name}/gateway.md
 
+%check
+# The binaries run on the build architecture and print their version.
+%{buildroot}%{_bindir}/aux --version
+%{buildroot}%{_bindir}/agentuxd --version
+
 %post
 %systemd_user_post agentuxd.service agentux-gateway.service
 

@@ -34,7 +34,7 @@
 
 The orchestration engine of [AgentUX](https://github.com/agentux-os/agentux): the daemon, CLI and integrations that let coding agents from different vendors work as one team.
 
-> **Status:** early. `agentuxd` runs pipelines from `agentux.yaml` as persisted state machines in run worktrees, with gates, bounded loops, approvals and crash recovery, and `aux` drives it over a local socket. Agent steps run in real harness sessions over ACP (tried with OpenCode; Claude Code and Codex go through their ACP adapters), with agent permission requests in the approvals inbox, session events in the event log, budgets enforced from reported cost, and pull requests opened with `gh`. Agents talk to each other and to you through the agent bus, an MCP server the daemon gives every session. `--fake-agents` swaps in a scripted fake. Design decisions live in [agentux/docs/adr](https://github.com/agentux-os/agentux/tree/main/docs/adr).
+> **Status:** early. `agentuxd` runs pipelines from `agentux.yaml` as persisted state machines in run worktrees, with gates, bounded loops, approvals and crash recovery, and `aux` drives it over a local socket. Agent steps run in real harness sessions over ACP (Claude Code, Codex, OpenCode and Antigravity, through their ACP adapters), with agent permission requests in the approvals inbox, session events in the event log, budgets enforced from reported cost, and pull requests opened with `gh`. Agents talk to each other and to you through the agent bus, an MCP server the daemon gives every session. `--fake-agents` swaps in a scripted fake. Design decisions live in [agentux/docs/adr](https://github.com/agentux-os/agentux/tree/main/docs/adr).
 
 ## Releases and packages
 
@@ -185,7 +185,7 @@ Linux is the target. The crate holding `aux` is named `aux-cli` because `aux` is
 - Per-project permission policies in `agentux.yaml`; harness-specific model selection where ACP offers none.
 - Headless fallbacks for the harnesses, behind the same `Harness` trait ([ADR 0002](https://github.com/agentux-os/agentux/blob/main/docs/adr/0002-harness-integration-via-acp.md)).
 - Agent bus: the token budget per run from ADR 0004; logging reads so restored mailboxes are exact.
-- Terminal mode: the `agentux` bus inside the harness TUI; taking a session over mid-turn. The cockpit's real `DaemonClient` on top of the sessions and terminals API.
+- Terminal mode: the `agentux` bus inside the harness TUI; taking a session over mid-turn.
 
 ## Relevant ADRs
 
