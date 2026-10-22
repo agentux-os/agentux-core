@@ -38,3 +38,14 @@ jobs:
           # The container-isolation tests skip without podman; the runner
           # has it, so a skip here would hide a regression.
           AGENTUX_REQUIRE_PODMAN: "1"
+
+  deny:
+    name: dependencies (cargo-deny)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      # Advisories (RustSec), licenses, banned and unknown sources: deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features

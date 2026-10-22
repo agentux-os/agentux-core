@@ -1,0 +1,49 @@
+# cargo-deny: what CI refuses in the dependency tree.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+# Every RustSec advisory that applies fails CI (vulnerabilities, unsound
+# code, yanked crates). An advisory with no fix yet is listed in `ignore`
+# with the reason and the date it was reviewed.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Licenses compatible with shipping the agentux RPM under Apache-2.0.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+    "0BSD",
+    "BSL-1.0",
+]
+confidence-threshold = 0.9
+
+# AgentUX's own unpublished crates (publish = false), such as auxp from
+# agentux-protocol, which has no license file yet.
+[licenses.private]
+ignore = true
+
+[bans]
+# Duplicate versions are common in a tree this size; report, do not fail.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# The AUXP crate (agentux-protocol), pinned by commit.
+allow-git = ["https://github.com/agentux-os/agentux-protocol"]
