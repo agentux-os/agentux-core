@@ -77,17 +77,6 @@ pub struct NodeConfig {
     pub command_instance_id: Option<String>,
 }
 
-/// What a Command server's enrollment gives a node.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Enrolled {
-    instance_id: String,
-    organization_id: String,
-    node_id: String,
-    node_secret: String,
-    approved: bool,
-}
-
 /// Joins the Command server at `url` with an enrollment token it issued:
 /// first checks the server is the one the token names (so the token never
 /// goes to another server), then trades it for this node's credential.
@@ -114,7 +103,7 @@ pub async fn enroll(
         .user_agent(concat!("agentux-gateway/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())?;
-    let instance: Value = client
+    let instance: auxp::enrollment::Instance = client
         .get(format!("{url}/v1/instance"))
         .send()
         .await
@@ -122,7 +111,10 @@ pub async fn enroll(
         .json()
         .await
         .map_err(|e| format!("{url} is not an AgentUX Command server: {e}"))?;
-    let actual = instance["instanceId"].as_str().unwrap_or_default();
+    instance
+        .check()
+        .map_err(|e| format!("{url} is not an AgentUX Command server for this node: {e}"))?;
+    let actual = instance.instance_id.as_str();
     if actual != wanted {
         return Err(format!(
             "{url} is Command server {actual}, but the token was issued by {wanted}: ask for a token from this server, or use that server's address"
@@ -130,7 +122,11 @@ pub async fn enroll(
     }
     let response = client
         .post(format!("{url}/v1/enroll"))
-        .json(&json!({ "token": token.trim(), "nodeName": node_name, "hostname": hostname }))
+        .json(&auxp::enrollment::Redemption {
+            token: token.trim().to_string(),
+            node_name: node_name.map(str::to_string),
+            hostname: Some(hostname.to_string()),
+        })
         .send()
         .await
         .map_err(|e| format!("cannot reach Command at {url}: {e}"))?;
@@ -142,9 +138,12 @@ pub async fn enroll(
             body["error"].as_str().unwrap_or("no reason given")
         ));
     }
-    let enrolled: Enrolled = response
+    let enrolled: auxp::enrollment::Enrolled = response
         .json()
         .await
+        .map_err(|e| format!("unexpected answer from Command: {e}"))?;
+    enrolled
+        .check()
         .map_err(|e| format!("unexpected answer from Command: {e}"))?;
     if enrolled.instance_id != wanted {
         return Err("Command answered for another instance".into());

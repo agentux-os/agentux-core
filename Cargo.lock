@@ -381,7 +381,7 @@ dependencies = [
 [[package]]
 name = "auxp"
 version = "0.1.0"
-source = "git+https://github.com/agentux-os/agentux-protocol?rev=9c219eebb88b1bd74a275f8a17ba287031723d3c#9c219eebb88b1bd74a275f8a17ba287031723d3c"
+source = "git+https://github.com/agentux-os/agentux-protocol?rev=aeced51393523ee7cd20c0b163cdb2664c2a038e#aeced51393523ee7cd20c0b163cdb2664c2a038e"
 dependencies = [
  "jiff",
  "serde",
