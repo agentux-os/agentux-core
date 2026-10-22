@@ -89,7 +89,7 @@ pub async fn command_loop(
             Ok((ws, response)) => {
                 let named = response
                     .headers()
-                    .get("X-AgentUX-Command-Instance")
+                    .get(auxp::INSTANCE_HEADER)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if let Some(pinned) = &config.command_instance_id

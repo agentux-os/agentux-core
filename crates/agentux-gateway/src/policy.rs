@@ -15,34 +15,14 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::{fs, io};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 pub const SYSTEM_POLICY: &str = "/etc/agentux/node-policy.yaml";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Decision {
-    Allow,
-    Confirm,
-    Deny,
-}
-
-/// Every command method the gateway runs, and its default decision: what
-/// does not change code or settings runs; starting runs and changing
-/// preferences wait for someone at the node.
-pub const DEFAULTS: &[(&str, Decision)] = &[
-    ("run.snapshot", Decision::Allow),
-    ("harness.list", Decision::Allow),
-    ("harness.test", Decision::Allow),
-    ("run.cancel", Decision::Allow),
-    ("run.pause", Decision::Allow),
-    ("run.resume", Decision::Allow),
-    ("request.resolve", Decision::Allow),
-    ("bus.post", Decision::Allow),
-    ("limits.clear", Decision::Allow),
-    ("run.start", Decision::Confirm),
-    ("preferences.set", Decision::Confirm),
-];
+/// A policy's answer, and every command method with its default decision
+/// (AUXP's): what does not change code or settings runs; starting runs and
+/// changing preferences wait for someone at the node.
+pub use auxp::policy::{DEFAULTS, Decision};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Policy(BTreeMap<String, Decision>);

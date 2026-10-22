@@ -16,6 +16,7 @@ agentux-api.workspace = true
 agentux-bus.workspace = true
 agentux-config.workspace = true
 agentux-gateway.workspace = true
+auxp.workspace = true
 agentux-harness.workspace = true
 agentux-worktree.workspace = true
 agentuxd.workspace = true

@@ -35,7 +35,9 @@ use agentux_api::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-pub const PROTOCOL_VERSION: &str = "v1";
+pub use auxp::PROTOCOL_VERSION;
+/// The instance id an enrollment token names (`auxe1_<instanceId>_<secret>`).
+pub use auxp::enrollment::token_instance;
 /// What this gateway can answer, for `node.hello`.
 pub const CAPABILITIES: &[&str] = &[
     "harness.status",
@@ -84,13 +86,6 @@ struct Enrolled {
     node_id: String,
     node_secret: String,
     approved: bool,
-}
-
-/// The instance id an enrollment token names (`auxe1_<instanceId>_<secret>`).
-pub fn token_instance(token: &str) -> Option<&str> {
-    let rest = token.trim().strip_prefix("auxe1_")?;
-    let (instance, secret) = rest.split_once('_')?;
-    (instance.starts_with("cmd-") && instance.len() == 20 && secret.len() == 64).then_some(instance)
 }
 
 /// Joins the Command server at `url` with an enrollment token it issued:

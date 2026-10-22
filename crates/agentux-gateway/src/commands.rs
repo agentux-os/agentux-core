@@ -16,11 +16,8 @@ use serde_json::{Value, json};
 use crate::policy::{Decision, Policy};
 
 /// JSON-RPC error codes of the AUXP command channel.
-pub const NOT_IMPLEMENTED: i64 = -32601;
-pub const INVALID_PARAMS: i64 = -32602;
-pub const HELD: i64 = -32010;
-pub const DENIED: i64 = -32011;
-pub const FAILED: i64 = -32012;
+pub use auxp::codes::{DENIED, FAILED, HELD, INVALID_PARAMS, METHOD_NOT_FOUND as NOT_IMPLEMENTED};
+use auxp::policy::{REASON_AWAITING_CONFIRMATION, REASON_DENIED_BY_POLICY};
 
 /// A command's error: code and message.
 pub type Failure = (i64, String);
@@ -477,13 +474,13 @@ pub async fn handle(
     };
     let handled = match policy.decide(method) {
         Decision::Deny => Handled {
-            response: error(&id, DENIED, "denied_by_policy"),
-            event: denied("denied_by_policy"),
+            response: error(&id, DENIED, REASON_DENIED_BY_POLICY),
+            event: denied(REASON_DENIED_BY_POLICY),
         },
         Decision::Confirm => match pending.hold(&command_id, method, &params) {
             Ok(()) => Handled {
-                response: error(&id, HELD, "awaiting_local_confirmation"),
-                event: denied("awaiting_local_confirmation"),
+                response: error(&id, HELD, REASON_AWAITING_CONFIRMATION),
+                event: denied(REASON_AWAITING_CONFIRMATION),
             },
             Err(e) => none(error(&id, FAILED, &format!("cannot hold the command: {e}"))),
         },
