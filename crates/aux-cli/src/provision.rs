@@ -31,127 +31,38 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use agentux_api::rpc::AgentPrefs;
-use serde::Deserialize;
 
 use crate::Result;
 
 pub const DONE: &str = "/var/lib/agentux/provisioned.json";
-const PROFILES: &[&str] = &[
-    "workstation",
-    "node",
-    "command",
-    "executive",
-    "complete",
-    "custom",
-];
+/// The file's shape, shared with AgentUX Command, which writes these files
+/// for the machines it enrolls.
+pub use auxp::provision::Provision;
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Provision {
-    pub version: u32,
-    pub profile: String,
-    #[serde(default)]
-    pub hostname: Option<String>,
-    /// The user whose agentuxd and gateway run on this machine; must exist.
-    #[serde(default)]
-    pub user: Option<String>,
-    #[serde(default)]
-    pub command: Option<CommandJoin>,
-    /// The node policy (`/etc/agentux/node-policy.yaml`), as that file.
-    #[serde(default)]
-    pub policy: Option<serde_json::Value>,
-    #[serde(default)]
-    pub preferences: Option<AgentPrefs>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CommandJoin {
-    pub url: String,
-    pub enrollment_token: String,
-    #[serde(default)]
-    pub node_name: Option<String>,
-}
-
-fn name_ok(s: &str, max: usize) -> bool {
-    !s.is_empty()
-        && s.len() <= max
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-        && !s.starts_with(['-', '.'])
-}
-
-impl Provision {
-    /// YAML or JSON.
-    pub fn parse(text: &str) -> std::result::Result<Provision, String> {
-        let provision: Provision =
-            serde_saphyr::from_str(text).map_err(|e| format!("not a valid provision file: {e}"))?;
-        provision.validate()?;
-        Ok(provision)
+/// Reads a provision file (YAML or JSON) and checks all of it before
+/// anything changes: its shape, the agent preferences and the node policy.
+pub fn parse(text: &str) -> std::result::Result<Provision, String> {
+    let provision: Provision =
+        serde_saphyr::from_str(text).map_err(|e| format!("not a valid provision file: {e}"))?;
+    provision.validate()?;
+    if let Some(prefs) = preferences(&provision)? {
+        agentuxd::prefs::validate(&prefs)?;
     }
-
-    fn validate(&self) -> std::result::Result<(), String> {
-        if self.version != 1 {
-            return Err(format!(
-                "unsupported version {} (this aux reads version 1)",
-                self.version
-            ));
-        }
-        if !PROFILES.contains(&self.profile.as_str()) {
-            return Err(format!(
-                "unknown profile `{}` (one of {})",
-                self.profile,
-                PROFILES.join(", ")
-            ));
-        }
-        if let Some(host) = &self.hostname
-            && !name_ok(host, 63)
-        {
-            return Err(format!("not a host name: {host}"));
-        }
-        if let Some(user) = &self.user
-            && !name_ok(user, 32)
-        {
-            return Err(format!("not a user name: {user}"));
-        }
-        let runs_agents = matches!(
-            self.profile.as_str(),
-            "workstation" | "node" | "complete" | "custom"
-        );
-        if let Some(join) = &self.command {
-            if agentux_gateway::token_instance(&join.enrollment_token).is_none() {
-                return Err("command.enrollmentToken is not an AgentUX Command enrollment token (auxe1_...)".into());
-            }
-            if !runs_agents {
-                return Err(format!(
-                    "a {} machine runs no node to join Command",
-                    self.profile
-                ));
-            }
-            if self.user.is_none() {
-                return Err(
-                    "joining Command needs `user`: the account whose agents run here".into(),
-                );
-            }
-            if let Some(name) = &join.node_name
-                && !name_ok(name, 63)
-            {
-                return Err(format!("not a node name: {name}"));
-            }
-        }
-        if self.preferences.is_some() && self.user.is_none() {
-            return Err("`preferences` need `user`".into());
-        }
-        if let Some(prefs) = &self.preferences {
-            agentuxd::prefs::validate(prefs)?;
-        }
-        if let Some(policy) = &self.policy {
-            agentux_gateway::policy::Policy::parse(
-                &serde_json::to_string(policy).map_err(|e| e.to_string())?,
-            )?;
-        }
-        Ok(())
+    if let Some(policy) = &provision.policy {
+        agentux_gateway::policy::Policy::parse(
+            &serde_json::to_string(policy).map_err(|e| e.to_string())?,
+        )?;
     }
+    Ok(provision)
+}
+
+/// The agent preferences of a provision, as agentuxd reads them.
+fn preferences(provision: &Provision) -> std::result::Result<Option<AgentPrefs>, String> {
+    provision
+        .preferences
+        .clone()
+        .map(|prefs| serde_json::from_value(prefs).map_err(|e| format!("preferences: {e}")))
+        .transpose()
 }
 
 /// What provisioning does to the machine: real in `aux`, recorded in tests.
@@ -207,9 +118,9 @@ pub fn apply(
     // Its agentuxd and gateway run without anyone logged in.
     system.run("loginctl", &["enable-linger", user], &[])?;
     done.push(format!("{user}'s services run without a login"));
-    if let Some(prefs) = &provision.preferences {
+    if let Some(prefs) = preferences(provision)? {
         let path = home.join(".config/agentux/agents.yaml");
-        system.write(&path, &agentuxd::prefs::to_yaml(prefs), 0o644, Some(user))?;
+        system.write(&path, &agentuxd::prefs::to_yaml(&prefs), 0o644, Some(user))?;
         done.push(format!("agent preferences {}", path.display()));
     }
     if let Some(join) = &provision.command {
@@ -349,7 +260,7 @@ pub fn sources(cmdline: &str) -> Vec<PathBuf> {
 
 pub fn run_apply(file: &Path, dry_run: bool) -> Result {
     let text = fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
-    let provision = Provision::parse(&text)?;
+    let provision = parse(&text)?;
     if dry_run {
         println!("{} is valid: profile {}", file.display(), provision.profile);
         return Ok(());
@@ -474,7 +385,7 @@ mod tests {
 
     #[test]
     fn a_node_is_set_up_and_joins_command() {
-        let provision = Provision::parse(&full()).unwrap();
+        let provision = parse(&full()).unwrap();
         let mut system = Recorded::default();
         let done = apply(&provision, &mut system).unwrap();
         assert_eq!(done.len(), 6, "{done:?}");
@@ -498,7 +409,7 @@ mod tests {
 
     #[test]
     fn bad_files_are_refused_before_anything_changes() {
-        let refuse = |text: &str| Provision::parse(text).unwrap_err();
+        let refuse = |text: &str| parse(text).unwrap_err();
         assert!(refuse("version: 2\nprofile: node\n").contains("version"));
         assert!(refuse("version: 1\nprofile: server\n").contains("unknown profile"));
         assert!(refuse("version: 1\nprofile: node\nsecret: x\n").contains("not a valid"));
@@ -511,7 +422,7 @@ mod tests {
         );
         assert!(refuse("version: 1\nprofile: node\nhostname: 'a b'\n").contains("host name"));
         // JSON works too.
-        assert!(Provision::parse(r#"{"version": 1, "profile": "workstation"}"#).is_ok());
+        assert!(parse(r#"{"version": 1, "profile": "workstation"}"#).is_ok());
     }
 
     #[test]

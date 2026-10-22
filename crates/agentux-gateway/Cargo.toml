@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 agentux-api.workspace = true
+auxp.workspace = true
 futures-util.workspace = true
 jiff.workspace = true
 reqwest.workspace = true
