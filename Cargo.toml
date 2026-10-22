@@ -38,7 +38,7 @@ serde_json = "1"
 sigpipe = "0.1"
 serde-saphyr = { version = "2.0", default-features = false, features = ["deserialize"] }
 tempfile = "3.27"
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
 tokio = "1"
 tokio-util = "0.7"
 
