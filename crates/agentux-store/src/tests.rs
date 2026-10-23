@@ -31,6 +31,7 @@ fn sample_run(project_id: &str) -> RunRecord {
             cost_usd: 0.0,
             sessions: BTreeMap::new(),
             models: BTreeMap::new(),
+            origin: None,
         },
         phase: Phase::Setup,
         loops: BTreeMap::new(),
@@ -95,6 +96,12 @@ fn runs_round_trip_with_their_private_state() {
     record.run.pull_request = Some(PullRequest {
         number: 7,
         url: "https://example.test/pr/7".into(),
+    });
+    record.run.origin = Some(agentux_api::RunOrigin {
+        organization_id: "acme".into(),
+        mission_id: "ship".into(),
+        command_run_id: "run-1a2b".into(),
+        definition_version: Some("definition-3".into()),
     });
     store.write(|tx| tx.insert_run(&record)).unwrap();
 

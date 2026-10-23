@@ -475,7 +475,7 @@ fn limit_json(l: &HarnessLimit) -> Value {
 /// What Command sees of a run: its state, never the prompt's files or
 /// transcripts. The prompt itself is the human's request, so it is included.
 fn run_json(run: &Run) -> Value {
-    json!({
+    let mut value = json!({
         "runId": run.id,
         "localProjectId": run.project_id,
         "title": run.title,
@@ -493,7 +493,18 @@ fn run_json(run: &Run) -> Value {
         "error": run.error,
         "startedAt": rfc3339(run.started_at),
         "finishedAt": run.finished_at.map(rfc3339),
-    })
+    });
+    // A run Command started for a mission: correlated with Command's run,
+    // so Office follows the work across both (ADR 0015).
+    if let Some(origin) = &run.origin {
+        value["missionId"] = json!(origin.mission_id);
+        value["correlationId"] = json!(origin.command_run_id);
+        if let Some(version) = &origin.definition_version {
+            value["definitionVersion"] = json!(version);
+        }
+        value["origin"] = json!(origin);
+    }
+    value
 }
 
 fn request_json(request: &PermissionRequest) -> Value {
@@ -769,6 +780,38 @@ mod tests {
             token: "secret".into(),
             command_instance_id: Some("cmd-0123456789abcdef".into()),
         }
+    }
+
+    #[test]
+    fn a_mission_runs_events_are_correlated_with_command() {
+        let mut run: Run = serde_json::from_value(serde_json::json!({
+            "id": "local-7", "projectId": "p", "title": "Ship", "prompt": null, "issue": null,
+            "branch": null, "worktree": null, "steps": ["plan"], "stepIndex": 0, "step": "plan",
+            "status": "running", "roles": {}, "checks": [], "gateAttempt": 0, "gateMaxAttempts": 0,
+            "reviewRound": 0, "reviewMaxRounds": 0, "budgetUsd": null, "startedAt": 1, "updatedAt": 1,
+            "finishedAt": null, "pullRequest": null, "activity": "", "error": null
+        }))
+        .unwrap();
+        let plain = run_json(&run);
+        assert!(
+            plain.get("correlationId").is_none(),
+            "a run of its own: nothing to correlate"
+        );
+        run.origin = Some(agentux_api::RunOrigin {
+            organization_id: "acme".into(),
+            mission_id: "ship".into(),
+            command_run_id: "run-1a2b".into(),
+            definition_version: Some("definition-3".into()),
+        });
+        let json = run_json(&run);
+        assert_eq!(
+            json["runId"], "local-7",
+            "the node's own id stays the runId"
+        );
+        assert_eq!(json["correlationId"], "run-1a2b");
+        assert_eq!(json["missionId"], "ship");
+        assert_eq!(json["definitionVersion"], "definition-3");
+        assert_eq!(json["origin"]["commandRunId"], "run-1a2b");
     }
 
     #[test]

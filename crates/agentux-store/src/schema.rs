@@ -131,6 +131,11 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE runs ADD COLUMN models TEXT NOT NULL DEFAULT '{}';
     ",
+    // 7: the mission run a run belongs to (a `RunOrigin` as JSON), when
+    // AgentUX Command started it.
+    "
+    ALTER TABLE runs ADD COLUMN origin TEXT;
+    ",
 ];
 
 /// The schema version this build writes.

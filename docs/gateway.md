@@ -48,7 +48,7 @@ commands:
 | `run.snapshot`, `harness.list`, `harness.test` | allow | `runs.get`, `harnesses.list`, `harnesses.test` |
 | `run.cancel`, `request.resolve`, `bus.post`, `limits.clear` | allow | cancel a run, approve or deny a request (`resolution`, `answer`), post on a run's bus (`message.body`, `message.to`), lift a limit |
 | `run.pause`, `run.resume` | allow | not implemented by agentuxd yet: `-32601` |
-| `run.start`, `preferences.set` | confirm | start a run on the project whose origin is `repository` (cloned into `~/src` when the node has none), with optional `agents` and `models` per role; replace the agent preferences |
+| `run.start`, `preferences.set` | confirm | start a run on the project whose origin is `repository` (cloned into `~/src` when the node has none), with optional `agents` and `models` per role; with `missionId` and `runId` (and `definitionVersion`), the run belongs to that mission run of Command, and its `run.*` events carry `missionId`, `correlationId` (Command's run id), `definitionVersion` and `origin` (ADR 0015); replace the agent preferences |
 
 A held command answers `-32010` and sends `command.denied` (`awaiting_local_confirmation`); a refused one answers `-32011` (`denied_by_policy`). Held commands wait in `~/.local/state/agentux/gateway-pending.json`:
 

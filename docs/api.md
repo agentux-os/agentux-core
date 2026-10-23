@@ -20,7 +20,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 |---|---|---|
 | `projects.register` | `{ path }` — absolute path inside a git repository | `Project` (idempotent per repository) |
 | `projects.list` | — | `Project[]` |
-| `runs.start` | `{ projectId, prompt?, issue?, title?, roles?, models? }` — `prompt` or `issue` required; `roles` maps role names to harness ids for this run, `models` role names to models | `Run` |
+| `runs.start` | `{ projectId, prompt?, issue?, title?, roles?, models?, origin? }` — `prompt` or `issue` required; `roles` maps role names to harness ids for this run, `models` role names to models; `origin` (`{ organizationId, missionId, commandRunId, definitionVersion? }`) names the organization's mission run it belongs to when AgentUX Command starts it, and the run keeps it | `Run` |
 | `harnesses.test` | `{ harness, model? }` | `{ harness, ok, detail, seconds, limit }`: one short prompt, answered like a helper question (no tools); a usage limit in the answer is recorded |
 | `preferences.get` | none | `AgentPrefs`: the user's agent preferences; see [Agent preferences](#agent-preferences) |
 | `preferences.set` | `AgentPrefs` | `AgentPrefs`, as written to the file; an unknown harness or 0 minutes is `-32602` |

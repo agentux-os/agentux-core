@@ -237,6 +237,7 @@ impl Remote {
                 issue,
                 roles: choices.roles,
                 models: choices.models,
+                origin: None,
             })
             .await?;
         println!("{}", run.id);

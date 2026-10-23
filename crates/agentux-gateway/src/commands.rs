@@ -189,11 +189,31 @@ async fn start_run(client: &mut Client, params: &Value) -> Result<Value, Failure
                 .map(str::to_string),
             roles: map("agents"),
             models: map("models"),
+            origin: origin(params),
             ..Default::default()
         })
         .await
         .map_err(failed)?;
     value(json!({ "localRunId": run.id, "run": run }))
+}
+
+/// The organization's mission run a `run.start` from Command belongs to
+/// (ADR 0015): Command sends its mission, its run id and the definition
+/// version; a run.start without a mission has none.
+fn origin(params: &Value) -> Option<agentux_api::RunOrigin> {
+    let text = |name: &str| {
+        params
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string)
+    };
+    Some(agentux_api::RunOrigin {
+        organization_id: text("organizationId")?,
+        mission_id: text("missionId")?,
+        command_run_id: text("runId")?,
+        definition_version: text("definitionVersion"),
+    })
 }
 
 /// host/owner/repo of a remote URL, the same for its https and SSH forms.
@@ -527,6 +547,36 @@ pub fn policy_path() -> &'static Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_run_start_from_command_carries_its_mission_run() {
+        let params = serde_json::json!({
+            "organizationId": "acme", "missionId": "ship", "runId": "run-1a2b",
+            "definitionVersion": "definition-3", "repository": "r", "prompt": "p",
+        });
+        let origin = origin(&params).unwrap();
+        assert_eq!(
+            (
+                origin.organization_id.as_str(),
+                origin.mission_id.as_str(),
+                origin.command_run_id.as_str()
+            ),
+            ("acme", "ship", "run-1a2b")
+        );
+        assert_eq!(origin.definition_version.as_deref(), Some("definition-3"));
+        // An operator's own run.start (no mission) has none.
+        assert!(origin_of(serde_json::json!({"organizationId": "acme", "runId": "x"})).is_none());
+        assert!(
+            origin_of(
+                serde_json::json!({"organizationId": "acme", "missionId": " ", "runId": "x"})
+            )
+            .is_none()
+        );
+    }
+
+    fn origin_of(params: Value) -> Option<agentux_api::RunOrigin> {
+        origin(&params)
+    }
 
     #[test]
     fn repository_keys_match_across_url_forms() {
