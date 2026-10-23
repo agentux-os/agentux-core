@@ -186,6 +186,10 @@ pub struct Loop {
 #[serde(deny_unknown_fields, default)]
 pub struct Bus {
     pub max_turns_per_exchange: u32,
+    /// Tokens agents may send each other on the bus in one run (estimated
+    /// from the messages' text: ACP reports no token counts). Beyond it,
+    /// their posts are refused and they decide, or ask the human.
+    pub max_tokens_per_run: u32,
     pub allow: Vec<BusTool>,
 }
 
@@ -193,6 +197,7 @@ impl Default for Bus {
     fn default() -> Self {
         Self {
             max_turns_per_exchange: 6,
+            max_tokens_per_run: 50_000,
             allow: BusTool::ALL.to_vec(),
         }
     }

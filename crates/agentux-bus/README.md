@@ -24,6 +24,7 @@ The agent bus from [ADR 0004](https://github.com/agentux-os/agentux/blob/main/do
 Routing rules:
 
 - A message without `in_reply_to` starts an **exchange**; replies join it. Each message uses one turn. Once an exchange has used `bus.max_turns_per_exchange` turns, further posts in it fail with a tool error telling the agent to stop and decide, or ask the human. The human is never cut off.
+- A run also has a **token budget** for what its agents send each other (`bus.max_tokens_per_run`, 50,000 by default). ACP reports no token counts, so it is estimated from the messages' text, about four characters a token. Past it, agents' posts fail with the same advice: decide, or ask the human. The count survives a daemon restart. The human is never cut off.
 - A message to a role no live session plays is queued for the role, with a `Wake` for the role; the session the daemon starts for it finds the messages in its mailbox when it joins.
 - Messages to `run` are delivered to everyone else in the run without waking them, so a broadcast cannot set off a chain of turns.
 - `read_messages` comes with `post_message`: the default `agentux.yaml` lists `post_message` but not `read_messages`, and receiving is the other half of messaging.

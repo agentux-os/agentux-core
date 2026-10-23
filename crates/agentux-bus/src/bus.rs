@@ -32,6 +32,8 @@ pub const DEFAULT_ASK_HUMAN_WAIT: Duration = Duration::from_secs(120);
 pub struct BusConfig {
     /// Turns (messages) one exchange may have before posts in it are refused.
     pub max_turns_per_exchange: u32,
+    /// Estimated tokens agents may post in the run before posts are refused.
+    pub max_tokens_per_run: u32,
     /// Tools sessions may call. `read_messages` is implied by `post_message`:
     /// it is the receiving half of the same conversation.
     pub allow: Vec<BusTool>,
@@ -48,6 +50,7 @@ impl Default for BusConfig {
         let bus = agentux_config::Bus::default();
         Self {
             max_turns_per_exchange: bus.max_turns_per_exchange,
+            max_tokens_per_run: bus.max_tokens_per_run,
             allow: bus.allow,
             roles: BTreeSet::new(),
             review_role: None,
@@ -61,6 +64,7 @@ impl BusConfig {
     pub fn from_config(config: &Config) -> Self {
         Self {
             max_turns_per_exchange: config.bus.max_turns_per_exchange,
+            max_tokens_per_run: config.bus.max_tokens_per_run,
             allow: config.bus.allow.clone(),
             roles: config.roles.keys().cloned().collect(),
             review_role: config.pipeline.iter().find_map(|step| match step {
@@ -92,6 +96,7 @@ impl BusConfig {
 pub enum BusError {
     ToolNotAllowed { tool: String },
     TurnLimit { exchange: u64, max_turns: u32 },
+    TokenBudget { used: u64, budget: u32 },
     UnknownRun { run: RunId },
     RunAlreadyOpen { run: RunId },
     UnknownSession { session: SessionId },
@@ -121,6 +126,12 @@ impl fmt::Display for BusError {
                 "exchange {exchange} reached its limit of {max_turns} turns (bus.max_turns_per_exchange). \
                  Do not send more messages in it: decide with what you have and continue your task, \
                  or call ask_human if you are blocked."
+            ),
+            Self::TokenBudget { used, budget } => write!(
+                f,
+                "this run's agents have sent each other about {used} tokens, and its budget is {budget} \
+                 (bus.max_tokens_per_run). Do not send more messages: decide with what you have and \
+                 continue your task, or call ask_human if you are blocked."
             ),
             Self::UnknownRun { run } => write!(f, "run `{run}` is not open on the bus"),
             Self::RunAlreadyOpen { run } => write!(f, "run `{run}` is already open on the bus"),
@@ -191,6 +202,8 @@ struct State {
     sent: HashMap<u64, Sent>,
     /// Turns used per exchange.
     exchanges: HashMap<u64, u32>,
+    /// Estimated tokens agents have posted, per run.
+    run_tokens: HashMap<RunId, u64>,
     /// Questions waiting for the human.
     questions: BTreeMap<u64, HumanQuestion>,
     subscribers: Vec<mpsc::UnboundedSender<BusEvent>>,
@@ -408,7 +421,22 @@ impl State {
             }
         };
 
+        // Token budget: agents only; the human is never cut off.
+        let cost = if sender.max_turns.is_some() {
+            estimate_tokens(&body)
+        } else {
+            0
+        };
+        let used = self.run_tokens.get(run).copied().unwrap_or(0);
+        if cost > 0 && used + cost > u64::from(config.max_tokens_per_run) {
+            return Err(BusError::TokenBudget {
+                used,
+                budget: config.max_tokens_per_run,
+            });
+        }
+
         // Commit.
+        *self.run_tokens.entry(run.clone()).or_insert(0) += cost;
         self.next_message += 1;
         let message = Message {
             id: self.next_message,
@@ -502,6 +530,8 @@ pub struct Restore {
     pub sent: Vec<RestoredSent>,
     /// Messages waiting for a role, oldest first.
     pub queued: Vec<(String, Message)>,
+    /// Estimated tokens the run's agents had posted (its bus budget so far).
+    pub tokens: u64,
     /// Sessions of the previous daemon that never left the bus.
     pub gone: Vec<GoneSession>,
 }
@@ -611,6 +641,8 @@ impl Bus {
             let used = state.exchanges.entry(exchange).or_insert(0);
             *used = (*used).max(turns);
         }
+        let tokens = state.run_tokens.entry(run.clone()).or_insert(0);
+        *tokens = (*tokens).max(restore.tokens);
         for sent in restore.sent {
             state.next_message = state.next_message.max(sent.message);
             state.next_exchange = state.next_exchange.max(sent.exchange);
@@ -666,6 +698,7 @@ impl Bus {
     pub fn close_run(&self, run: &RunId) {
         let mut state = self.lock();
         state.runs.remove(run);
+        state.run_tokens.remove(run);
         state.sessions.retain(|_, entry| &entry.identity.run != run);
         state.role_queues.retain(|(r, _), _| r != run);
         state.questions.retain(|_, question| &question.run != run);
@@ -1011,4 +1044,10 @@ impl Bus {
             );
         }
     }
+}
+
+/// About how many tokens `text` is to a model: a quarter of its characters,
+/// rounded up (no tokenizer for every vendor; the budget is a guard rail).
+pub fn estimate_tokens(text: &str) -> u64 {
+    (text.chars().count() as u64).div_ceil(4)
 }

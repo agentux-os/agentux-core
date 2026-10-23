@@ -688,6 +688,7 @@ fn a_restored_bus_continues_exchanges_and_delivers_queued_mail() {
         &run,
         Restore {
             exchanges: vec![(1, 2)],
+            tokens: 0,
             sent: vec![
                 RestoredSent {
                     message: 1,
@@ -739,4 +740,86 @@ fn a_restored_bus_continues_exchanges_and_delivers_queued_mail() {
         bus.post_message(&s("impl"), reply(2, "more")),
         Err(BusError::TurnLimit { exchange: 1, .. })
     ));
+}
+
+#[test]
+fn a_run_stops_agents_talking_past_its_token_budget() {
+    // 10 tokens: two 24-character messages (6 tokens each) do not fit.
+    let mut f = fixture(BusConfig {
+        max_tokens_per_run: 10,
+        ..config()
+    });
+    let words = "x".repeat(24);
+    let first = f
+        .bus
+        .post_message(&s("impl"), post("session:rev", &words))
+        .unwrap();
+    let error = f
+        .bus
+        .post_message(&s("rev"), reply(first.message_id, &words))
+        .unwrap_err();
+    assert_eq!(
+        error,
+        BusError::TokenBudget {
+            used: 6,
+            budget: 10
+        }
+    );
+    let text = error.to_string();
+    assert!(text.contains("bus.max_tokens_per_run"), "{text}");
+    assert!(text.contains("ask_human"), "{text}");
+    // A new exchange is no way around it; a short message still fits.
+    assert!(matches!(
+        f.bus.post_message(&s("rev"), post("session:impl", &words)),
+        Err(BusError::TokenBudget { .. })
+    ));
+    f.bus
+        .post_message(&s("rev"), post("session:impl", "ok, done"))
+        .unwrap();
+    // The human is never cut off.
+    f.bus
+        .post_from_human(&f.run, post("session:impl", &"y".repeat(400)))
+        .unwrap();
+    drain(&mut f.events);
+}
+
+#[test]
+fn the_budget_used_survives_a_restart() {
+    let backend = Arc::new(MemoryBackend::default());
+    let bus = Bus::new(backend);
+    let run: RunId = RUN.into();
+    bus.open_run(
+        run.clone(),
+        "shop",
+        BusConfig {
+            max_tokens_per_run: 10,
+            ..config()
+        },
+    )
+    .unwrap();
+    bus.restore(
+        &run,
+        Restore {
+            tokens: 9,
+            ..Restore::default()
+        },
+    )
+    .unwrap();
+    bus.join(identity("impl", "implementer", "claude-code"))
+        .unwrap();
+    bus.join(identity("rev", "reviewer", "codex")).unwrap();
+    assert!(matches!(
+        bus.post_message(&s("impl"), post("session:rev", "eight chars")),
+        Err(BusError::TokenBudget {
+            used: 9,
+            budget: 10
+        })
+    ));
+    assert_eq!(agentux_bus::estimate_tokens("abcd"), 1);
+    assert_eq!(agentux_bus::estimate_tokens("abcde"), 2);
+    assert_eq!(
+        agentux_bus::estimate_tokens("ação"),
+        1,
+        "characters, not bytes"
+    );
 }

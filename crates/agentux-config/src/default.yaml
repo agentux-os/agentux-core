@@ -38,6 +38,7 @@ pipeline:
 # Agent bus limits (ADR 0004).
 bus:
   max_turns_per_exchange: 6
+  max_tokens_per_run: 50000     # agents' messages to each other, per run
   allow: [post_message, request_review, handoff, get_run_state, ask_human]
 
 budget:

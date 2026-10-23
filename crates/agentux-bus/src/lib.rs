@@ -28,7 +28,7 @@ pub use bridge::{
 };
 pub use bus::{
     Bus, BusConfig, BusError, DEFAULT_ASK_HUMAN_WAIT, GoneSession, Restore, RestoredSent,
-    restored_prompt, wake_prompt,
+    estimate_tokens, restored_prompt, wake_prompt,
 };
 pub use prompt::{description, session_prompt};
 pub use server::{BusServer, SERVER_NAME};
