@@ -134,6 +134,7 @@ fn adr_example_parses_into_the_expected_config() {
         budget: Budget {
             max_usd_per_run: Some(10.0),
         },
+        permissions: Default::default(),
     };
     assert_eq!(config, expected);
 }
@@ -793,5 +794,15 @@ fn isolation_image_resolves_from_the_devcontainer() {
     assert_eq!(
         image.to_string(),
         "mcr.microsoft.com/devcontainers/base:ubuntu (from .devcontainer/devcontainer.json)"
+    );
+}
+
+#[test]
+fn permission_policies_name_roles_of_the_project() {
+    let base = with_pipeline("  - step: pull_request\n");
+    assert_issue(
+        &format!("{base}permissions:\n  roles:\n    ghost:\n      edit: deny\n"),
+        "permissions.roles.ghost",
+        "not a role",
     );
 }

@@ -1049,6 +1049,8 @@ fn permissions(
     permission_handler(move |request: PermissionRequest| {
         let current = lock(&host).clone();
         let (title, detail) = describe(&role, &harness, &request);
+        let kind = request.kind.map(tool_kind);
+        let role = role.clone();
         let session_id = session_id.clone();
         let asking = Arc::clone(&asking);
         async move {
@@ -1056,7 +1058,9 @@ fn permissions(
                 return Decision::Deny;
             };
             asking.fetch_add(1, Ordering::SeqCst);
-            let allowed = host.ask_permission(&session_id, title, detail).await;
+            let allowed = host
+                .ask_permission(&session_id, &role, kind, title, detail)
+                .await;
             asking.fetch_sub(1, Ordering::SeqCst);
             if allowed {
                 Decision::Allow

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use agentux_api::{PullRequest, SessionEvent, SessionState, StepKind};
+use agentux_api::{PullRequest, SessionEvent, SessionState, StepKind, ToolKind};
 use agentux_harness::McpServer;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -138,11 +138,15 @@ pub trait StepHost: Send + Sync {
     /// Records the harness's own id of a session (the ACP session id).
     fn session_vendor_id(&self, _session_id: &str, _vendor_session_id: &str) {}
 
-    /// Asks whether the agent may run a tool call. Resolves to `true` when
-    /// allowed. Dropping the future withdraws the question.
+    /// Asks whether the agent playing `role` may run a tool call of `kind`.
+    /// The project's permission policy (ADR 0021) may answer at once;
+    /// otherwise the human does. Resolves to `true` when allowed. Dropping
+    /// the future withdraws the question.
     fn ask_permission(
         &self,
         session_id: &str,
+        role: &str,
+        kind: Option<ToolKind>,
         title: String,
         detail: String,
     ) -> BoxFuture<'static, bool>;
@@ -164,7 +168,14 @@ impl StepHost for NoHost {
 
     fn session_event(&self, _: &str, _: SessionEvent) {}
 
-    fn ask_permission(&self, _: &str, _: String, _: String) -> BoxFuture<'static, bool> {
+    fn ask_permission(
+        &self,
+        _: &str,
+        _: &str,
+        _: Option<ToolKind>,
+        _: String,
+        _: String,
+    ) -> BoxFuture<'static, bool> {
         Box::pin(async { false })
     }
 }
