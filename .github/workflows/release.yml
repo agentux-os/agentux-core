@@ -93,6 +93,14 @@ jobs:
             --define "srcroot ${GITHUB_WORKSPACE}" \
             --define "version_ ${{ steps.version.outputs.version }}"
 
+      # Signed with the AgentUX RPM key when the secret exists; the public
+      # key travels with the RPM (docs/releasing.md).
+      - name: Sign RPM
+        env:
+          AGENTUX_RPM_SIGNING_KEY: ${{ secrets.AGENTUX_RPM_SIGNING_KEY }}
+          AGENTUX_RPM_SIGNING_PASSPHRASE: ${{ secrets.AGENTUX_RPM_SIGNING_PASSPHRASE }}
+        run: sh .github/scripts/sign-rpms.sh target/rpmbuild/RPMS/${{ matrix.arch }}/agentux-*.${{ matrix.arch }}.rpm
+
       - name: Inspect RPM
         id: rpm
         run: |
@@ -122,7 +130,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: agentux-rpm-${{ matrix.arch }}
-          path: ${{ steps.rpm.outputs.path }}
+          path: |
+            ${{ steps.rpm.outputs.path }}
+            target/rpmbuild/RPMS/${{ matrix.arch }}/RPM-GPG-KEY-agentux
           if-no-files-found: error
 
   verify:
@@ -143,6 +153,16 @@ jobs:
       - uses: actions/download-artifact@v8
         with:
           name: agentux-rpm-${{ matrix.arch }}
+
+      - name: Check the signature
+        run: |
+          rpm_file=$(ls agentux-*.${{ matrix.arch }}.rpm)
+          if [ -f RPM-GPG-KEY-agentux ]; then
+            rpm --import RPM-GPG-KEY-agentux
+            rpm -K "$rpm_file" | tee /dev/stderr | grep -q 'signatures OK'
+          else
+            echo "::warning::$rpm_file is not signed"
+          fi
 
       - name: Install with dnf
         run: |
@@ -189,4 +209,6 @@ jobs:
           files: |
             agentux-*.x86_64.rpm
             agentux-*.aarch64.rpm
-          fail_on_unmatched_files: true
+            RPM-GPG-KEY-agentux
+          # The key is there only once the RPMs are signed.
+          fail_on_unmatched_files: false
