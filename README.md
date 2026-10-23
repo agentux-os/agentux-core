@@ -198,3 +198,18 @@ Linux is the target. The crate holding `aux` is named `aux-cli` because `aux` is
 ## License
 
 [Apache 2.0](LICENSE)
+
+## Runs with real agents
+
+`.github/workflows/real-harnesses.yml` runs the whole pipeline (plan,
+implement, gate, review, pull request) with Claude Code, Codex and
+Antigravity on a small sandbox project (`tests/e2e/`), on demand: it costs
+money on the vendors' APIs. A harness without credentials is skipped; the
+workflow's header lists the secrets each needs, and the optional sandbox
+repository where the run opens (and then closes) a draft pull request. The
+same script runs in CI with scripted agents, so its plumbing cannot rot:
+
+```sh
+AGENTUX_E2E_FAKE=1 sh tests/e2e/run-real.sh claude-code target/debug   # scripted
+sh tests/e2e/run-real.sh codex target/release                           # real, OPENAI_API_KEY set
+```
