@@ -729,6 +729,7 @@ impl Engine {
                 cost_usd: 0.0,
                 sessions: Default::default(),
                 models,
+                origin: params.origin,
             },
             phase: Phase::Setup,
             loops: Default::default(),

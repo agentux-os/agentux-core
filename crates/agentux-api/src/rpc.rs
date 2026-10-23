@@ -185,6 +185,9 @@ pub struct StartRun {
     /// Role name to the model it uses in this run (`planner: "opus"`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, String>,
+    /// The mission run this run belongs to, when Command starts it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<crate::RunOrigin>,
 }
 
 /// One entry of `harnesses.list`.

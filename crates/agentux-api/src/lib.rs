@@ -286,6 +286,25 @@ pub struct Run {
     pub activity: String,
     /// Why the run failed, if it did.
     pub error: Option<String>,
+    /// Where the run came from, when AgentUX Command started it for an
+    /// organization's mission (ADR 0015).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<RunOrigin>,
+}
+
+/// An organization's mission run a node's run belongs to (ADR 0015): what
+/// lets Command and Office follow the work across the node and Command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunOrigin {
+    pub organization_id: String,
+    pub mission_id: String,
+    /// Command's id of the mission run: the correlation of everything the
+    /// node reports about this run.
+    pub command_run_id: String,
+    /// The organization definition the mission run is pinned to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition_version: Option<String>,
 }
 
 /// One execution of one pipeline step.
