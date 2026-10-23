@@ -3,13 +3,18 @@
 //! answers the commands that come over it ([`crate::commands::handle`]).
 //! Every few seconds it also runs the held commands someone at the node
 //! decided on. It reconnects with backoff, and runs never depend on it.
+//!
+//! Commands run in a worker, one at a time and in order, while the
+//! connection keeps being read: a slow command (`run.start` registers a
+//! project and starts a run) does not leave pings unanswered or a close
+//! unnoticed. Why a connection ended is logged.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -61,12 +66,12 @@ pub async fn command_loop(
     options: CommandOptions,
     out: UnboundedSender<Out>,
 ) {
-    let pending = Pending::new(options.pending);
+    let mut pending = Pending::new(options.pending.clone());
     let mut answers = Answers::default();
     let mut backoff = Duration::from_secs(5);
     let mut said_down = false;
     loop {
-        let mut client = match agentux_api::Client::connect(&socket).await {
+        let client = match agentux_api::Client::connect(&socket).await {
             Ok(client) => client,
             Err(_) => {
                 tokio::time::sleep(Duration::from_secs(5)).await;
@@ -121,12 +126,28 @@ pub async fn command_loop(
         said_down = false;
         let _ = out.send(Out::Log("command connection to Command open".into()));
         let (mut write, mut read) = ws.split();
-        let mut decided = tokio::time::interval(Duration::from_secs(3));
-        loop {
+        let (jobs, jobs_rx) = mpsc::unbounded_channel::<Value>();
+        let (done_tx, mut done) = mpsc::unbounded_channel::<commands::Handled>();
+        let worker = tokio::spawn(worker(
+            client,
+            config.clone(),
+            options.policy.clone(),
+            pending,
+            answers,
+            jobs_rx,
+            done_tx,
+            out.clone(),
+        ));
+        let reason = loop {
             tokio::select! {
                 message = read.next() => {
                     let text = match message {
-                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        Some(Ok(Message::Close(frame))) => break match frame {
+                            Some(frame) => format!("closed by Command: {} {}", u16::from(frame.code), frame.reason),
+                            None => "closed by Command".to_string(),
+                        },
+                        None => break "the connection ended".to_string(),
+                        Some(Err(e)) => break format!("read error: {e}"),
                         Some(Ok(message)) if message.is_text() => message.to_text().unwrap_or_default().to_string(),
                         Some(Ok(_)) => continue,
                     };
@@ -134,31 +155,70 @@ pub async fn command_loop(
                     if request.get("method").is_none() || request.get("id").is_none() {
                         continue;
                     }
-                    let handled = commands::handle(
-                        &mut client,
-                        &config,
-                        &options.policy,
-                        &pending,
-                        &mut answers,
-                        &request,
-                    )
-                    .await;
-                    if write.send(Message::text(handled.response.to_string())).await.is_err() {
-                        break;
+                    let _ = jobs.send(request);
+                }
+                Some(handled) = done.recv() => {
+                    if let Err(e) = write.send(Message::text(handled.response.to_string())).await {
+                        break format!("write error: {e}");
                     }
                     if let Some((method, payload)) = handled.event {
                         let _ = out.send(Out::Event(method, payload));
                     }
                 }
-                _ = decided.tick() => {
-                    for (method, payload) in commands::run_decided(&mut client, &pending).await {
-                        let _ = out.send(Out::Event(method, payload));
-                    }
+            }
+        };
+        // The worker finishes the command it is on; an answer it gives after
+        // the connection ended is lost, and Command's resend of the same
+        // commandId gets it from `answers`.
+        drop(jobs);
+        (pending, answers) = match worker.await {
+            Ok(state) => state,
+            Err(_) => (Pending::new(options.pending.clone()), Answers::default()),
+        };
+        let _ = out.send(Out::Log(format!(
+            "command connection closed ({reason}); reconnecting"
+        )));
+    }
+}
+
+/// Runs a connection's commands in order, and the commands someone at the
+/// node decided on every few seconds; gives its state back when the
+/// connection's job channel closes.
+#[allow(clippy::too_many_arguments)]
+async fn worker(
+    mut client: agentux_api::Client,
+    config: NodeConfig,
+    policy: Policy,
+    pending: Pending,
+    mut answers: Answers,
+    mut jobs: UnboundedReceiver<Value>,
+    done: UnboundedSender<commands::Handled>,
+    out: UnboundedSender<Out>,
+) -> (Pending, Answers) {
+    let mut decided = tokio::time::interval(Duration::from_secs(3));
+    loop {
+        tokio::select! {
+            job = jobs.recv() => {
+                let Some(request) = job else { break };
+                let handled = commands::handle(
+                    &mut client,
+                    &config,
+                    &policy,
+                    &pending,
+                    &mut answers,
+                    &request,
+                )
+                .await;
+                let _ = done.send(handled);
+            }
+            _ = decided.tick() => {
+                for (method, payload) in commands::run_decided(&mut client, &pending).await {
+                    let _ = out.send(Out::Event(method, payload));
                 }
             }
         }
-        let _ = out.send(Out::Log("command connection closed; reconnecting".into()));
     }
+    (pending, answers)
 }
 
 #[cfg(test)]
