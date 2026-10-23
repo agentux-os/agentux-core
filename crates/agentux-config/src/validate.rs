@@ -172,6 +172,9 @@ impl RawConfig {
         if self.bus.max_turns_per_exchange == 0 {
             issues.push("bus.max_turns_per_exchange", "must be at least 1");
         }
+        if self.bus.max_tokens_per_run == 0 {
+            issues.push("bus.max_tokens_per_run", "must be at least 1");
+        }
         let mut tools = HashSet::new();
         for (i, tool) in self.bus.allow.iter().enumerate() {
             if !tools.insert(*tool) {

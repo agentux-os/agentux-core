@@ -122,6 +122,7 @@ fn adr_example_parses_into_the_expected_config() {
         ],
         bus: Bus {
             max_turns_per_exchange: 6,
+            max_tokens_per_run: 50_000,
             allow: vec![
                 BusTool::PostMessage,
                 BusTool::RequestReview,
@@ -620,6 +621,11 @@ fn bus_and_budget_limits_are_checked() {
     assert_issue(
         &format!("{base}bus:\n  max_turns_per_exchange: 0\n"),
         "bus.max_turns_per_exchange",
+        "at least 1",
+    );
+    assert_issue(
+        &format!("{base}bus:\n  max_tokens_per_run: 0\n"),
+        "bus.max_tokens_per_run",
         "at least 1",
     );
     assert_issue(

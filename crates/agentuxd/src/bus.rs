@@ -1020,6 +1020,11 @@ pub(crate) fn restore_from(log: &[BusMessage]) -> Restore {
                 };
                 let turns = exchanges.entry(exchange).or_insert(0);
                 *turns = (*turns).max(entry.turn);
+                if matches!(from, Participant::Session { .. })
+                    && entry.kind != BusMessageKind::HumanAnswer
+                {
+                    restore.tokens += agentux_bus::estimate_tokens(&entry.body);
+                }
                 restore.sent.push(RestoredSent {
                     message: id,
                     exchange,
