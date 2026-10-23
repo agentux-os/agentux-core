@@ -27,9 +27,11 @@ use agentux_api::rpc::{
 use agentux_api::{
     AttemptStatus, CheckResult, CheckStatus, EventBody, HarnessLimit, PermissionRequest, Project,
     RequestKind, RequestStatus, Run, RunStatus, Session, SessionEvent, SessionState, StepAttempt,
-    StepKind,
+    StepKind, ToolKind,
 };
-use agentux_config::{Config, DEVCONTAINER_FILES, FILE_NAME, IsolationMode, Loop, Role, Step};
+use agentux_config::{
+    Access, Config, DEVCONTAINER_FILES, FILE_NAME, IsolationMode, Loop, Permissions, Role, Step,
+};
 use agentux_store::{NewRequest, Phase, RunRecord, Store, Table, Tx, now_ms};
 use agentux_worktree::Worktrees;
 use tokio::sync::oneshot;
@@ -904,15 +906,52 @@ impl Engine {
         Ok(request)
     }
 
+    /// The permission policy of the `agentux.yaml` a run started with; none
+    /// for the built-in pipeline, or a run that cannot be read.
+    fn permissions_of(&self, run_id: &str) -> Permissions {
+        self.inner
+            .store
+            .read(|tx| tx.run(run_id))
+            .ok()
+            .flatten()
+            .and_then(|record| record.config_yaml)
+            .and_then(|yaml| Config::from_yaml(&yaml).ok())
+            .map(|config| config.permissions)
+            .unwrap_or_default()
+    }
+
     /// Creates a permission request for the agent of `host`'s step and
     /// returns a future that resolves with the human's answer.
     fn ask_permission(
         &self,
         host: &RunHost,
         session_id: &str,
+        role: &str,
+        kind: Option<ToolKind>,
         title: String,
         detail: String,
     ) -> BoxFuture<'static, bool> {
+        // The project's policy first (ADR 0021): a deny holds whatever the
+        // machine allows; an allow needs nobody; ask goes on as before.
+        let category = kind.map_or("other", ToolKind::as_str);
+        let decided = self.permissions_of(&host.run_id).decide(role, category);
+        if decided.access != Access::Ask {
+            let allowed = decided.access == Access::Allow;
+            let logged = self.inner.store.write(|tx| {
+                tx.log(
+                    &host.run_id,
+                    format!(
+                        "permission {} by {} ({role}, {category}): {title}",
+                        if allowed { "allowed" } else { "denied" },
+                        decided.rule
+                    ),
+                )
+            });
+            if let Err(e) = logged {
+                eprintln!("agentuxd: run {}: {e}", host.run_id);
+            }
+            return Box::pin(async move { allowed });
+        }
         if self.inner.settings.auto_approve_permissions {
             let logged = self.inner.store.write(|tx| {
                 tx.log(
@@ -2215,10 +2254,13 @@ impl StepHost for RunHost {
     fn ask_permission(
         &self,
         session_id: &str,
+        role: &str,
+        kind: Option<ToolKind>,
         title: String,
         detail: String,
     ) -> BoxFuture<'static, bool> {
-        self.engine.ask_permission(self, session_id, title, detail)
+        self.engine
+            .ask_permission(self, session_id, role, kind, title, detail)
     }
 }
 

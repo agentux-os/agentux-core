@@ -22,6 +22,7 @@ use serde::Deserialize;
 
 mod detect;
 mod isolation;
+mod permissions;
 mod validate;
 
 pub use detect::detect_checks;
@@ -29,6 +30,7 @@ pub use isolation::{
     DEFAULT_CHECK_TIMEOUT, DEFAULT_IMAGE, DEVCONTAINER_FILES, Image, ImageSource, Isolation,
     IsolationMode, devcontainer_image, format_timeout,
 };
+pub use permissions::{Access, CATEGORIES as PERMISSION_CATEGORIES, Decided, Permissions, Rules};
 
 /// Name of the pipeline file at the root of a project.
 pub const FILE_NAME: &str = "agentux.yaml";
@@ -54,6 +56,8 @@ pub struct Config {
     pub pipeline: Vec<Step>,
     pub bus: Bus,
     pub budget: Budget,
+    /// What agents may do without asking (ADR 0021).
+    pub permissions: Permissions,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

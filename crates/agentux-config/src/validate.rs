@@ -7,7 +7,7 @@ use serde::Deserialize;
 use crate::isolation::{image_issue, parse_timeout};
 use crate::{
     Budget, Bus, Check, Config, ConfigError, DEFAULT_CHECK_TIMEOUT, Isolation, IsolationMode,
-    Issue, Loop, Role, SUPPORTED_VERSION, Step, StepKind,
+    Issue, Loop, Permissions, Role, SUPPORTED_VERSION, Step, StepKind,
 };
 
 #[derive(Deserialize)]
@@ -24,6 +24,8 @@ pub(crate) struct RawConfig {
     bus: Bus,
     #[serde(default)]
     budget: Budget,
+    #[serde(default)]
+    permissions: Permissions,
 }
 
 #[derive(Deserialize)]
@@ -185,6 +187,15 @@ impl RawConfig {
             }
         }
 
+        for role in self.permissions.roles.keys() {
+            if !self.roles.contains_key(role) {
+                issues.push(
+                    format!("permissions.roles.{role}"),
+                    "is not a role of this project",
+                );
+            }
+        }
+
         if let Some(usd) = self.budget.max_usd_per_run {
             let valid = usd.is_finite() && usd > 0.0;
             if !valid {
@@ -203,6 +214,7 @@ impl RawConfig {
             pipeline,
             bus: self.bus,
             budget: self.budget,
+            permissions: self.permissions,
         })
     }
 }

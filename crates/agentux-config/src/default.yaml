@@ -43,3 +43,14 @@ bus:
 
 budget:
   max_usd_per_run: 10         # pause the run and ask the human when exceeded
+
+# What agents may do without asking (ADR 0021): allow, ask or deny per tool
+# category (read, edit, delete, move, search, execute, fetch, think, other),
+# with per-role rules first. Without this section everything is asked.
+# permissions:
+#   default: ask
+#   read: allow
+#   search: allow
+#   roles:
+#     reviewer:
+#       edit: deny

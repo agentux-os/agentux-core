@@ -619,3 +619,93 @@ async fn a_stalled_agent_is_given_up_on_and_the_run_waits() {
     assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
     assert_eq!(launched.lock().unwrap().len(), 2);
 }
+
+/// The run's log lines, as one text.
+fn run_log(engine: &Engine, run_id: &str) -> String {
+    engine
+        .store()
+        .read(|tx| tx.events_since(0, Some(run_id)))
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.body {
+            agentux_api::EventBody::Log { text } => Some(text),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(
+            "
+",
+        )
+}
+
+/// The careful pipeline with a permission policy.
+fn with_policy(policy: &str) -> String {
+    format!("{CAREFUL_PIPELINE}permissions:\n{policy}")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_policy_allows_without_asking_and_says_so() {
+    let f = fixture(&with_policy("  default: ask\n  execute: allow\n"));
+    let seen = Shared::default();
+    let (executor, _) = executor(&seen, careful);
+    let engine = f.engine(executor);
+    let run = start(&f, &engine, "Create hello.txt").await;
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+    assert!(
+        engine.requests(false).unwrap().is_empty(),
+        "nobody was asked"
+    );
+    assert_eq!(seen.lock().unwrap().permission_outcomes, ["allow"]);
+    let text = run_log(&engine, &run.id);
+    assert!(
+        text.contains("permission allowed by permissions.execute (implementer, execute)"),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_role_deny_holds_even_when_the_machine_approves_everything() {
+    let f = fixture(&with_policy(
+        "  execute: allow\n  roles:\n    implementer:\n      execute: deny\n",
+    ));
+    let seen = Shared::default();
+    let (executor, _) = executor(&seen, careful);
+    let engine = Engine::with_settings(
+        Store::open(&f.database).unwrap(),
+        executor,
+        Settings {
+            auto_approve_permissions: true,
+            ..Settings::default()
+        },
+    );
+    let run = start(&f, &engine, "Create hello.txt").await;
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(
+        run.status,
+        RunStatus::Failed,
+        "the agent was told no; the gate fails"
+    );
+    assert!(engine.requests(false).unwrap().is_empty());
+    assert_eq!(seen.lock().unwrap().permission_outcomes, ["deny"]);
+    let text = run_log(&engine, &run.id);
+    assert!(
+        text.contains("permission denied by permissions.roles.implementer.execute"),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ask_in_a_policy_still_asks_the_human() {
+    let f = fixture(&with_policy("  read: allow\n  execute: ask\n"));
+    let seen = Shared::default();
+    let (executor, _) = executor(&seen, careful);
+    let engine = f.engine(executor);
+    let (mut client, _stop) = serve(&f, &engine).await;
+    let run = start(&f, &engine, "Create hello.txt").await;
+    let request = pending_permission(&mut client).await;
+    assert_eq!(request.run_id, run.id);
+    client.approve(&request.id, None).await.unwrap();
+    let done = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(done.status, RunStatus::Done, "{:?}", done.error);
+}
