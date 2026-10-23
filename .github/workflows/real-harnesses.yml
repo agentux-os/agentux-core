@@ -1,0 +1,109 @@
+name: real harnesses
+
+# A full run (plan -> implement -> gate -> review -> pull request) with each
+# real agent CLI, on demand: tests/e2e/run-real.sh on tests/e2e/sandbox.
+# It spends real money on the vendors' APIs, so it runs only when started by
+# hand (or nightly, once the schedule below is turned on), and a harness
+# without its credentials is skipped, not failed.
+#
+# Credentials (repository secrets; never printed):
+#   claude-code  ANTHROPIC_API_KEY, or CLAUDE_CODE_OAUTH_TOKEN
+#   codex        OPENAI_API_KEY
+#   antigravity  AGENTUX_E2E_ANTIGRAVITY_TOKEN (its OAuth token file), and the
+#                variable ANTIGRAVITY_INSTALL (the command that installs
+#                agy-acp-server)
+# Pull requests (optional): variable AGENTUX_E2E_REPO (owner/name of a
+# sandbox repository) and secret AGENTUX_E2E_GITHUB_TOKEN (contents and pull
+# requests on it). Without them the pipeline stops after the review.
+
+on:
+  workflow_dispatch:
+    inputs:
+      harnesses:
+        description: Harnesses to run, space-separated
+        default: claude-code codex antigravity
+  # schedule:
+  #   - cron: "17 4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: ${{ matrix.harness }}
+    strategy:
+      fail-fast: false
+      matrix:
+        harness: [claude-code, codex, antigravity]
+    runs-on: ubuntu-24.04
+    container:
+      image: registry.fedoraproject.org/fedora:44
+    timeout-minutes: 75
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTIGRAVITY_TOKEN: ${{ secrets.AGENTUX_E2E_ANTIGRAVITY_TOKEN }}
+      ANTIGRAVITY_INSTALL: ${{ vars.ANTIGRAVITY_INSTALL }}
+      AGENTUX_E2E_REPO: ${{ vars.AGENTUX_E2E_REPO }}
+      GH_TOKEN: ${{ secrets.AGENTUX_E2E_GITHUB_TOKEN }}
+    steps:
+      - name: Requested and configured?
+        id: ready
+        env:
+          HARNESS: ${{ matrix.harness }}
+          REQUESTED: ${{ inputs.harnesses || 'claude-code codex antigravity' }}
+        run: |
+          ready=false
+          case " $REQUESTED " in *" $HARNESS "*) ;; *) echo "not requested"; echo "ready=false" >> "$GITHUB_OUTPUT"; exit 0 ;; esac
+          case "$HARNESS" in
+            claude-code) [ -n "$ANTHROPIC_API_KEY$CLAUDE_CODE_OAUTH_TOKEN" ] && ready=true ;;
+            codex) [ -n "$OPENAI_API_KEY" ] && ready=true ;;
+            antigravity) [ -n "$ANTIGRAVITY_TOKEN" ] && [ -n "$ANTIGRAVITY_INSTALL" ] && ready=true ;;
+          esac
+          [ "$ready" = true ] || echo "::notice::$HARNESS skipped: its credentials are not configured (see the workflow's header)"
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        if: steps.ready.outputs.ready == 'true'
+        run: |
+          dnf -y install --setopt=install_weak_deps=False \
+            git rustup gcc jq gh nodejs npm python3 >/dev/null
+
+      - uses: actions/checkout@v7
+        if: steps.ready.outputs.ready == 'true'
+
+      - name: Build aux and agentuxd
+        if: steps.ready.outputs.ready == 'true'
+        run: |
+          rustup-init -y --profile minimal --default-toolchain none --no-modify-path
+          export PATH="$HOME/.cargo/bin:$PATH"
+          rustup show active-toolchain || rustup toolchain install
+          cargo build --release --locked --bin aux --bin agentuxd
+
+      - name: Sign in to Antigravity
+        if: steps.ready.outputs.ready == 'true' && matrix.harness == 'antigravity'
+        run: |
+          sh -c "$ANTIGRAVITY_INSTALL"
+          mkdir -p "$HOME/.gemini/antigravity-cli"
+          printf '%s' "$ANTIGRAVITY_TOKEN" > "$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+          chmod 600 "$HOME/.gemini/antigravity-cli/antigravity-oauth-token"
+
+      - name: A full run
+        if: steps.ready.outputs.ready == 'true'
+        env:
+          AGENTUX_E2E_OUT: ${{ runner.temp }}
+        run: |
+          git config --global user.name agentux-e2e
+          git config --global user.email e2e@agentuxos.org
+          sh tests/e2e/run-real.sh "${{ matrix.harness }}" "$GITHUB_WORKSPACE/target/release"
+
+      - name: Keep the run's record
+        if: always() && steps.ready.outputs.ready == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: real-run-${{ matrix.harness }}
+          path: |
+            ${{ runner.temp }}/status.json
+            ${{ runner.temp }}/agentuxd.log
+          if-no-files-found: ignore
