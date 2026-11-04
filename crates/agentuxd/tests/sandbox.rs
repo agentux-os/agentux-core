@@ -310,3 +310,28 @@ fn nothing_outlives_the_sandbox() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn allowed_extra_paths_are_readable_and_nothing_else_is() {
+    if !available(AgentNetwork::None) {
+        return;
+    }
+    let s = setup();
+    std::fs::create_dir_all(s.home.join(".cargo/registry")).unwrap();
+    std::fs::write(s.home.join(".cargo/registry/index"), "crates").unwrap();
+    let mut p = profile(&s, AgentNetwork::None);
+    p.extra_read_only = vec![std::fs::canonicalize(s.home.join(".cargo/registry")).unwrap()];
+    let registry = p.extra_read_only[0].display().to_string();
+    let out = ok(&run(
+        &p,
+        &format!(
+            "cat {registry}/index; echo; \
+             (echo x > {registry}/index) 2>/dev/null && echo writable || echo read-only; \
+             test ! -e {home}/.ssh/id_ed25519 && echo no-ssh",
+            home = s.home.display()
+        ),
+    ));
+    for expected in ["crates", "read-only", "no-ssh"] {
+        assert!(out.contains(expected), "missing {expected:?} in {out}");
+    }
+}

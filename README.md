@@ -180,6 +180,13 @@ It never sees the daemon's control socket, `/run/user` (D-Bus, keyring, SSH agen
 
 **What still gets through.** It can reach the LAN and the internet, and send out what it can read: the worktree and its own harness's login. That's why this phase is for workstations; production nodes wait for the allow-list proxy.
 
+**Extra paths.** A project can't give a sandbox more of the host. The machine (`/etc/agentux/sandbox.yaml`) or the user (`~/.config/agentux/sandbox.yaml`, which no sandbox can write) can, read-only: `read_only: [~/.cargo/registry]`. A path is refused, with a note in the run's log, if it:
+- doesn't exist or goes through a symlink;
+- is the home or `/`;
+- is, contains or is inside a credential or harness-state location (`~/.ssh`, `~/.gnupg`, keyrings, `~/.config/gh`, `~/.aws`, `~/.kube`, `~/.docker`, browser profiles, `~/.claude`, `~/.codex`, …).
+
+**Hooks in the worktree.** The run's log warns when the repository's `core.hooksPath` points into the worktree, where the agent can edit the hooks.
+
 **Failures.** A missing `bwrap` or `pasta` fails the session instead of running it unconfined. The TUI handoff opens in the same sandbox. Antigravity isn't supported in the sandbox until its paths are verified.
 
 ## Tool catalog (MCP servers)
