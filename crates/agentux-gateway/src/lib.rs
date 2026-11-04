@@ -33,8 +33,8 @@ use std::{env, fs, io};
 
 use agentux_api::rpc::HarnessInfo;
 use agentux_api::{
-    Event, EventBody, HarnessLimit, PermissionRequest, Run, RunOrigin, RunStatus, SessionEvent,
-    SessionState, ToolStatus,
+    Event, EventBody, HarnessLimit, PermissionRequest, RequestStatus, Run, RunOrigin, RunStatus,
+    SessionEvent, SessionState, ToolStatus,
 };
 use auxp::activity::{ACTIVITY_SCHEMA_VERSION, Activity, ActivityKind};
 use auxp::replay::{ReplayResult, ReplayStatus};
@@ -1012,6 +1012,7 @@ async fn run_loop(
                     _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
                     Some(out) = out_rx.recv() => {
                         handle_gateway_out(out, &mut messages, &mut outbox, log)?;
+                        continue;
                     }
                 }
             }
