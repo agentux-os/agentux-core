@@ -587,7 +587,7 @@ impl Messages {
         };
         let activity = Activity {
             schema_version: ACTIVITY_SCHEMA_VERSION.into(),
-            activity_id: format!("local-event-{sequence}"),
+            activity_id: activity_id(&self.config.node_id, sequence),
             mission_id: origin.mission_id.clone(),
             run_id: origin.command_run_id.clone(),
             agent_id: session_id.to_string(),
@@ -699,6 +699,13 @@ impl Messages {
             sent_event_ids: HashSet::new(),
         }
     }
+}
+
+fn activity_id(node_id: &str, local_sequence: i64) -> String {
+    let suffix = format!("-event-{local_sequence}");
+    let prefix_limit = 128usize.saturating_sub(suffix.chars().count());
+    let prefix = node_id.chars().take(prefix_limit).collect::<String>();
+    format!("{prefix}{suffix}")
 }
 
 fn limit_json(l: &HarnessLimit) -> Value {
@@ -1328,14 +1335,14 @@ mod tests {
             assert_eq!(message["method"], "execution.activity");
             assert_eq!(message["params"]["sequence"], index + 1);
             assert_eq!(activity["schemaVersion"], "v1");
-            assert_eq!(activity["activityId"], "local-event-41");
+            assert_eq!(activity["activityId"], "node-01-event-41");
             assert_eq!(activity["missionId"], "mission-1");
             assert_eq!(activity["runId"], "command-run-1");
             assert_eq!(activity["roleId"], "implementer");
             assert_eq!(activity["type"], expected_type);
             assert_eq!(activity["toolName"], "execute");
             assert!(!message.to_string().contains("private"));
-            auxp::message::validate(&message).unwrap();
+            auxp::validate(&message).unwrap();
         }
     }
 
