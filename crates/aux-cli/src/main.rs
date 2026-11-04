@@ -258,7 +258,8 @@ enum ToolsCommand {
         #[arg(long)]
         file: Option<PathBuf>,
     },
-    /// Start an MCP server from the catalog and list the tools it offers
+    /// Start an MCP server from the catalog (or reach an HTTP one) and list
+    /// the tools it offers
     Test {
         name: String,
         /// Project whose agentux.yaml adds to the catalog
