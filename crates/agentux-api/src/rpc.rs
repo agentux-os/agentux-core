@@ -21,6 +21,9 @@ pub mod method {
     pub const HARNESSES_LIST: &str = "harnesses.list";
     /// The harness limits in force ([`crate::HarnessLimit`]).
     pub const LIMITS_LIST: &str = "limits.list";
+    /// The tool catalog: the machine's, the user's and, with a project, its
+    /// own ([`super::ListTools`], [`super::ToolsListing`]).
+    pub const TOOLS_LIST: &str = "tools.list";
     /// The human says a limit no longer holds ([`super::ClearLimit`]).
     pub const LIMITS_CLEAR: &str = "limits.clear";
     /// One short prompt to a harness, to see that it answers
@@ -322,6 +325,58 @@ pub struct RolePref {
     pub harness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListTools {
+    /// Also the project's `tools` in its `agentux.yaml`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+}
+
+/// The merged tool catalog, without any value of a secret or a plain
+/// variable.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsListing {
+    pub mcp: Vec<ToolInfo>,
+    /// Catalog files that could not be used, and why.
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolInfo {
+    pub name: String,
+    /// The catalog it comes from: `machine`, `user` or `project`.
+    pub source: String,
+    /// A started server's command and arguments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// An HTTP server's URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The harnesses it is for; `None`: every harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harnesses: Option<Vec<String>>,
+    /// Its environment variables' and headers' names.
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub headers: Vec<String>,
+    /// The secrets it needs and whether each is set; sessions go without it
+    /// while one isn't.
+    #[serde(default)]
+    pub secrets: Vec<ToolSecret>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolSecret {
+    pub name: String,
+    pub set: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

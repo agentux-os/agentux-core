@@ -494,6 +494,35 @@ impl Engine {
     }
 
     /// The harness limits in force.
+    /// The tool catalog sessions get, with the project's when given
+    /// (`tools.list`).
+    pub fn tools(&self, project_id: Option<&str>) -> Result<agentux_api::rpc::ToolsListing> {
+        let mut notes = Vec::new();
+        let project = match project_id {
+            None => Default::default(),
+            Some(id) => {
+                let project = self
+                    .inner
+                    .store
+                    .read(|tx| tx.project(id))?
+                    .ok_or_else(|| Error::NotFound(format!("no project {id}")))?;
+                match Config::load(Path::new(&project.path)) {
+                    Ok(config) => config.tools,
+                    Err(e) => {
+                        notes.push(format!(
+                            "tools: {}'s agentux.yaml is not used: {e}",
+                            project.name
+                        ));
+                        Default::default()
+                    }
+                }
+            }
+        };
+        let (catalog, more) = crate::tools::catalog(project);
+        notes.extend(more);
+        Ok(crate::tools::listing(&catalog, notes, crate::tools::secret))
+    }
+
     pub fn limits(&self) -> Result<Vec<HarnessLimit>> {
         Ok(self.inner.store.read(|tx| tx.limits(now_ms()))?)
     }
