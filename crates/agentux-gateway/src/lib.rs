@@ -560,7 +560,17 @@ impl Messages {
             } => {
                 let tool_name = tool
                     .as_ref()
-                    .map(|tool| format!("{tool:?}").to_lowercase())
+                    .map(|tool| match tool {
+                        agentux_api::ToolKind::Read => "read",
+                        agentux_api::ToolKind::Edit => "edit",
+                        agentux_api::ToolKind::Delete => "delete",
+                        agentux_api::ToolKind::Move => "move",
+                        agentux_api::ToolKind::Search => "search",
+                        agentux_api::ToolKind::Execute => "execute",
+                        agentux_api::ToolKind::Fetch => "fetch",
+                        agentux_api::ToolKind::Think | agentux_api::ToolKind::Other => "other",
+                    })
+                    .map(str::to_string)
                     .unwrap_or_else(|| "other".into());
                 let summary = match status {
                     ToolStatus::Running => format!("Agent started a {tool_name} operation"),
@@ -874,7 +884,7 @@ impl Outbox {
         while index < self.queue.len() {
             let message = self.queue[index].clone();
             let event_id = message["params"]["eventId"].as_str();
-            if event_id.is_some_and(|id| self.sent_event_ids.contains(id)) {
+            if retain_events && event_id.is_some_and(|id| self.sent_event_ids.contains(id)) {
                 index += 1;
                 continue;
             }
@@ -1424,6 +1434,11 @@ mod tests {
         assert_eq!(outbox.queue.front(), Some(&message));
 
         outbox.acknowledge_through(1);
+        assert!(outbox.is_empty());
+
+        outbox.push(messages.limits_changed(&[]));
+        assert_eq!(outbox.flush(&Accepting, true).await.unwrap().0, 1);
+        assert_eq!(outbox.flush(&Accepting, false).await.unwrap().0, 1);
         assert!(outbox.is_empty());
     }
 
