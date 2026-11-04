@@ -1526,6 +1526,12 @@ tools:
       command: secret-mcp
       env:
         KEY: { secret: AGENTUX_TEST_NO_SUCH_SECRET }
+  instructions:
+    - name: house-style
+      text: Write commit messages in the imperative.
+    - name: reviewers
+      text: Only for reviewers.
+      harnesses: [fake-reviewer]
 ";
 
 /// The tool catalog's MCP servers reach every session next to the bus;
@@ -1550,6 +1556,23 @@ async fn sessions_get_the_tool_catalogs_servers() {
     assert_eq!(
         docs.env,
         [("DOCS_MODE".to_string(), "read-only".to_string())]
+    );
+
+    // The catalog's instructions come with the session's first prompt, only
+    // those for its harness.
+    let first = eventually("the first prompt", || {
+        prompts_of(&seen, "fake-coder").first().cloned()
+    })
+    .await;
+    assert!(
+        first.contains("## Instructions from the AgentUX tool catalog")
+            && first.contains("### house-style\n\nWrite commit messages in the imperative."),
+        "{first}"
+    );
+    assert!(!first.contains("Only for reviewers"), "{first}");
+    assert!(
+        first.find("house-style") < first.find("## Your step"),
+        "instructions come before the step: {first}"
     );
 
     let log = eventually("the catalog notes", || {
