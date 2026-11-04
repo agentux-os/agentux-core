@@ -29,6 +29,7 @@ pub mod quota;
 pub mod secrets;
 pub mod server;
 mod terminal;
+pub mod tools;
 
 pub use acp::{AcpExecutor, HarnessLauncher, LaunchSpec, Launcher, StallLimits};
 pub use bus::{BusLink, aux_binary};

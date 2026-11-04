@@ -199,6 +199,17 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         set: Option<PathBuf>,
     },
+    /// Show the tool catalog: the MCP servers every harness's sessions get
+    /// (/etc/agentux/tools.yaml, ~/.config/agentux/tools.yaml and the
+    /// project's agentux.yaml `tools`), and whether their secrets are set
+    Tools {
+        /// Project whose agentux.yaml adds to the catalog
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Only what this harness's sessions get
+        #[arg(long)]
+        harness: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -333,6 +344,7 @@ fn main() -> ExitCode {
         Command::Ps { all, json: true } => return remote::ps_json(cli.socket, all),
         Command::Node(command) => node(cli.socket, command),
         Command::Preferences { json, set } => preferences(json, set),
+        Command::Tools { project, harness } => tools(&project, harness.as_deref()),
         Command::Provision(ProvisionCommand::Apply { file, dry_run }) => {
             provision::run_apply(&file, dry_run)
         }
@@ -509,6 +521,47 @@ fn node(socket: Option<PathBuf>, command: NodeCommand) -> Result {
 
 /// The agent preferences straight from their file, so it works without the
 /// daemon (agentuxd reads the same file each time it needs it).
+fn tools(project: &std::path::Path, harness: Option<&str>) -> Result {
+    let config = Config::load(project).map_err(|e| format!("{}: {e}", project.display()))?;
+    let (catalog, notes) = agentuxd::tools::catalog(config.tools);
+    for note in &notes {
+        eprintln!("{note}");
+    }
+    if catalog.is_empty() {
+        println!("no MCP servers in the tool catalog");
+        return Ok(());
+    }
+    for tool in catalog.mcp.values() {
+        if harness.is_some_and(|h| !tool.applies_to(h)) {
+            continue;
+        }
+        let command = std::iter::once(tool.command.as_str())
+            .chain(tool.args.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ");
+        println!("{} ({} catalog)", tool.name, tool.source);
+        println!("  command: {command}");
+        match &tool.harnesses {
+            Some(list) => println!("  harnesses: {}", list.join(", ")),
+            None => println!("  harnesses: all"),
+        }
+        for (var, value) in &tool.env {
+            match value {
+                agentux_config::EnvValue::Plain(value) => println!("  {var}={value}"),
+                agentux_config::EnvValue::Secret { secret } => {
+                    let state = if agentuxd::tools::secret(secret).is_some() {
+                        "set"
+                    } else {
+                        "NOT SET: the server is left out"
+                    };
+                    println!("  {var}: secret {secret} ({state})");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn preferences(json: bool, set: Option<PathBuf>) -> Result {
     let path = agentuxd::prefs::default_path().ok_or("neither XDG_CONFIG_HOME nor HOME is set")?;
     if let Some(file) = set {
@@ -617,6 +670,7 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
             Command::Validate { .. }
             | Command::Node(_)
             | Command::Preferences { .. }
+            | Command::Tools { .. }
             | Command::Provision(_)
             | Command::Worktree(_)
             | Command::Exec { .. }

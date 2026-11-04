@@ -1897,6 +1897,37 @@ fn pending_request(tx: &Tx<'_>, request_id: &str) -> Result<(PermissionRequest, 
 }
 
 /// The pipeline the run started with.
+impl Engine {
+    /// The tool catalog's MCP servers for a session of `run_id` with
+    /// `harness`, and notes on what it goes without.
+    pub(crate) fn session_tools(
+        &self,
+        run_id: &str,
+        harness: &str,
+    ) -> (Vec<agentux_harness::McpServer>, Vec<String>) {
+        let mut notes = Vec::new();
+        let project = self
+            .inner
+            .store
+            .read(|tx| {
+                let record = tx
+                    .run(run_id)?
+                    .ok_or_else(|| Error::NotFound(format!("no run {run_id}")))?;
+                let root = project_root(tx, &record)?;
+                config_of(&record, &root).map(|config| config.tools)
+            })
+            .unwrap_or_else(|e| {
+                notes.push(format!("tools: the project's catalog is not used: {e}"));
+                Default::default()
+            });
+        let (catalog, more) = crate::tools::catalog(project);
+        notes.extend(more);
+        let (servers, more) = crate::tools::servers(&catalog, harness, crate::tools::secret);
+        notes.extend(more);
+        (servers, notes)
+    }
+}
+
 pub(crate) fn config_of(record: &RunRecord, project_root: &Path) -> Result<Config> {
     let mut config = match &record.config_yaml {
         Some(yaml) => Config::from_yaml(yaml)
@@ -2180,7 +2211,7 @@ impl StepHost for RunHost {
             })
             .map_err(|e| e.to_string())?;
         // A session without the bus still works; say why it has none.
-        let (mcp_servers, system_prompt) = self
+        let (mut mcp_servers, system_prompt) = self
             .engine
             .bus_attach(&self.run_id, &self.role, harness, &session.id)
             .unwrap_or_else(|e| {
@@ -2192,6 +2223,13 @@ impl StepHost for RunHost {
                 });
                 (Vec::new(), None)
             });
+        // The tool catalog's MCP servers, the same for every harness; the
+        // run's log says which ones this session goes without.
+        let (tools, notes) = self.engine.session_tools(&self.run_id, harness);
+        mcp_servers.extend(tools);
+        for note in notes {
+            self.record("a tool catalog note", |tx| Ok(tx.log(&self.run_id, note)?));
+        }
         Ok(OpenedSession {
             id: session.id,
             mcp_servers,

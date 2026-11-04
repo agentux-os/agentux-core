@@ -10,6 +10,9 @@
 //! Without a file, [`Config::default_for`] builds the built-in pipeline with
 //! checks detected from the project (see [`detect_checks`]).
 //!
+//! `tools` declares MCP servers for every harness's sessions; see
+//! [`ToolCatalog`].
+//!
 //! `isolation` (ADR 0009) says whether gate steps run their checks on the
 //! host or in a rootless Podman container; see [`Isolation`].
 
@@ -23,6 +26,7 @@ use serde::Deserialize;
 mod detect;
 mod isolation;
 mod permissions;
+mod tools;
 mod validate;
 
 pub use detect::detect_checks;
@@ -31,6 +35,10 @@ pub use isolation::{
     IsolationMode, devcontainer_image, format_timeout,
 };
 pub use permissions::{Access, CATEGORIES as PERMISSION_CATEGORIES, Decided, Permissions, Rules};
+pub use tools::{
+    EnvValue, MACHINE_FILE as TOOLS_MACHINE_FILE, McpTool, RESERVED_NAME as TOOLS_RESERVED_NAME,
+    Source as ToolSource, ToolCatalog, user_file as tools_user_file,
+};
 
 /// Name of the pipeline file at the root of a project.
 pub const FILE_NAME: &str = "agentux.yaml";
@@ -58,6 +66,9 @@ pub struct Config {
     pub budget: Budget,
     /// What agents may do without asking (ADR 0021).
     pub permissions: Permissions,
+    /// The project's MCP servers, over the machine's and the user's
+    /// (agentux-core#68).
+    pub tools: ToolCatalog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
