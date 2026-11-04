@@ -80,7 +80,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn Error>> {
     let prefs_path = prefs::default_path();
     let stall_prefs = prefs_path.clone();
     let executor: Arc<dyn StepExecutor> = if options.fake_agents {
-        Arc::new(FakeExecutor::default())
+        Arc::new(FakeExecutor::demo())
     } else {
         // Read each turn, so an edit applies without a restart.
         Arc::new(AcpExecutor::default().with_stall_source(move || {
