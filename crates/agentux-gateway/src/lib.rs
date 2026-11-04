@@ -1348,6 +1348,7 @@ mod tests {
             assert_eq!(activity["toolName"], "execute");
             assert_eq!(activity["toolCallId"], "tool-9");
             assert!(!message.to_string().contains("PRIVATE"));
+            assert!(!message.to_string().contains("fixture-secret"));
             auxp::validate(&message).unwrap();
             emitted.push(message);
         }
