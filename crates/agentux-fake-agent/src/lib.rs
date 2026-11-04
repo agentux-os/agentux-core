@@ -210,6 +210,8 @@ pub struct Setup {
     pub load_session: bool,
     /// Called with the session id of each `session/load` request.
     pub on_load_session: Box<dyn Fn(&str) + Send + Sync>,
+    /// Advertise `mcpCapabilities.http`.
+    pub mcp_http: bool,
 }
 
 /// The history a loaded session replays.
@@ -223,6 +225,7 @@ impl Default for Setup {
             on_set_config: Box::new(|_, _| {}),
             load_session: false,
             on_load_session: Box::new(|_| {}),
+            mcp_http: false,
         }
     }
 }
@@ -238,6 +241,7 @@ pub fn spawn_with(
         on_set_config,
         load_session,
         on_load_session,
+        mcp_http,
     } = setup;
     let model_option = (!models.is_empty()).then(|| {
         acp::SessionConfigOption::select(
@@ -264,7 +268,9 @@ pub fn spawn_with(
             async move |request: acp::InitializeRequest, responder, _cx| {
                 responder.respond(
                     acp::InitializeResponse::new(request.protocol_version).agent_capabilities(
-                        acp::AgentCapabilities::new().load_session(load_session),
+                        acp::AgentCapabilities::new()
+                            .load_session(load_session)
+                            .mcp_capabilities(acp::McpCapabilities::new().http(mcp_http)),
                     ),
                 )
             },

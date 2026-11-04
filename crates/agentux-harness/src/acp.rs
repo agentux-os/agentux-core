@@ -130,6 +130,8 @@ pub struct AcpSession {
     model: ModelSelection,
     /// The agent advertised `loadSession`.
     can_load: bool,
+    /// MCP servers left out because the agent can't use their transport.
+    unsupported_mcp: Vec<String>,
 }
 
 impl AcpSession {
@@ -238,10 +240,18 @@ impl AcpSession {
             .block_task()
             .await?;
         let can_load = initialized.agent_capabilities.load_session;
+        // HTTP MCP servers go only to agents that say they can use them.
+        let http = initialized.agent_capabilities.mcp_capabilities.http;
+        let (mcp_servers, unsupported_mcp): (Vec<McpServer>, Vec<McpServer>) = options
+            .mcp_servers
+            .iter()
+            .cloned()
+            .partition(|server| server.url.is_none() || http);
+        let unsupported_mcp: Vec<String> = unsupported_mcp.into_iter().map(|s| s.name).collect();
         let (session_id, config_options) = match &options.load {
             None => {
                 let session = connection
-                    .send_request(new_session_request(cwd, &options.mcp_servers))
+                    .send_request(new_session_request(cwd, &mcp_servers))
                     .block_task()
                     .await?;
                 (session.session_id, session.config_options)
@@ -253,7 +263,7 @@ impl AcpSession {
                 let loaded = connection
                     .send_request(
                         acp::LoadSessionRequest::new(session_id.clone(), cwd)
-                            .mcp_servers(mcp_servers(&options.mcp_servers)),
+                            .mcp_servers(acp_mcp_servers(&mcp_servers)),
                     )
                     .block_task()
                     .await;
@@ -279,6 +289,7 @@ impl AcpSession {
                 process: None,
                 model,
                 can_load,
+                unsupported_mcp,
             },
             events,
         ))
@@ -302,6 +313,12 @@ impl AcpSession {
     /// Whether the model asked for in [`SessionOptions`] is in use.
     pub fn model_selection(&self) -> &ModelSelection {
         &self.model
+    }
+
+    /// The MCP servers this session went without: HTTP servers, when the
+    /// agent doesn't support HTTP MCP servers.
+    pub fn unsupported_mcp_servers(&self) -> &[String] {
+        &self.unsupported_mcp
     }
 }
 
@@ -466,14 +483,24 @@ impl Drop for AgentProcess {
 
 /// The `session/new` request for `cwd`, with `mcp_servers` as stdio servers.
 fn new_session_request(cwd: &Path, servers: &[McpServer]) -> acp::NewSessionRequest {
-    acp::NewSessionRequest::new(cwd).mcp_servers(mcp_servers(servers))
+    acp::NewSessionRequest::new(cwd).mcp_servers(acp_mcp_servers(servers))
 }
 
-/// `mcp_servers` as ACP stdio servers.
-fn mcp_servers(mcp_servers: &[McpServer]) -> Vec<acp::McpServer> {
+/// `mcp_servers` as ACP servers: HTTP when they have a URL, stdio otherwise.
+fn acp_mcp_servers(mcp_servers: &[McpServer]) -> Vec<acp::McpServer> {
     mcp_servers
         .iter()
         .map(|server| {
+            if let Some(url) = &server.url {
+                let headers = server
+                    .headers
+                    .iter()
+                    .map(|(name, value)| acp::HttpHeader::new(name.clone(), value.clone()))
+                    .collect();
+                return acp::McpServer::Http(
+                    acp::McpServerHttp::new(server.name.clone(), url.clone()).headers(headers),
+                );
+            }
             let env = server
                 .env
                 .iter()

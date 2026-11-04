@@ -58,13 +58,18 @@ pub trait HarnessSession {
 /// An MCP server the agent connects to for the session, such as the
 /// `agentux` bus (ADR 0004). Launched by the agent as a subprocess speaking
 /// MCP over stdio, the one transport every ACP agent must support.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct McpServer {
     /// Name the agent shows the server's tools under.
     pub name: String,
     pub command: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Set for a server reached over HTTP instead of started over stdio
+    /// (ACP passes it only to agents with `mcpCapabilities.http`).
+    pub url: Option<String>,
+    /// An HTTP server's request headers.
+    pub headers: Vec<(String, String)>,
 }
 
 /// Receives the events of a session.
