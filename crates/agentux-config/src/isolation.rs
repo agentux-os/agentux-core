@@ -27,6 +27,60 @@ pub struct Isolation {
     pub image: Option<String>,
     /// Whether the container gets a network. Off by default.
     pub network: bool,
+    /// Where agent sessions run (ADRs 0023 and 0024).
+    pub agents: AgentIsolation,
+}
+
+/// Where agent sessions run: on the host, or in a Bubblewrap sandbox
+/// (ADRs 0023 and 0024). A project can turn the sandbox on and narrow its
+/// network; it cannot add host paths to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentIsolation {
+    #[serde(default)]
+    pub mode: AgentIsolationMode,
+    #[serde(default)]
+    pub network: AgentNetwork,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentIsolationMode {
+    /// Agents run on the host, as the user running `agentuxd`.
+    #[default]
+    None,
+    /// Agents run in a Bubblewrap sandbox.
+    Bubblewrap,
+}
+
+impl AgentIsolationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Bubblewrap => "bubblewrap",
+        }
+    }
+}
+
+/// A sandboxed session's network.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentNetwork {
+    /// Its own network namespace, connected outward through pasta, with no
+    /// route to the host's loopback.
+    #[default]
+    Outbound,
+    /// No network at all.
+    None,
+}
+
+impl AgentNetwork {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Outbound => "outbound",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]

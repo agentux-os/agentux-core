@@ -31,9 +31,20 @@ jobs:
           channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
           rustup toolchain install "$channel" --profile minimal --component rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
+      # The agent sandbox's tests (ADRs 0023 and 0024) run for real: Bubblewrap
+      # and pasta, with the unprivileged user namespaces Ubuntu's AppArmor
+      # restricts by default (Fedora, where AgentUX runs, allows them).
+      - name: Install the agent sandbox's tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends bubblewrap passt
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+        env:
+          # A skip of the sandbox tests here would hide a regression.
+          AGENTUX_SANDBOX_TESTS: "1"
       # The real-harness run's plumbing, with scripted agents (no credentials):
       # tests/e2e/run-real.sh, as .github/workflows/real-harnesses.yml runs it.
       - name: Real-harness run, scripted

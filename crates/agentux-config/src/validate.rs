@@ -43,9 +43,13 @@ struct RawCheck {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawIsolation {
+    /// Checks' mode; `none` when only `agents` is set.
+    #[serde(default)]
     mode: IsolationMode,
     image: Option<String>,
     network: Option<bool>,
+    #[serde(default)]
+    agents: crate::AgentIsolation,
 }
 
 /// Every field any step type may use; which ones are allowed depends on
@@ -255,6 +259,7 @@ impl RawIsolation {
             mode: self.mode,
             image: self.image,
             network: self.network.unwrap_or(false),
+            agents: self.agents,
         }
     }
 }

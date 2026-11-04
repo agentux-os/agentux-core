@@ -1898,6 +1898,51 @@ fn pending_request(tx: &Tx<'_>, request_id: &str) -> Result<(PermissionRequest, 
 
 /// The pipeline the run started with.
 impl Engine {
+    /// The sandbox a session of `run_id` with `harness` in `worktree` runs
+    /// in: `None` when the run doesn't ask for one, an error when it does
+    /// and the sandbox can't be set up (the session must not start
+    /// unconfined).
+    pub(crate) fn sandbox_profile(
+        &self,
+        run_id: &str,
+        harness: &str,
+        worktree: &Path,
+    ) -> std::result::Result<Option<crate::sandbox::Profile>, String> {
+        let isolation = self
+            .inner
+            .store
+            .read(|tx| {
+                let record = tx
+                    .run(run_id)?
+                    .ok_or_else(|| Error::NotFound(format!("no run {run_id}")))?;
+                let root = project_root(tx, &record)?;
+                config_of(&record, &root).map(|config| config.isolation.agents)
+            })
+            .map_err(|e| format!("cannot read the run's isolation: {e}"))?;
+        if isolation.mode == agentux_config::AgentIsolationMode::None {
+            return Ok(None);
+        }
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or("the agent sandbox needs $HOME")?;
+        let mut profile =
+            crate::sandbox::Profile::new(harness, isolation.network, &home, worktree)?;
+        for program in profile.required_programs() {
+            if !crate::sandbox::on_path(program) {
+                return Err(format!(
+                    "the agent sandbox needs `{program}`, which is not installed; the session is not started unconfined"
+                ));
+            }
+        }
+        profile.git_dir = crate::sandbox::git_dir(worktree);
+        profile.git_identity = crate::sandbox::git_identity(worktree);
+        profile
+            .prepare()
+            .map_err(|e| format!("cannot prepare the agent sandbox: {e}"))?;
+        Ok(Some(profile))
+    }
+
     /// The tool catalog's MCP servers for a session of `run_id` with
     /// `harness`, and notes on what it goes without.
     pub(crate) fn session_tools(
@@ -2177,6 +2222,11 @@ impl StepHost for RunHost {
         harness: &str,
         model: Option<&str>,
     ) -> std::result::Result<OpenedSession, String> {
+        // The sandbox first: a session that should be sandboxed and can't be
+        // never starts unconfined.
+        let mut sandbox =
+            self.engine
+                .sandbox_profile(&self.run_id, harness, Path::new(&self.cwd))?;
         let now = now_ms();
         let mut session = Session {
             // Replaced by an unused id when the session is inserted.
@@ -2211,9 +2261,15 @@ impl StepHost for RunHost {
             })
             .map_err(|e| e.to_string())?;
         // A session without the bus still works; say why it has none.
-        let (mut mcp_servers, system_prompt) = self
+        let (mut mcp_servers, system_prompt, bus_socket) = self
             .engine
-            .bus_attach(&self.run_id, &self.role, harness, &session.id)
+            .bus_attach(
+                &self.run_id,
+                &self.role,
+                harness,
+                &session.id,
+                sandbox.is_some(),
+            )
             .unwrap_or_else(|e| {
                 self.record("a bus failure", |tx| {
                     Ok(tx.log(
@@ -2221,8 +2277,20 @@ impl StepHost for RunHost {
                         format!("bus: session {} is not on the bus: {e}", session.id),
                     )?)
                 });
-                (Vec::new(), None)
+                (Vec::new(), None, None)
             });
+        if let Some(profile) = &mut sandbox {
+            profile.bus_socket = bus_socket;
+            let note = format!(
+                "session {} runs in a Bubblewrap sandbox (network: {})",
+                session.id,
+                profile.network.as_str()
+            );
+            self.record(
+                "the session's sandbox",
+                |tx| Ok(tx.log(&self.run_id, note)?),
+            );
+        }
         // The tool catalog's MCP servers, the same for every harness; the
         // run's log says which ones this session goes without.
         let (tools, notes) = self.engine.session_tools(&self.run_id, harness);
@@ -2234,6 +2302,7 @@ impl StepHost for RunHost {
             id: session.id,
             mcp_servers,
             system_prompt,
+            sandbox,
         })
     }
 

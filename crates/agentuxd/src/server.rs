@@ -176,6 +176,84 @@ async fn connection(engine: Engine, stream: UnixStream) {
     let _ = write.await;
 }
 
+/// A sandboxed session's own bus socket (ADR 0024): `bus.hello` and
+/// `bus.call` with that session's token, and nothing else of the daemon's
+/// API.
+pub(crate) async fn serve_session_bus(engine: Engine, listener: UnixListener, session_id: String) {
+    while let Ok((stream, _)) = listener.accept().await {
+        tokio::spawn(session_bus_connection(
+            engine.clone(),
+            stream,
+            session_id.clone(),
+        ));
+    }
+}
+
+async fn session_bus_connection(engine: Engine, stream: UnixStream, session_id: String) {
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let response = match serde_json::from_str::<Request>(&line) {
+            Err(e) => Response::err(
+                Value::Null,
+                rpc::Error::new(code::PARSE_ERROR, e.to_string()),
+            ),
+            Ok(request) => {
+                let id = request.id.clone().unwrap_or(Value::Null);
+                match session_bus_call(&engine, &session_id, &request.method, request.params).await
+                {
+                    Ok(value) => Response::ok(id, value),
+                    Err(e) => Response::err(id, e),
+                }
+            }
+        };
+        let Ok(mut text) = serde_json::to_string(&response) else {
+            break;
+        };
+        text.push('\n');
+        if writer.write_all(text.as_bytes()).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn session_bus_call(
+    engine: &Engine,
+    session_id: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, rpc::Error> {
+    let own = |token: &str| {
+        if engine.token_session(token).as_deref() == Some(session_id) {
+            Ok(())
+        } else {
+            Err(rpc::Error::new(
+                code::INVALID_PARAMS,
+                "this socket only serves its own session's bus token",
+            ))
+        }
+    };
+    match method {
+        method::BUS_HELLO => {
+            let params: agentux_bus::BridgeHello = parse(params)?;
+            own(&params.session_token)?;
+            to_value(engine.bus_hello(&params.session_token))
+        }
+        method::BUS_CALL => {
+            let params: agentux_bus::BridgeCall = parse(params)?;
+            own(&params.session_token)?;
+            to_value(engine.bus_call(&params.session_token, params.call).await)
+        }
+        _ => Err(rpc::Error::new(
+            code::METHOD_NOT_FOUND,
+            format!("{method:?} is not served on a session's bus socket"),
+        )),
+    }
+}
+
 async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, rpc::Error> {
     match method {
         method::PROJECTS_REGISTER => {

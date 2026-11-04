@@ -17,9 +17,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 mod acp;
+mod sandbox;
 mod spec;
 
 pub use acp::{AcpHarness, AcpSession, ModelSelection, SessionOptions};
+pub use sandbox::HarnessSandbox;
 pub use spec::HarnessSpec;
 
 /// Starts sessions with one harness.

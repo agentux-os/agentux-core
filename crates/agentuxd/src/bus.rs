@@ -75,6 +75,10 @@ pub fn aux_binary() -> PathBuf {
     }
 }
 
+/// What a session joins the bus with: its MCP servers, its session prompt,
+/// and its own bus socket when it is sandboxed.
+pub(crate) type Attached = (Vec<McpServer>, Option<String>, Option<PathBuf>);
+
 /// The daemon's buses, session tokens and unanswered questions.
 #[derive(Default)]
 pub(crate) struct Hub {
@@ -83,6 +87,8 @@ pub(crate) struct Hub {
     tokens: Mutex<HashMap<String, Token>>,
     /// `ask_human` calls waiting for an answer, by request id.
     answers: Mutex<HashMap<String, Waiter>>,
+    /// Sandboxed sessions' own bus sockets (ADR 0024), by session id.
+    session_sockets: Mutex<HashMap<String, (PathBuf, tokio::task::JoinHandle<()>)>>,
 }
 
 struct RunBus {
@@ -118,13 +124,18 @@ impl Engine {
     /// Puts a new session on its run's bus (opening the bus if needed) and
     /// returns the MCP server and session prompt to start it with. Without a
     /// [`BusLink`] the session joins but gets no MCP server.
+    ///
+    /// A sandboxed session reaches the bus through a socket of its own
+    /// (returned third), which serves only its bus calls: the daemon's
+    /// control socket is never mounted in a sandbox (ADR 0024).
     pub(crate) fn bus_attach(
         &self,
         run_id: &str,
         role: &str,
         harness: &str,
         session_id: &str,
-    ) -> Result<(Vec<McpServer>, Option<String>), Error> {
+        sandboxed: bool,
+    ) -> Result<Attached, Error> {
         let (bus, config, project) = self.run_bus(run_id)?;
         let identity = SessionIdentity {
             run: RunId(run_id.to_string()),
@@ -135,7 +146,12 @@ impl Engine {
         };
         bus.join(identity.clone()).map_err(internal)?;
         let Some(link) = &self.inner.settings.bus else {
-            return Ok((Vec::new(), None));
+            return Ok((Vec::new(), None, None));
+        };
+        let socket = if sandboxed {
+            Some(self.open_session_bus(&link.socket, session_id)?)
+        } else {
+            None
         };
         let token = new_token().map_err(Error::Internal)?;
         lock(&self.inner.hub.tokens).insert(
@@ -148,7 +164,7 @@ impl Engine {
         let server = McpServer {
             name: agentux_bus::SERVER_NAME.to_string(),
             command: link.aux.clone(),
-            args: agentux_bus::bus_stdio_args(&link.socket),
+            args: agentux_bus::bus_stdio_args(socket.as_deref().unwrap_or(&link.socket)),
             // Not in the arguments: other local users can read those.
             env: agentux_bus::bus_stdio_env(&token),
         };
@@ -157,12 +173,61 @@ impl Engine {
             &config.allowed_tools(),
             config.max_turns_per_exchange,
         );
-        Ok((vec![server], Some(prompt)))
+        Ok((vec![server], Some(prompt), socket))
+    }
+
+    /// The session a bus token was issued to.
+    pub(crate) fn token_session(&self, token: &str) -> Option<String> {
+        lock(&self.inner.hub.tokens)
+            .get(token)
+            .map(|t| t.session_id.clone())
+    }
+
+    /// Opens `session_id`'s own bus socket next to the control socket, in
+    /// `bus/` (the directory is the user's only, like the control socket's).
+    fn open_session_bus(
+        &self,
+        control: &std::path::Path,
+        session_id: &str,
+    ) -> Result<PathBuf, Error> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = control
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("bus");
+        let socket = dir.join(format!("{session_id}.sock"));
+        let open = || -> std::io::Result<std::os::unix::net::UnixListener> {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            let _ = std::fs::remove_file(&socket);
+            let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        };
+        let listener = open()
+            .and_then(tokio::net::UnixListener::from_std)
+            .map_err(|e| Error::Internal(format!("cannot open the session's bus socket: {e}")))?;
+        let task = tokio::spawn(crate::server::serve_session_bus(
+            self.clone(),
+            listener,
+            session_id.to_string(),
+        ));
+        if let Some((_, old)) = lock(&self.inner.hub.session_sockets)
+            .insert(session_id.to_string(), (socket.clone(), task))
+        {
+            old.abort();
+        }
+        Ok(socket)
     }
 
     /// Takes an ended session off the bus and revokes its token.
     pub(crate) fn bus_leave(&self, session_id: &str) {
         lock(&self.inner.hub.tokens).retain(|_, token| token.session_id != session_id);
+        if let Some((socket, task)) = lock(&self.inner.hub.session_sockets).remove(session_id) {
+            task.abort();
+            let _ = std::fs::remove_file(socket);
+        }
         let session = SessionId(session_id.to_string());
         for entry in lock(&self.inner.hub.runs).values() {
             if entry.bus.has_session(&session) {
