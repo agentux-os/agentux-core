@@ -203,7 +203,7 @@ mcp:                      # in agentux.yaml, under `tools:`
     harnesses: [claude-code, codex]   # optional: every harness when left out
 ```
 
-Secrets are references. agentuxd looks each one up when a session starts, from its own environment, a systemd credential, or the desktop's secret service (`secret-tool store --label=NAME agentux-key NAME`). It passes the value to that server only. An entry whose secret isn't set is left out, and so is an entry that isn't for the session's harness. The run's log says which and why, never with a value. `aux tools [--project DIR] [--harness NAME]` shows the merged catalog and whether each secret is set.
+Secrets are references. agentuxd looks each one up when a session starts, from its own environment, a systemd credential, or the desktop's secret service (`secret-tool store --label=NAME agentux-key NAME`). It passes the value to that server only. An entry whose secret isn't set is left out, and so is an entry that isn't for the session's harness. The run's log says which and why, never with a value. `aux tools [--project DIR] [--harness NAME]` shows the merged catalog and whether each secret is set. `aux tools add NAME --command CMD [--arg A]… [--env VAR=VALUE]… [--secret VAR=SECRET]… [--harness H]…` adds or replaces an entry in the user's catalog (`--file` for another one), `aux tools remove NAME` takes it out, and `aux tools test NAME` starts the server, initializes MCP and lists its tools.
 
 ## Crates
 
