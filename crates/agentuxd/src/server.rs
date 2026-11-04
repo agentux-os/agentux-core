@@ -270,6 +270,10 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
             to_value(engine.set_prefs(&params))
         }
         method::LIMITS_LIST => to_value(engine.limits()),
+        method::TOOLS_LIST => {
+            let params: rpc::ListTools = parse_or_default(params)?;
+            to_value(engine.tools(params.project_id.as_deref()))
+        }
         method::LIMITS_CLEAR => {
             let params: rpc::ClearLimit = parse(params)?;
             to_value(engine.clear_limit(&params))

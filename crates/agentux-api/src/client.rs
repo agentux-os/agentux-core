@@ -102,6 +102,16 @@ impl Client {
         self.call(method::LIMITS_LIST, &()).await
     }
 
+    pub async fn tools(
+        &mut self,
+        project_id: Option<&str>,
+    ) -> Result<rpc::ToolsListing, ClientError> {
+        let params = rpc::ListTools {
+            project_id: project_id.map(str::to_string),
+        };
+        self.call(method::TOOLS_LIST, &params).await
+    }
+
     pub async fn clear_limit(
         &mut self,
         params: &rpc::ClearLimit,

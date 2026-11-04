@@ -61,6 +61,49 @@ pub fn servers(
     (servers, notes)
 }
 
+/// `catalog` as `tools.list` shows it: names, never values.
+pub fn listing(
+    catalog: &ToolCatalog,
+    notes: Vec<String>,
+    secret: impl Fn(&str) -> Option<String>,
+) -> agentux_api::rpc::ToolsListing {
+    let mcp = catalog
+        .mcp
+        .values()
+        .map(|tool| {
+            let mut secrets = Vec::new();
+            for value in tool.env.values().chain(tool.headers.values()) {
+                if let EnvValue::Secret { secret: name } = value
+                    && !secrets
+                        .iter()
+                        .any(|s: &agentux_api::rpc::ToolSecret| &s.name == name)
+                {
+                    secrets.push(agentux_api::rpc::ToolSecret {
+                        name: name.clone(),
+                        set: secret(name).is_some(),
+                    });
+                }
+            }
+            agentux_api::rpc::ToolInfo {
+                name: tool.name.clone(),
+                source: tool.source.to_string(),
+                command: tool.url.is_none().then(|| {
+                    std::iter::once(tool.command.as_str())
+                        .chain(tool.args.iter().map(String::as_str))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }),
+                url: tool.url.clone(),
+                harnesses: tool.harnesses.clone(),
+                env: tool.env.keys().cloned().collect(),
+                headers: tool.headers.keys().cloned().collect(),
+                secrets,
+            }
+        })
+        .collect();
+    agentux_api::rpc::ToolsListing { mcp, notes }
+}
+
 /// `tool` as the server to start, with its secrets from `secret`; the name
 /// of the first secret that isn't set otherwise.
 pub fn resolve(
@@ -591,6 +634,33 @@ mcp:
             .await
             .unwrap_err();
         assert!(err.contains("401") && err.contains("headers"), "{err}");
+    }
+
+    #[test]
+    fn the_listing_names_secrets_and_variables_but_no_values() {
+        let listing = listing(&catalog(), Vec::new(), secret);
+        let github = &listing.mcp.iter().find(|t| t.name == "github").unwrap();
+        assert_eq!(github.command.as_deref(), Some("github-mcp-server stdio"));
+        assert_eq!(github.env, ["MODE", "TOKEN"]);
+        assert_eq!(
+            github.secrets,
+            [agentux_api::rpc::ToolSecret {
+                name: "GH_TOKEN".into(),
+                set: true
+            }]
+        );
+        let wiki = listing.mcp.iter().find(|t| t.name == "wiki").unwrap();
+        assert!(!wiki.secrets[0].set);
+        let browser = listing.mcp.iter().find(|t| t.name == "browser").unwrap();
+        assert_eq!(
+            browser.harnesses.as_deref(),
+            Some(&["claude-code".to_string()][..])
+        );
+        let json = serde_json::to_string(&listing).unwrap();
+        assert!(
+            !json.contains("gh-secret-value") && !json.contains("read-only"),
+            "{json}"
+        );
     }
 
     #[test]
