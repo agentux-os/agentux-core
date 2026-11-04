@@ -318,6 +318,19 @@ impl AcpExecutor {
         match self.launcher.launch(spec, handler).await {
             Ok((session, events)) => {
                 host.session_vendor_id(&opened.id, session.id());
+                if !session.unsupported_mcp_servers().is_empty() {
+                    host.session_event(
+                        &opened.id,
+                        SessionEvent::Message {
+                            from: MessageFrom::System,
+                            text: format!(
+                                "{} doesn't support HTTP MCP servers; this session goes without: {}",
+                                want.harness,
+                                session.unsupported_mcp_servers().join(", ")
+                            ),
+                        },
+                    );
+                }
                 if let ModelSelection::Unavailable(note) = session.model_selection() {
                     host.session_event(
                         &opened.id,

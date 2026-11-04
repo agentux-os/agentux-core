@@ -167,6 +167,7 @@ impl Engine {
             args: agentux_bus::bus_stdio_args(socket.as_deref().unwrap_or(&link.socket)),
             // Not in the arguments: other local users can read those.
             env: agentux_bus::bus_stdio_env(&token),
+            ..McpServer::default()
         };
         let prompt = agentux_bus::session_prompt(
             &identity,

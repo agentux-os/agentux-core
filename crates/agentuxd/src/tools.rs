@@ -67,20 +67,23 @@ pub fn resolve(
     tool: &agentux_config::McpTool,
     secret: impl Fn(&str) -> Option<String>,
 ) -> Result<McpServer, String> {
-    let mut env = Vec::with_capacity(tool.env.len());
-    for (var, value) in &tool.env {
-        match value {
-            EnvValue::Plain(value) => env.push((var.clone(), value.clone())),
-            EnvValue::Secret { secret: name } => {
-                env.push((var.clone(), secret(name).ok_or_else(|| name.clone())?))
-            }
-        }
-    }
+    let values = |map: &std::collections::BTreeMap<String, EnvValue>| {
+        map.iter()
+            .map(|(key, value)| match value {
+                EnvValue::Plain(value) => Ok((key.clone(), value.clone())),
+                EnvValue::Secret { secret: name } => secret(name)
+                    .map(|value| (key.clone(), value))
+                    .ok_or_else(|| name.clone()),
+            })
+            .collect::<Result<Vec<_>, String>>()
+    };
     Ok(McpServer {
         name: tool.name.clone(),
         command: PathBuf::from(&tool.command),
         args: tool.args.clone(),
-        env,
+        env: values(&tool.env)?,
+        url: tool.url.clone(),
+        headers: values(&tool.headers)?,
     })
 }
 
@@ -96,6 +99,11 @@ pub struct Probe {
 /// `timeout`. The server is stopped afterwards.
 pub async fn probe(server: &McpServer, timeout: std::time::Duration) -> Result<Probe, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    if let Some(url) = &server.url {
+        return Err(format!(
+            "{url} is an HTTP server; `aux tools test` starts stdio servers only for now"
+        ));
+    }
     let mut child = tokio::process::Command::new(&server.command)
         .args(&server.args)
         .envs(server.env.iter().cloned())
@@ -271,6 +279,7 @@ mcp:
             command: PathBuf::from("sh"),
             args: vec!["-c".into(), FAKE_SERVER.into()],
             env: Vec::new(),
+            ..McpServer::default()
         };
         let probe = probe(&server, std::time::Duration::from_secs(10))
             .await
@@ -286,6 +295,7 @@ mcp:
             command: PathBuf::from("sh"),
             args: vec!["-c".into(), "sleep 30".into()],
             env: Vec::new(),
+            ..McpServer::default()
         };
         let err = probe(&silent, std::time::Duration::from_millis(300))
             .await

@@ -222,8 +222,18 @@ enum ToolsCommand {
         /// The server's name, as agents see its tools
         name: String,
         /// The command that starts it (MCP over stdio)
+        #[arg(long, required_unless_present = "url", conflicts_with = "url")]
+        command: Option<String>,
+        /// An HTTP server's URL instead of a command (https://, or http://
+        /// on this machine)
         #[arg(long)]
-        command: String,
+        url: Option<String>,
+        /// An HTTP request header with its value
+        #[arg(long = "header", value_name = "NAME=VALUE")]
+        headers: Vec<String>,
+        /// An HTTP request header taken from a secret
+        #[arg(long = "secret-header", value_name = "NAME=SECRET")]
+        secret_headers: Vec<String>,
         /// An argument to the command (repeat for more)
         #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
         args: Vec<String>,
@@ -596,6 +606,9 @@ fn tools_command(command: ToolsCommand) -> Result {
         ToolsCommand::Add {
             name,
             command,
+            url,
+            headers,
+            secret_headers,
             args,
             env,
             secrets,
@@ -614,12 +627,23 @@ fn tools_command(command: ToolsCommand) -> Result {
                 let (var, secret) = assignment(text, "--secret")?;
                 values.insert(var, EnvValue::Secret { secret });
             }
+            let mut header_values = std::collections::BTreeMap::new();
+            for text in &headers {
+                let (header, value) = assignment(text, "--header")?;
+                header_values.insert(header, EnvValue::Plain(value));
+            }
+            for text in &secret_headers {
+                let (header, secret) = assignment(text, "--secret-header")?;
+                header_values.insert(header, EnvValue::Secret { secret });
+            }
             let replaced = catalog.mcp.contains_key(&name);
             catalog.mcp.insert(
                 name.clone(),
                 McpTool {
                     name: name.clone(),
-                    command,
+                    command: command.unwrap_or_default(),
+                    url,
+                    headers: header_values,
                     args,
                     env: values,
                     harnesses: (!harnesses.is_empty()).then_some(harnesses),
@@ -713,7 +737,10 @@ fn tools(project: &std::path::Path, harness: Option<&str>) -> Result {
             .collect::<Vec<_>>()
             .join(" ");
         println!("{} ({} catalog)", tool.name, tool.source);
-        println!("  command: {command}");
+        match &tool.url {
+            Some(url) => println!("  url: {url}"),
+            None => println!("  command: {command}"),
+        }
         match &tool.harnesses {
             Some(list) => println!("  harnesses: {}", list.join(", ")),
             None => println!("  harnesses: all"),
@@ -728,6 +755,19 @@ fn tools(project: &std::path::Path, harness: Option<&str>) -> Result {
                         "NOT SET: the server is left out"
                     };
                     println!("  {var}: secret {secret} ({state})");
+                }
+            }
+        }
+        for (header, value) in &tool.headers {
+            match value {
+                agentux_config::EnvValue::Plain(_) => println!("  header {header}"),
+                agentux_config::EnvValue::Secret { secret } => {
+                    let state = if agentuxd::tools::secret(secret).is_some() {
+                        "set"
+                    } else {
+                        "NOT SET: the server is left out"
+                    };
+                    println!("  header {header}: secret {secret} ({state})");
                 }
             }
         }

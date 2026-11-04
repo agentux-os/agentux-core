@@ -53,12 +53,21 @@ pub struct ToolCatalog {
     pub mcp: BTreeMap<String, McpTool>,
 }
 
-/// One MCP server, started over stdio by the agent.
+/// One MCP server: started over stdio by the agent (`command`), or reached
+/// over HTTP (`url`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpTool {
     pub name: String,
+    /// Empty for an HTTP server.
+    #[serde(default)]
     pub command: String,
+    /// An HTTP server's URL (MCP's streamable HTTP transport): `https://`,
+    /// or `http://` on this machine.
+    pub url: Option<String>,
+    /// An HTTP server's request headers: values or secrets.
+    #[serde(default)]
+    pub headers: BTreeMap<String, EnvValue>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
@@ -113,10 +122,13 @@ impl McpTool {
 
     /// The secrets this server needs, by name.
     pub fn secrets(&self) -> impl Iterator<Item = &str> {
-        self.env.values().filter_map(|value| match value {
-            EnvValue::Secret { secret } => Some(secret.as_str()),
-            EnvValue::Plain(_) => None,
-        })
+        self.env
+            .values()
+            .chain(self.headers.values())
+            .filter_map(|value| match value {
+                EnvValue::Secret { secret } => Some(secret.as_str()),
+                EnvValue::Plain(_) => None,
+            })
     }
 }
 
@@ -152,8 +164,45 @@ impl RawTools {
             } else if mcp.contains_key(&tool.name) {
                 push(format!("{at}.name"), "is already used by another entry");
             }
-            if tool.command.trim().is_empty() {
-                push(format!("{at}.command"), "must not be empty");
+            match &tool.url {
+                None if tool.command.trim().is_empty() => push(
+                    format!("{at}.command"),
+                    "must not be empty (or give a `url` for an HTTP server)",
+                ),
+                None if !tool.headers.is_empty() => {
+                    push(format!("{at}.headers"), "are only for HTTP servers (`url`)")
+                }
+                None => {}
+                Some(url) => {
+                    if !tool.command.is_empty() || !tool.args.is_empty() || !tool.env.is_empty() {
+                        push(
+                            format!("{at}.url"),
+                            "an HTTP server has no `command`, `args` or `env`",
+                        );
+                    }
+                    if !valid_url(url) {
+                        push(
+                            format!("{at}.url"),
+                            "must be https://…, or http:// on this machine (localhost, 127.0.0.1, [::1])",
+                        );
+                    }
+                    for (header, value) in &tool.headers {
+                        if !valid_header(header) {
+                            push(
+                                format!("{at}.headers.{header}"),
+                                "is not an HTTP header name",
+                            );
+                        }
+                        if let EnvValue::Secret { secret } = value
+                            && !valid_variable(secret)
+                        {
+                            push(
+                                format!("{at}.headers.{header}.secret"),
+                                "must be a secret name: letters, digits and `_`, not starting with a digit",
+                            );
+                        }
+                    }
+                }
             }
             for (var, value) in &tool.env {
                 if !valid_variable(var) {
@@ -258,7 +307,11 @@ impl ToolCatalog {
         out.push_str("mcp:\n");
         for tool in self.mcp.values() {
             out.push_str(&format!("  - name: {}\n", q(&tool.name)));
-            out.push_str(&format!("    command: {}\n", q(&tool.command)));
+            if let Some(url) = &tool.url {
+                out.push_str(&format!("    url: {}\n", q(url)));
+            } else {
+                out.push_str(&format!("    command: {}\n", q(&tool.command)));
+            }
             if !tool.args.is_empty() {
                 out.push_str(&format!("    args: {}\n", list(&tool.args)));
             }
@@ -272,6 +325,21 @@ impl ToolCatalog {
                         EnvValue::Secret { secret } => out.push_str(&format!(
                             "      {}: {{ secret: {} }}\n",
                             q(var),
+                            q(secret)
+                        )),
+                    }
+                }
+            }
+            if !tool.headers.is_empty() {
+                out.push_str("    headers:\n");
+                for (header, value) in &tool.headers {
+                    match value {
+                        EnvValue::Plain(value) => {
+                            out.push_str(&format!("      {}: {}\n", q(header), q(value)))
+                        }
+                        EnvValue::Secret { secret } => out.push_str(&format!(
+                            "      {}: {{ secret: {} }}\n",
+                            q(header),
                             q(secret)
                         )),
                     }
@@ -307,6 +375,39 @@ fn valid_name(name: &str) -> bool {
         && bytes
             .iter()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(b))
+}
+
+fn valid_url(url: &str) -> bool {
+    let rest = if let Some(rest) = url.strip_prefix("https://") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+        let host = match host.rsplit_once(':') {
+            Some((h, port)) if !h.ends_with(']') || host.starts_with('[') => {
+                if port.chars().all(|c| c.is_ascii_digit()) {
+                    h
+                } else {
+                    host
+                }
+            }
+            _ => host,
+        };
+        if !matches!(host, "localhost" | "127.0.0.1" | "[::1]") {
+            return false;
+        }
+        rest
+    } else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    !host.is_empty() && !host.contains('@') && !url.chars().any(char::is_whitespace)
+}
+
+fn valid_header(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 fn valid_variable(name: &str) -> bool {
@@ -431,10 +532,73 @@ mcp:
         assert!(ToolCatalog::from_yaml("mcp: []\nskills: []\n", Source::User).is_err());
         assert!(
             ToolCatalog::from_yaml(
-                "mcp:\n  - name: a\n    command: b\n    url: c\n",
+                "mcp:\n  - name: a\n    command: b\n    port: 1\n",
                 Source::User
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn http_servers_have_a_url_and_headers_instead_of_a_command() {
+        let catalog = ToolCatalog::from_yaml(
+            r#"
+mcp:
+  - name: linear
+    url: https://mcp.linear.app/mcp
+    headers:
+      Authorization: { secret: LINEAR_TOKEN }
+      X-Team: core
+  - name: local
+    url: http://127.0.0.1:3845/mcp
+"#,
+            Source::User,
+        )
+        .unwrap();
+        let linear = &catalog.mcp["linear"];
+        assert_eq!(linear.url.as_deref(), Some("https://mcp.linear.app/mcp"));
+        assert_eq!(linear.secrets().collect::<Vec<_>>(), ["LINEAR_TOKEN"]);
+        assert_eq!(
+            ToolCatalog::from_yaml(&catalog.to_yaml(), Source::User).unwrap(),
+            catalog
+        );
+
+        let err = ToolCatalog::from_yaml(
+            r#"
+mcp:
+  - name: plain
+    url: http://example.com/mcp
+  - name: both
+    url: https://a.example/mcp
+    command: x
+  - name: headers-without-url
+    command: x
+    headers: { A: b }
+  - name: bad-header
+    url: https://a.example/mcp
+    headers: { "bad header": x }
+  - name: creds
+    url: https://user:pw@a.example/mcp
+  - name: neither
+    args: [x]
+"#,
+            Source::User,
+        )
+        .unwrap_err();
+        let ConfigError::Invalid(issues) = err else {
+            panic!("{err}")
+        };
+        let paths: Vec<_> = issues.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "mcp[0].url",
+                "mcp[1].url",
+                "mcp[2].headers",
+                "mcp[3].headers.bad header",
+                "mcp[4].url",
+                "mcp[5].command",
+            ]
         );
     }
 

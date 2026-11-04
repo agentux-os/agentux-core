@@ -216,6 +216,7 @@ async fn mcp_servers_are_passed_in_session_new() {
         command: "/usr/bin/aux".into(),
         args: vec!["bus-stdio".into(), "--session-token".into(), "t1".into()],
         env: vec![("AGENTUX_LOG".into(), "debug".into())],
+        ..McpServer::default()
     };
     let (session, _events, seen, _agent) = connect_with(
         permission_handler(|_| async { Decision::Deny }),
@@ -413,4 +414,69 @@ async fn sessions_reopen_with_session_load_without_replaying_events() {
         .err()
         .unwrap();
     assert!(matches!(err, Error::LoadUnsupported), "{err}");
+}
+
+/// HTTP MCP servers reach agents that support them, and the rest of the
+/// session goes on without them where the agent doesn't.
+#[tokio::test]
+async fn http_mcp_servers_go_only_to_agents_that_support_them() {
+    let stdio = McpServer {
+        name: "files".into(),
+        command: "/usr/bin/files-mcp".into(),
+        ..McpServer::default()
+    };
+    let http = McpServer {
+        name: "linear".into(),
+        url: Some("https://mcp.linear.app/mcp".into()),
+        headers: vec![("Authorization".into(), "Bearer t".into())],
+        ..McpServer::default()
+    };
+    for supported in [true, false] {
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let (transport, _agent) = agentux_fake_agent::spawn_with(
+            script({
+                let seen = Arc::clone(&seen);
+                move |t| turn(t, Arc::clone(&seen))
+            }),
+            agentux_fake_agent::Setup {
+                on_new_session: Box::new({
+                    let seen = Arc::clone(&seen);
+                    move |request: &acp::NewSessionRequest| {
+                        seen.lock().unwrap().mcp_servers = request.mcp_servers.clone();
+                    }
+                }),
+                mcp_http: supported,
+                ..Default::default()
+            },
+        );
+        let (session, _events) = tokio::time::timeout(
+            TIMEOUT,
+            AcpSession::connect_with_mcp_servers(
+                transport,
+                Path::new("/work/tree"),
+                &[stdio.clone(), http.clone()],
+                permission_handler(|_| async { Decision::Deny }),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let passed = seen.lock().unwrap().mcp_servers.clone();
+        if supported {
+            assert_eq!(passed.len(), 2);
+            assert_eq!(
+                passed[1],
+                acp::McpServer::Http(
+                    acp::McpServerHttp::new("linear", "https://mcp.linear.app/mcp")
+                        .headers(vec![acp::HttpHeader::new("Authorization", "Bearer t")])
+                )
+            );
+            assert!(session.unsupported_mcp_servers().is_empty());
+        } else {
+            assert_eq!(passed.len(), 1);
+            assert!(matches!(&passed[0], acp::McpServer::Stdio(s) if s.name == "files"));
+            assert_eq!(session.unsupported_mcp_servers(), ["linear"]);
+        }
+        session.shutdown().await.unwrap();
+    }
 }
