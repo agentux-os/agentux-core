@@ -149,6 +149,39 @@ aux bus-stdio --standalone [--project <dir>] [--role <r>]   # the same on an in-
 
 `aux bus-stdio` is the stdio MCP server harnesses launch to reach the bus: `agentuxd` passes it in ACP `session/new` with the session's token in its environment (not on the command line, where other local users could read it), and it forwards each tool call to the daemon (see the [`agentux-bus` README](crates/agentux-bus/README.md#transport-and-the-daemon-bridge)).
 
+## Agent sandbox
+
+Agent sessions can run in a Bubblewrap sandbox ([ADR 0023](https://github.com/agentux-os/agentux/blob/main/docs/adr/0023-agent-session-sandbox.md), as amended by [ADR 0024](https://github.com/agentux-os/agentux/blob/main/docs/adr/0024-agent-sandbox-security-boundaries.md)). A project opts in:
+
+```yaml
+isolation:
+  agents:
+    mode: bubblewrap   # none (default) | bubblewrap
+    network: outbound  # outbound (default) | none
+```
+
+A sandboxed session sees:
+
+- **The system** read-only, and a private `/tmp` and `/run`.
+- **An empty home**, holding only:
+  - the run's worktree;
+  - the repository's git directory, with `hooks/` and `config` read-only;
+  - its harness's own sandbox state in `~/.local/share/agentux/sandbox/state/<harness>/`, with the CLI pointed there (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, XDG directories), so the host's CLI settings, hooks and MCP configuration are neither seen nor changed;
+  - the one credential file it shares with the host (Claude Code's `.credentials.json`, Codex's `auth.json`, OpenCode's `auth.json`);
+  - its install;
+  - a sandbox-only npm cache;
+  - a bus socket of its own that serves only its session's bus calls.
+
+It never sees the daemon's control socket, `/run/user` (D-Bus, keyring, SSH agent), the user's other files, or other harnesses' keys.
+
+**Network.** `outbound` is a network namespace of its own through pasta, with no route to the host's loopback.
+
+**Git.** It uses no user configuration, and makes unsigned commits with the host's identity.
+
+**What still gets through.** It can reach the LAN and the internet, and send out what it can read: the worktree and its own harness's login. That's why this phase is for workstations; production nodes wait for the allow-list proxy.
+
+**Failures.** A missing `bwrap` or `pasta` fails the session instead of running it unconfined. The TUI handoff opens in the same sandbox. Antigravity isn't supported in the sandbox until its paths are verified.
+
 ## Tool catalog (MCP servers)
 
 Declare an MCP server once and every harness's sessions get it: Claude Code, Codex, OpenCode and Antigravity alike. agentuxd hands the servers to each session in ACP's `session/new`, next to the `agentux` bus, so there's no per-CLI configuration file to keep in sync. A run that falls back to another harness keeps its tools.

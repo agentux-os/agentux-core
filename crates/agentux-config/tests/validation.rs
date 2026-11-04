@@ -689,6 +689,7 @@ fn isolation_podman_with_image_and_network() {
             mode: IsolationMode::Podman,
             image: Some("docker.io/library/rust:1".into()),
             network: true,
+            agents: Default::default(),
         }
     );
 
@@ -708,8 +709,44 @@ fn isolation_rejects_unknown_modes_and_keys() {
         "isolation:\n  mode: podman\n  volumes: [/home]\n",
     ));
     assert!(message.contains("volumes"), "{message}");
-    let message = parse_error(&with_isolation("isolation:\n  image: x\n"));
-    assert!(message.contains("mode"), "{message}");
+    // `mode` defaults to `none` (only `agents` may be set), so a checks
+    // setting without it has no effect.
+    assert_issue(
+        &with_isolation("isolation:\n  image: x\n"),
+        "isolation.image",
+        "no effect with `mode: none`",
+    );
+}
+
+#[test]
+fn agents_isolation_is_opt_in_with_outbound_network_by_default() {
+    use agentux_config::{AgentIsolationMode, AgentNetwork};
+    let config = Config::from_yaml(&with_isolation(
+        "isolation:\n  agents:\n    mode: bubblewrap\n",
+    ))
+    .unwrap();
+    assert_eq!(config.isolation.agents.mode, AgentIsolationMode::Bubblewrap);
+    assert_eq!(config.isolation.agents.network, AgentNetwork::Outbound);
+    assert_eq!(config.isolation.mode, IsolationMode::None);
+    let config = Config::from_yaml(&with_isolation(
+        "isolation:\n  mode: podman\n  agents:\n    mode: bubblewrap\n    network: none\n",
+    ))
+    .unwrap();
+    assert_eq!(config.isolation.agents.network, AgentNetwork::None);
+    let default = Config::from_yaml(&with_isolation("")).unwrap();
+    assert_eq!(default.isolation.agents.mode, AgentIsolationMode::None);
+}
+
+#[test]
+fn a_project_cannot_add_host_paths_or_host_networking() {
+    // ADR 0024: no project-chosen paths, and `full` is withdrawn.
+    for yaml in [
+        "isolation:\n  agents:\n    mode: bubblewrap\n    read_only: [~/.ssh]\n",
+        "isolation:\n  agents:\n    mode: bubblewrap\n    network: full\n",
+        "isolation:\n  agents:\n    mode: firejail\n",
+    ] {
+        parse_error(&with_isolation(yaml));
+    }
 }
 
 #[test]

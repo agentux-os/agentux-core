@@ -57,6 +57,8 @@ pub struct LaunchSpec<'a> {
     /// Reopen this existing session (ACP `session/load`) instead of creating
     /// one: after the session was open in its harness's TUI.
     pub load: Option<&'a str>,
+    /// Run the harness in this sandbox (ADRs 0023 and 0024).
+    pub sandbox: Option<&'a crate::sandbox::Profile>,
 }
 
 /// Starts harness sessions. The daemon uses [`HarnessLauncher`]; tests plug in
@@ -93,6 +95,11 @@ impl Launcher for HarnessLauncher {
                 .await
                 .unwrap_or_default();
             harness.env.extend(keys);
+            if let Some(profile) = spec.sandbox {
+                let (program, args) = profile.command(&harness.command, &harness.args);
+                harness.command = program;
+                harness.args = args;
+            }
             AcpHarness::new(harness)
                 .with_mcp_servers(spec.mcp_servers.to_vec())
                 .with_model(spec.model.map(str::to_string))
@@ -117,6 +124,8 @@ struct Slot {
     model: Option<String>,
     worktree: PathBuf,
     mcp_servers: Vec<McpServer>,
+    /// The sandbox it runs in, to reload it in the same one.
+    sandbox: Option<crate::sandbox::Profile>,
     /// The agent can reopen the session with `session/load`.
     can_load: bool,
     /// Handed over to the harness's TUI: turns wait (see
@@ -304,6 +313,7 @@ impl AcpExecutor {
             model: want.model,
             mcp_servers: &opened.mcp_servers,
             load: None,
+            sandbox: opened.sandbox.as_ref(),
         };
         match self.launcher.launch(spec, handler).await {
             Ok((session, events)) => {
@@ -325,6 +335,7 @@ impl AcpExecutor {
                     model: want.model.map(str::to_string),
                     worktree: want.worktree.to_path_buf(),
                     mcp_servers: opened.mcp_servers,
+                    sandbox: opened.sandbox,
                     can_load: session.can_load(),
                     attached: AtomicBool::new(false),
                     host: host_slot,
@@ -412,6 +423,7 @@ impl AcpExecutor {
             model: task.model.as_deref(),
             mcp_servers: &[],
             load: None,
+            sandbox: None,
         };
         let (session, mut events) = self
             .launcher
@@ -645,6 +657,7 @@ impl StepExecutor for AcpExecutor {
                 model: slot.model.as_deref(),
                 mcp_servers: &slot.mcp_servers,
                 load: Some(&slot.vendor_id),
+                sandbox: slot.sandbox.as_ref(),
             };
             let launched = self.launcher.launch(spec, handler).await;
             slot.attached.store(false, Ordering::SeqCst);

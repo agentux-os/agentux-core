@@ -385,6 +385,35 @@ impl Engine {
                     .vendor_session_id
                     .as_deref()
                     .and_then(|id| self.inner.settings.tui.resume(&session.harness, id));
+                // A sandboxed run's TUI opens in the same sandbox, never
+                // unconfined (ADR 0023).
+                let argv = match argv {
+                    Some(argv) => {
+                        match self.sandbox_profile(&target.run_id, &session.harness, &target.cwd) {
+                            Ok(None) => Ok(Some(argv)),
+                            Ok(Some(profile)) => {
+                                let (program, args) = profile.command(&argv[0], &argv[1..]);
+                                Ok(Some(std::iter::once(program).chain(args).collect()))
+                            }
+                            Err(e) => Err(e),
+                        }
+                    }
+                    None => Ok(None),
+                };
+                let argv = match argv {
+                    Ok(argv) => argv,
+                    Err(reason) => {
+                        fallback(
+                            &term,
+                            &target,
+                            &env,
+                            &format!(
+                                "The session's TUI is not opened outside its sandbox: {reason}."
+                            ),
+                        )?;
+                        return Ok(term);
+                    }
+                };
                 match argv {
                     None => {
                         let reason = match &session.vendor_session_id {

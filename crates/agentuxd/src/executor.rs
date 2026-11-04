@@ -89,6 +89,9 @@ pub struct OpenedSession {
     /// Prepended to the session's first prompt: who it is and how to use the
     /// bus (`agentux_bus::session_prompt`).
     pub system_prompt: Option<String>,
+    /// The sandbox the session runs in, if its run asks for one (ADRs 0023
+    /// and 0024).
+    pub sandbox: Option<crate::sandbox::Profile>,
 }
 
 /// A wake from the agent bus: prompt a session so it reads its new mail, or
