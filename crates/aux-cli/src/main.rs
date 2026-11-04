@@ -512,6 +512,14 @@ fn node(socket: Option<PathBuf>, command: NodeCommand) -> Result {
             for (method, decision) in policy.entries() {
                 println!("  {method:<16} {decision:?}");
             }
+            let agents = agentux_config::NodeAgents::load(path)?;
+            let isolation = match agents.isolation {
+                agentux_config::NodeIsolation::Required => "required: every session is sandboxed",
+                agentux_config::NodeIsolation::Optional => {
+                    "optional: projects decide, runs from Command are sandboxed"
+                }
+            };
+            println!("agent sandbox: {isolation}");
             Ok(())
         }
         NodeCommand::Pending => {

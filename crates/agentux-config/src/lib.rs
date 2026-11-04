@@ -32,8 +32,8 @@ mod validate;
 pub use detect::detect_checks;
 pub use isolation::{
     AgentIsolation, AgentIsolationMode, AgentNetwork, DEFAULT_CHECK_TIMEOUT, DEFAULT_IMAGE,
-    DEVCONTAINER_FILES, Image, ImageSource, Isolation, IsolationMode, devcontainer_image,
-    format_timeout,
+    DEVCONTAINER_FILES, Image, ImageSource, Isolation, IsolationMode, IsolationSource, NODE_POLICY,
+    NodeAgents, NodeIsolation, devcontainer_image, format_timeout,
 };
 pub use permissions::{Access, CATEGORIES as PERMISSION_CATEGORIES, Decided, Permissions, Rules};
 pub use tools::{

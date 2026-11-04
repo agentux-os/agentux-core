@@ -494,6 +494,10 @@ fn run_json(run: &Run) -> Value {
         "startedAt": rfc3339(run.started_at),
         "finishedAt": run.finished_at.map(rfc3339),
     });
+    // So Command can see runs whose agents ran unconfined (ADR 0023).
+    if let Some(isolation) = &run.agent_isolation {
+        value["agentIsolation"] = json!(isolation);
+    }
     // A run Command started for a mission: correlated with Command's run,
     // so Office follows the work across both (ADR 0015).
     if let Some(origin) = &run.origin {

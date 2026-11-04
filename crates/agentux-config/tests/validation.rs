@@ -725,7 +725,10 @@ fn agents_isolation_is_opt_in_with_outbound_network_by_default() {
         "isolation:\n  agents:\n    mode: bubblewrap\n",
     ))
     .unwrap();
-    assert_eq!(config.isolation.agents.mode, AgentIsolationMode::Bubblewrap);
+    assert_eq!(
+        config.isolation.agents.mode,
+        Some(AgentIsolationMode::Bubblewrap)
+    );
     assert_eq!(config.isolation.agents.network, AgentNetwork::Outbound);
     assert_eq!(config.isolation.mode, IsolationMode::None);
     let config = Config::from_yaml(&with_isolation(
@@ -734,7 +737,7 @@ fn agents_isolation_is_opt_in_with_outbound_network_by_default() {
     .unwrap();
     assert_eq!(config.isolation.agents.network, AgentNetwork::None);
     let default = Config::from_yaml(&with_isolation("")).unwrap();
-    assert_eq!(default.isolation.agents.mode, AgentIsolationMode::None);
+    assert_eq!(default.isolation.agents.mode, None);
 }
 
 #[test]

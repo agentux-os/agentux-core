@@ -136,6 +136,11 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE runs ADD COLUMN origin TEXT;
     ",
+    // 8: the isolation a run's agent sessions ran with (an `AgentIsolation`
+    // as JSON).
+    "
+    ALTER TABLE runs ADD COLUMN agent_isolation TEXT;
+    ",
 ];
 
 /// The schema version this build writes.

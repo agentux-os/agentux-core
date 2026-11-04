@@ -37,10 +37,107 @@ pub struct Isolation {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentIsolation {
+    /// `None`: the project doesn't say, and [`AgentIsolation::decide`]
+    /// picks.
     #[serde(default)]
-    pub mode: AgentIsolationMode,
+    pub mode: Option<AgentIsolationMode>,
     #[serde(default)]
     pub network: AgentNetwork,
+}
+
+/// Why a run's sessions get the isolation they do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationSource {
+    /// `isolation.agents.mode` in the project's `agentux.yaml`.
+    Project,
+    /// The machine's node policy requires the sandbox.
+    NodePolicy,
+    /// The run came from AgentUX Command and the project doesn't say.
+    Command,
+    /// Nothing asks for a sandbox.
+    Default,
+}
+
+impl IsolationSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::NodePolicy => "node-policy",
+            Self::Command => "command",
+            Self::Default => "default",
+        }
+    }
+}
+
+impl AgentIsolation {
+    /// The mode a run's sessions get, and why (ADR 0023): a node policy that
+    /// requires the sandbox wins over the project, the project's own choice
+    /// comes next, and runs from AgentUX Command are sandboxed when the
+    /// project doesn't say.
+    pub fn decide(
+        self,
+        node: NodeAgents,
+        from_command: bool,
+    ) -> (AgentIsolationMode, IsolationSource) {
+        if node.isolation == NodeIsolation::Required {
+            return (AgentIsolationMode::Bubblewrap, IsolationSource::NodePolicy);
+        }
+        match self.mode {
+            Some(mode) => (mode, IsolationSource::Project),
+            None if from_command => (AgentIsolationMode::Bubblewrap, IsolationSource::Command),
+            None => (AgentIsolationMode::None, IsolationSource::Default),
+        }
+    }
+}
+
+/// The machine's file that can require the agent sandbox, shared with the
+/// gateway's command policy.
+pub const NODE_POLICY: &str = "/etc/agentux/node-policy.yaml";
+
+/// `agents` in the node policy: what the machine requires of agent sessions.
+///
+/// ```yaml
+/// agents:
+///   isolation: required
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeAgents {
+    #[serde(default)]
+    pub isolation: NodeIsolation,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeIsolation {
+    /// Projects (and runs from Command) decide.
+    #[default]
+    Optional,
+    /// Every agent session runs in the sandbox, whatever the project says.
+    Required,
+}
+
+impl NodeAgents {
+    /// `agents` of the node policy at `path`; the defaults when there is no
+    /// file. The rest of the file is the gateway's.
+    pub fn load(path: &Path) -> Result<NodeAgents, String> {
+        #[derive(Deserialize)]
+        struct File {
+            #[serde(default)]
+            agents: NodeAgents,
+        }
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(NodeAgents::default()),
+            Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+        };
+        if text.trim().is_empty() {
+            return Ok(NodeAgents::default());
+        }
+        serde_saphyr::from_str::<File>(&text)
+            .map(|file| file.agents)
+            .map_err(|e| format!("{}: invalid policy: {e}", path.display()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize)]
@@ -80,6 +177,57 @@ impl AgentNetwork {
             Self::Outbound => "outbound",
             Self::None => "none",
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+
+    #[test]
+    fn node_policy_wins_then_the_project_then_command() {
+        let required = NodeAgents {
+            isolation: NodeIsolation::Required,
+        };
+        let optional = NodeAgents::default();
+        let unset = AgentIsolation::default();
+        let none = AgentIsolation {
+            mode: Some(AgentIsolationMode::None),
+            ..unset
+        };
+        use AgentIsolationMode::*;
+        assert_eq!(
+            none.decide(required, false),
+            (Bubblewrap, IsolationSource::NodePolicy)
+        );
+        assert_eq!(
+            none.decide(optional, true),
+            (None, IsolationSource::Project)
+        );
+        assert_eq!(
+            unset.decide(optional, true),
+            (Bubblewrap, IsolationSource::Command)
+        );
+        assert_eq!(
+            unset.decide(optional, false),
+            (None, IsolationSource::Default)
+        );
+    }
+
+    #[test]
+    fn node_policy_agents_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node-policy.yaml");
+        assert_eq!(NodeAgents::load(&path).unwrap(), NodeAgents::default());
+        fs::write(&path, "commands:\n  run.start: allow\n").unwrap();
+        assert_eq!(NodeAgents::load(&path).unwrap(), NodeAgents::default());
+        fs::write(&path, "agents:\n  isolation: required\n").unwrap();
+        assert_eq!(
+            NodeAgents::load(&path).unwrap().isolation,
+            NodeIsolation::Required
+        );
+        fs::write(&path, "agents:\n  isolation: sometimes\n").unwrap();
+        assert!(NodeAgents::load(&path).is_err());
     }
 }
 

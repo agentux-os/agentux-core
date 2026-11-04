@@ -25,7 +25,7 @@ Two Command servers in one institution therefore never share or take nodes. A no
 | `harness.status` | When the agent CLIs change, checked every 5 minutes and after limit changes: installed, signed in, version, spend, plan windows, limits |
 | `harness.limits_changed` | When the usage limits in force change |
 | `approval.requested` | A run waits for the human: kind, title, detail (cut at 4000 characters), options |
-| `run.updated` / `run.completed` / `run.failed` | A run changed: state, step, roles and models, activity, cost and budget, branch, pull request, error |
+| `run.updated` / `run.completed` / `run.failed` | A run changed: state, step, roles and models, activity, cost and budget, branch, pull request, error, and once a session opened, `agentIsolation` (`mode` `none` or `bubblewrap`, `network`, and `source`: `project`, `node-policy`, `command` or `default`) |
 
 Messages are POSTed to `<command>/v1/protocol/messages` with `Authorization: Bearer <node token>`. Events carry a `sequence` that keeps growing across restarts (`~/.local/state/agentux/gateway.json`) and an `eventId` of `<nodeId>-<sequence>`. While Command is unreachable they wait in order (up to 5000, oldest dropped first) and go out when it answers again; runs go on regardless.
 
@@ -41,6 +41,8 @@ commands:
   run.start: confirm        # default
   preferences.set: confirm  # default
   limits.clear: deny
+agents:
+  isolation: required       # every agent session in the sandbox; default optional
 ```
 
 | Method | Default | What it does on the node |

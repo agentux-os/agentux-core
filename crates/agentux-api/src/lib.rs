@@ -290,6 +290,35 @@ pub struct Run {
     /// organization's mission (ADR 0015).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<RunOrigin>,
+    /// Where the run's agent sessions run (ADRs 0023 and 0024), once one
+    /// has opened: the weakest isolation any of them had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_isolation: Option<AgentIsolation>,
+}
+
+/// The isolation an agent session ran with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentIsolation {
+    /// `none` (on the host, as the user running `agentuxd`) or `bubblewrap`.
+    pub mode: String,
+    /// A sandbox's network: `outbound` or `none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// What decided it: `project`, `node-policy`, `command` or `default`.
+    pub source: String,
+}
+
+impl AgentIsolation {
+    /// How much it keeps a session in: none on the host, more without a
+    /// network.
+    pub fn strength(&self) -> u8 {
+        match (self.mode.as_str(), self.network.as_deref()) {
+            ("none", _) => 0,
+            (_, Some("none")) => 2,
+            _ => 1,
+        }
+    }
 }
 
 /// An organization's mission run a node's run belongs to (ADR 0015): what
