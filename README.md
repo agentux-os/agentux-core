@@ -196,7 +196,7 @@ It never sees the daemon's control socket, `/run/user` (D-Bus, keyring, SSH agen
 
 **Failures.** A missing `bwrap` or `pasta` fails the session instead of running it unconfined. The TUI handoff opens in the same sandbox. Antigravity isn't supported in the sandbox until its paths are verified.
 
-## Tool catalog (MCP servers)
+## Tool catalog (MCP servers and instructions)
 
 Declare an MCP server once and every harness's sessions get it: Claude Code, Codex, OpenCode and Antigravity alike. agentuxd hands the servers to each session in ACP's `session/new`, next to the `agentux` bus, so there's no per-CLI configuration file to keep in sync. A run that falls back to another harness keeps its tools.
 
@@ -220,6 +220,18 @@ mcp:                      # in agentux.yaml, under `tools:`
 An HTTP server (MCP's streamable HTTP transport) gives a `url` instead of a `command`: `https://`, or `http://` on this machine. Its `headers` can be values or secrets (`Authorization: { secret: LINEAR_TOKEN }`). ACP passes HTTP servers only to agents that declare `mcpCapabilities.http`, and a session whose harness doesn't support them says which ones it goes without. `aux tools add NAME --url URL [--header NAME=VALUE] [--secret-header NAME=SECRET]` adds one.
 
 Secrets are references. agentuxd looks each one up when a session starts, from its own environment, a systemd credential, or the desktop's secret service (`secret-tool store --label=NAME agentux-key NAME`). It passes the value to that server only. An entry whose secret isn't set is left out, and so is an entry that isn't for the session's harness. The run's log says which and why, never with a value. `aux tools [--project DIR] [--harness NAME]` shows the merged catalog and whether each secret is set. `aux tools add NAME --command CMD [--arg A]… [--env VAR=VALUE]… [--secret VAR=SECRET]… [--harness H]…` adds or replaces an entry in the user's catalog (`--file` for another one), `aux tools remove NAME` takes it out, and `aux tools test NAME` starts the server (or, for a `url` entry, reaches it over HTTP with its headers), initializes MCP and lists its tools.
+
+**Instructions.** The catalog's `instructions` are text that every harness's sessions get, like a `CLAUDE.md` or `AGENTS.md` shared by all of them:
+
+```yaml
+instructions:             # in agentux.yaml, under `tools:`
+  - name: house-style
+    text: |
+      Write commit messages in the imperative, in English.
+    harnesses: [codex]    # optional: every harness when left out
+```
+
+agentuxd adds them to the session prompt that comes before a session's first turn, under "Instructions from the AgentUX tool catalog", each under its name. Nothing is written into the vendors' own files, so a project's `CLAUDE.md` and `AGENTS.md` stay as the project wrote them, and a run that falls back to another harness gets the same instructions. A text is at most 16 KiB. `aux tools` and the cockpit's Tools section list the instructions with their size. Skills, which each vendor reads from its own directory, aren't in the catalog yet.
 
 ## Crates
 

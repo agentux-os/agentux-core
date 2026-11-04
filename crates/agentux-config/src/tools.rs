@@ -29,6 +29,20 @@
 //! Secrets are references, never values: agentuxd looks each one up when it
 //! starts a session (a systemd credential, else the desktop's secret service)
 //! and passes it to that session's server only.
+//!
+//! The catalog also holds instructions: text every harness's sessions get,
+//! like a shared `CLAUDE.md` or `AGENTS.md`, without writing either file.
+//! agentuxd adds them to the session prompt (the bus system prompt that
+//! precedes the first turn), so they follow a run that falls back to another
+//! harness, and the project's own instruction files stay the agent's own.
+//!
+//! ```yaml
+//! instructions:
+//!   - name: house-style
+//!     text: |
+//!       Write commit messages in the imperative, in English.
+//!     harnesses: [codex]                  # optional: every harness when unset
+//! ```
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -51,6 +65,32 @@ pub const RESERVED_NAME: &str = "agentux";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ToolCatalog {
     pub mcp: BTreeMap<String, McpTool>,
+    /// Instructions by name, in name order.
+    pub instructions: BTreeMap<String, Instruction>,
+}
+
+/// The longest instruction text, in bytes: instructions share the session
+/// prompt with the bus's and the step's.
+pub const MAX_INSTRUCTION_BYTES: usize = 16 * 1024;
+
+/// Text every harness's sessions get at their start (see the module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Instruction {
+    pub name: String,
+    pub text: String,
+    /// The harnesses it is for; every harness when unset.
+    pub harnesses: Option<Vec<String>>,
+    #[serde(skip)]
+    pub source: Source,
+}
+
+impl Instruction {
+    pub fn applies_to(&self, harness: &str) -> bool {
+        self.harnesses
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|h| h == harness))
+    }
 }
 
 /// One MCP server: started over stdio by the agent (`command`), or reached
@@ -138,6 +178,8 @@ impl McpTool {
 pub(crate) struct RawTools {
     #[serde(default)]
     pub(crate) mcp: Vec<McpTool>,
+    #[serde(default)]
+    pub(crate) instructions: Vec<Instruction>,
 }
 
 impl RawTools {
@@ -237,8 +279,41 @@ impl RawTools {
             tool.source = source;
             mcp.entry(tool.name.clone()).or_insert(tool);
         }
+        let mut instructions = BTreeMap::new();
+        for (i, mut entry) in self.instructions.into_iter().enumerate() {
+            let at = format!("{prefix}instructions[{i}]");
+            if !valid_name(&entry.name) {
+                push(
+                    format!("{at}.name"),
+                    "must be lowercase letters, digits, `.`, `_` or `-`, starting with a letter or digit (at most 63)",
+                );
+            } else if instructions.contains_key(&entry.name) {
+                push(format!("{at}.name"), "is already used by another entry");
+            }
+            if entry.text.trim().is_empty() {
+                push(format!("{at}.text"), "must not be empty");
+            } else if entry.text.len() > MAX_INSTRUCTION_BYTES {
+                push(format!("{at}.text"), "must be at most 16 KiB");
+            }
+            match &entry.harnesses {
+                Some(list) if list.is_empty() => push(
+                    format!("{at}.harnesses"),
+                    "must name at least one harness (leave it out for every harness)",
+                ),
+                Some(list) => {
+                    for (j, harness) in list.iter().enumerate() {
+                        if harness.trim().is_empty() {
+                            push(format!("{at}.harnesses[{j}]"), "must not be empty");
+                        }
+                    }
+                }
+                None => {}
+            }
+            entry.source = source;
+            instructions.entry(entry.name.clone()).or_insert(entry);
+        }
         if issues.is_empty() {
-            Ok(ToolCatalog { mcp })
+            Ok(ToolCatalog { mcp, instructions })
         } else {
             Err(issues)
         }
@@ -272,7 +347,20 @@ impl ToolCatalog {
     /// replaced.
     pub fn merge(mut self, other: ToolCatalog) -> Self {
         self.mcp.extend(other.mcp);
+        self.instructions.extend(other.instructions);
         self
+    }
+
+    /// The instructions `harness`'s sessions get, as one text: each under
+    /// its name, in name order. `None` without any.
+    pub fn instructions_for(&self, harness: &str) -> Option<String> {
+        let parts: Vec<String> = self
+            .instructions
+            .values()
+            .filter(|i| i.applies_to(harness))
+            .map(|i| format!("### {}\n\n{}", i.name, i.text.trim()))
+            .collect();
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
     }
 
     /// The servers `harness`'s sessions get, in name order.
@@ -283,7 +371,7 @@ impl ToolCatalog {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.mcp.is_empty()
+        self.mcp.is_empty() && self.instructions.is_empty()
     }
 
     /// The catalog as a catalog file (what `aux tools add` writes). Every
@@ -300,6 +388,19 @@ impl ToolCatalog {
             "# The AgentUX tool catalog: MCP servers every harness's sessions get.\n\
              # Written by `aux tools`; see `aux tools --help`.\n",
         );
+        if !self.instructions.is_empty() {
+            out.push_str("instructions:\n");
+            for entry in self.instructions.values() {
+                out.push_str(&format!(
+                    "  - name: {}\n    text: {}\n",
+                    q(&entry.name),
+                    q(&entry.text)
+                ));
+                if let Some(harnesses) = &entry.harnesses {
+                    out.push_str(&format!("    harnesses: {}\n", list(harnesses)));
+                }
+            }
+        }
         if self.mcp.is_empty() {
             out.push_str("mcp: []\n");
             return out;
@@ -436,6 +537,46 @@ mcp:
     args: ["-y", "@playwright/mcp@0.0.41"]
     harnesses: [claude-code]
 "#;
+
+    #[test]
+    fn instructions_are_validated_filtered_by_harness_and_written_back() {
+        let yaml = "instructions:\n  - name: style\n    text: |\n      Use English.\n  - name: codex-only\n    text: Run cargo fmt.\n    harnesses: [codex]\n";
+        let catalog = ToolCatalog::from_yaml(yaml, Source::User).unwrap();
+        assert!(!catalog.is_empty());
+        assert_eq!(catalog.instructions["style"].source, Source::User);
+        assert_eq!(
+            catalog.instructions_for("claude-code").as_deref(),
+            Some("### style\n\nUse English.")
+        );
+        assert_eq!(
+            catalog.instructions_for("codex").as_deref(),
+            Some("### codex-only\n\nRun cargo fmt.\n\n### style\n\nUse English.")
+        );
+        let again = ToolCatalog::from_yaml(&catalog.to_yaml(), Source::User).unwrap();
+        assert_eq!(
+            again, catalog,
+            "aux tools keeps instructions when it rewrites the file"
+        );
+        assert_eq!(ToolCatalog::default().instructions_for("codex"), None);
+
+        let bad = format!(
+            "instructions:\n  - name: Bad Name\n    text: x\n  - name: empty\n    text: \"  \"\n  - name: big\n    text: \"{}\"\n  - name: none\n    text: x\n    harnesses: []\n",
+            "a".repeat(MAX_INSTRUCTION_BYTES + 1)
+        );
+        let Err(ConfigError::Invalid(issues)) = ToolCatalog::from_yaml(&bad, Source::User) else {
+            panic!("invalid instructions were accepted");
+        };
+        let paths: Vec<&str> = issues.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "instructions[0].name",
+                "instructions[1].text",
+                "instructions[2].text",
+                "instructions[3].harnesses"
+            ]
+        );
+    }
 
     #[test]
     fn a_catalog_file_names_servers_with_secret_references() {

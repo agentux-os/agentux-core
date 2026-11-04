@@ -2112,7 +2112,7 @@ impl Engine {
         &self,
         run_id: &str,
         harness: &str,
-    ) -> (Vec<agentux_harness::McpServer>, Vec<String>) {
+    ) -> (Vec<agentux_harness::McpServer>, Option<String>, Vec<String>) {
         let mut notes = Vec::new();
         let project = self
             .inner
@@ -2132,7 +2132,7 @@ impl Engine {
         notes.extend(more);
         let (servers, more) = crate::tools::servers(&catalog, harness, crate::tools::secret);
         notes.extend(more);
-        (servers, notes)
+        (servers, catalog.instructions_for(harness), notes)
     }
 }
 
@@ -2478,11 +2478,24 @@ impl StepHost for RunHost {
         }
         // The tool catalog's MCP servers, the same for every harness; the
         // run's log says which ones this session goes without.
-        let (tools, notes) = self.engine.session_tools(&self.run_id, harness);
+        let (tools, instructions, notes) = self.engine.session_tools(&self.run_id, harness);
         mcp_servers.extend(tools);
         for note in notes {
             self.record("a tool catalog note", |tx| Ok(tx.log(&self.run_id, note)?));
         }
+        // The catalog's instructions, after the bus's own prompt.
+        let system_prompt = match (system_prompt, instructions) {
+            (prompt, None) => prompt,
+            (prompt, Some(text)) => Some(
+                prompt
+                    .into_iter()
+                    .chain(std::iter::once(format!(
+                        "## Instructions from the AgentUX tool catalog\n\n{text}"
+                    )))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            ),
+        };
         Ok(OpenedSession {
             id: session.id,
             mcp_servers,

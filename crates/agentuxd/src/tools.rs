@@ -101,7 +101,21 @@ pub fn listing(
             }
         })
         .collect();
-    agentux_api::rpc::ToolsListing { mcp, notes }
+    let instructions = catalog
+        .instructions
+        .values()
+        .map(|i| agentux_api::rpc::InstructionInfo {
+            name: i.name.clone(),
+            source: i.source.to_string(),
+            harnesses: i.harnesses.clone(),
+            chars: i.text.chars().count(),
+        })
+        .collect();
+    agentux_api::rpc::ToolsListing {
+        mcp,
+        instructions,
+        notes,
+    }
 }
 
 /// `tool` as the server to start, with its secrets from `secret`; the name

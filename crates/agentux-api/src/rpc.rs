@@ -411,6 +411,9 @@ pub struct ListTools {
 #[serde(rename_all = "camelCase")]
 pub struct ToolsListing {
     pub mcp: Vec<ToolInfo>,
+    /// The catalog's instructions (names, never needed to show their text).
+    #[serde(default)]
+    pub instructions: Vec<InstructionInfo>,
     /// Catalog files that could not be used, and why.
     #[serde(default)]
     pub notes: Vec<String>,
@@ -440,6 +443,18 @@ pub struct ToolInfo {
     /// while one isn't.
     #[serde(default)]
     pub secrets: Vec<ToolSecret>,
+}
+
+/// One instruction of the tool catalog.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstructionInfo {
+    pub name: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harnesses: Option<Vec<String>>,
+    /// The text's length in characters.
+    pub chars: usize,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

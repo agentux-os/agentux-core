@@ -741,6 +741,20 @@ fn tools(project: &std::path::Path, harness: Option<&str>) -> Result {
         println!("no MCP servers in the tool catalog");
         return Ok(());
     }
+    for entry in catalog.instructions.values() {
+        if harness.is_some_and(|h| !entry.applies_to(h)) {
+            continue;
+        }
+        println!("{} (instructions, {} catalog)", entry.name, entry.source);
+        match &entry.harnesses {
+            Some(list) => println!("  harnesses: {}", list.join(", ")),
+            None => println!("  harnesses: all"),
+        }
+        println!(
+            "  {} characters, added to every session's prompt",
+            entry.text.chars().count()
+        );
+    }
     for tool in catalog.mcp.values() {
         if harness.is_some_and(|h| !tool.applies_to(h)) {
             continue;
