@@ -49,36 +49,145 @@ pub fn servers(
             ));
             continue;
         }
-        let mut env = Vec::with_capacity(tool.env.len());
-        let mut missing = None;
-        for (var, value) in &tool.env {
-            match value {
-                EnvValue::Plain(value) => env.push((var.clone(), value.clone())),
-                EnvValue::Secret { secret: name } => match secret(name) {
-                    Some(value) => env.push((var.clone(), value)),
-                    None => {
-                        missing = Some(name.clone());
-                        break;
-                    }
-                },
-            }
-        }
-        if let Some(name) = missing {
-            notes.push(format!(
+        match resolve(tool, &secret) {
+            Ok(server) => servers.push(server),
+            Err(name) => notes.push(format!(
                 "tools: `{}` ({} catalog) is left out: the secret {name} is not set \
                  (a systemd credential, or `secret-tool store --label={name} agentux-key {name}`)",
                 tool.name, tool.source
-            ));
-            continue;
+            )),
         }
-        servers.push(McpServer {
-            name: tool.name.clone(),
-            command: PathBuf::from(&tool.command),
-            args: tool.args.clone(),
-            env,
-        });
     }
     (servers, notes)
+}
+
+/// `tool` as the server to start, with its secrets from `secret`; the name
+/// of the first secret that isn't set otherwise.
+pub fn resolve(
+    tool: &agentux_config::McpTool,
+    secret: impl Fn(&str) -> Option<String>,
+) -> Result<McpServer, String> {
+    let mut env = Vec::with_capacity(tool.env.len());
+    for (var, value) in &tool.env {
+        match value {
+            EnvValue::Plain(value) => env.push((var.clone(), value.clone())),
+            EnvValue::Secret { secret: name } => {
+                env.push((var.clone(), secret(name).ok_or_else(|| name.clone())?))
+            }
+        }
+    }
+    Ok(McpServer {
+        name: tool.name.clone(),
+        command: PathBuf::from(&tool.command),
+        args: tool.args.clone(),
+        env,
+    })
+}
+
+/// What an MCP server says about itself (`aux tools test`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// `serverInfo.name` and `.version`.
+    pub server: String,
+    pub tools: Vec<String>,
+}
+
+/// Starts `server` over stdio, initializes MCP and lists its tools, within
+/// `timeout`. The server is stopped afterwards.
+pub async fn probe(server: &McpServer, timeout: std::time::Duration) -> Result<Probe, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut child = tokio::process::Command::new(&server.command)
+        .args(&server.args)
+        .envs(server.env.iter().cloned())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {e}", server.command.display()))?;
+    let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    let mut lines = BufReader::new(child.stdout.take().ok_or("no stdout")?).lines();
+    let talk = async move {
+        write_line(
+            &mut stdin,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "aux", "version": env!("CARGO_PKG_VERSION")}
+            }}),
+        )
+        .await?;
+        let init = read_reply(&mut lines, 1).await?;
+        write_line(
+            &mut stdin,
+            &serde_json::json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await?;
+        write_line(
+            &mut stdin,
+            &serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+        )
+        .await?;
+        let listed = read_reply(&mut lines, 2).await?;
+        let info = &init["serverInfo"];
+        let server = format!(
+            "{} {}",
+            info["name"].as_str().unwrap_or("(unnamed)"),
+            info["version"].as_str().unwrap_or("")
+        )
+        .trim()
+        .to_string();
+        let tools = listed["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|t| t["name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok::<_, String>(Probe { server, tools })
+    };
+    let result = tokio::time::timeout(timeout, talk)
+        .await
+        .map_err(|_| format!("no answer within {}s", timeout.as_secs()))?;
+    let _ = child.kill().await;
+
+    async fn write_line(
+        stdin: &mut tokio::process::ChildStdin,
+        message: &serde_json::Value,
+    ) -> Result<(), String> {
+        let mut line = message.to_string();
+        line.push('\n');
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("the server closed its input: {e}"))
+    }
+
+    async fn read_reply(
+        lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+        id: u64,
+    ) -> Result<serde_json::Value, String> {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("the server exited")?;
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if message.get("id") == Some(&serde_json::json!(id)) {
+                if let Some(error) = message.get("error") {
+                    return Err(format!("the server answered with an error: {error}"));
+                }
+                return Ok(message.get("result").cloned().unwrap_or_default());
+            }
+        }
+    }
+
+    result
 }
 
 /// A secret for a catalog entry: the daemon's own environment, a systemd
@@ -149,6 +258,60 @@ mcp:
         assert!(notes[0].contains("`browser`") && notes[0].contains("not for codex"));
         assert!(notes[1].contains("`wiki`") && notes[1].contains("WIKI_KEY"));
         assert!(notes.iter().all(|n| !n.contains("gh-secret-value")));
+    }
+
+    /// A stdio MCP server in `sh`: answers initialize, skips the
+    /// notification, and lists two tools.
+    const FAKE_SERVER: &str = r#"read l; echo '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"fake-mcp","version":"1.2"}}}'; read l; read l; echo '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'; echo '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"search"},{"name":"fetch"}]}}'; sleep 5"#;
+
+    #[tokio::test]
+    async fn a_probe_initializes_and_lists_the_tools() {
+        let server = McpServer {
+            name: "fake".into(),
+            command: PathBuf::from("sh"),
+            args: vec!["-c".into(), FAKE_SERVER.into()],
+            env: Vec::new(),
+        };
+        let probe = probe(&server, std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(probe.server, "fake-mcp 1.2");
+        assert_eq!(probe.tools, ["search", "fetch"]);
+    }
+
+    #[tokio::test]
+    async fn a_silent_server_times_out_and_a_missing_one_is_said() {
+        let silent = McpServer {
+            name: "silent".into(),
+            command: PathBuf::from("sh"),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env: Vec::new(),
+        };
+        let err = probe(&silent, std::time::Duration::from_millis(300))
+            .await
+            .unwrap_err();
+        assert!(err.contains("no answer"), "{err}");
+        let missing = McpServer {
+            command: PathBuf::from("/nonexistent/mcp-server"),
+            ..silent
+        };
+        let err = probe(&missing, std::time::Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(err.contains("cannot start"), "{err}");
+    }
+
+    #[test]
+    fn resolve_names_the_missing_secret() {
+        let catalog = catalog();
+        assert_eq!(
+            resolve(&catalog.mcp["wiki"], secret).unwrap_err(),
+            "WIKI_KEY"
+        );
+        assert_eq!(
+            resolve(&catalog.mcp["github"], secret).unwrap().env.len(),
+            2
+        );
     }
 
     #[test]

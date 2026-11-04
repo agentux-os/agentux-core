@@ -203,12 +203,60 @@ enum Command {
     /// (/etc/agentux/tools.yaml, ~/.config/agentux/tools.yaml and the
     /// project's agentux.yaml `tools`), and whether their secrets are set
     Tools {
+        #[command(subcommand)]
+        command: Option<ToolsCommand>,
         /// Project whose agentux.yaml adds to the catalog
         #[arg(long, default_value = ".")]
         project: PathBuf,
         /// Only what this harness's sessions get
         #[arg(long)]
         harness: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ToolsCommand {
+    /// Add an MCP server to a catalog file (the user's by default), or
+    /// replace the one of the same name
+    Add {
+        /// The server's name, as agents see its tools
+        name: String,
+        /// The command that starts it (MCP over stdio)
+        #[arg(long)]
+        command: String,
+        /// An argument to the command (repeat for more)
+        #[arg(long = "arg", value_name = "ARG", allow_hyphen_values = true)]
+        args: Vec<String>,
+        /// An environment variable with its value
+        #[arg(long = "env", value_name = "VAR=VALUE")]
+        env: Vec<String>,
+        /// An environment variable taken from a secret (a systemd
+        /// credential, or the secret service's `agentux-key SECRET`)
+        #[arg(long = "secret", value_name = "VAR=SECRET")]
+        secrets: Vec<String>,
+        /// Only for this harness's sessions (repeat for more)
+        #[arg(long = "harness", value_name = "HARNESS")]
+        harnesses: Vec<String>,
+        /// The catalog file to change [default: ~/.config/agentux/tools.yaml]
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Remove an MCP server from a catalog file (the user's by default)
+    Remove {
+        name: String,
+        /// The catalog file to change [default: ~/.config/agentux/tools.yaml]
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Start an MCP server from the catalog and list the tools it offers
+    Test {
+        name: String,
+        /// Project whose agentux.yaml adds to the catalog
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// Seconds to wait for its answers
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
     },
 }
 
@@ -344,7 +392,15 @@ fn main() -> ExitCode {
         Command::Ps { all, json: true } => return remote::ps_json(cli.socket, all),
         Command::Node(command) => node(cli.socket, command),
         Command::Preferences { json, set } => preferences(json, set),
-        Command::Tools { project, harness } => tools(&project, harness.as_deref()),
+        Command::Tools {
+            command: None,
+            project,
+            harness,
+        } => tools(&project, harness.as_deref()),
+        Command::Tools {
+            command: Some(command),
+            ..
+        } => tools_command(command),
         Command::Provision(ProvisionCommand::Apply { file, dry_run }) => {
             provision::run_apply(&file, dry_run)
         }
@@ -521,6 +577,123 @@ fn node(socket: Option<PathBuf>, command: NodeCommand) -> Result {
 
 /// The agent preferences straight from their file, so it works without the
 /// daemon (agentuxd reads the same file each time it needs it).
+/// The catalog file `aux tools add/remove` change.
+fn tools_file(file: Option<PathBuf>) -> std::result::Result<PathBuf, String> {
+    file.or_else(agentux_config::tools_user_file)
+        .ok_or_else(|| "neither XDG_CONFIG_HOME nor HOME is set; pass --file".to_string())
+}
+
+/// `VAR=VALUE` into its two halves.
+fn assignment(text: &str, what: &str) -> std::result::Result<(String, String), String> {
+    text.split_once('=')
+        .map(|(var, value)| (var.to_string(), value.to_string()))
+        .ok_or_else(|| format!("{what} `{text}` is not VAR=VALUE"))
+}
+
+fn tools_command(command: ToolsCommand) -> Result {
+    use agentux_config::{EnvValue, McpTool, ToolCatalog, ToolSource};
+    match command {
+        ToolsCommand::Add {
+            name,
+            command,
+            args,
+            env,
+            secrets,
+            harnesses,
+            file,
+        } => {
+            let path = tools_file(file)?;
+            let mut catalog = ToolCatalog::from_file(&path, ToolSource::User)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let mut values = std::collections::BTreeMap::new();
+            for text in &env {
+                let (var, value) = assignment(text, "--env")?;
+                values.insert(var, EnvValue::Plain(value));
+            }
+            for text in &secrets {
+                let (var, secret) = assignment(text, "--secret")?;
+                values.insert(var, EnvValue::Secret { secret });
+            }
+            let replaced = catalog.mcp.contains_key(&name);
+            catalog.mcp.insert(
+                name.clone(),
+                McpTool {
+                    name: name.clone(),
+                    command,
+                    args,
+                    env: values,
+                    harnesses: (!harnesses.is_empty()).then_some(harnesses),
+                    source: ToolSource::User,
+                },
+            );
+            write_catalog(&path, &catalog)?;
+            eprintln!(
+                "{} `{name}` in {}",
+                if replaced { "replaced" } else { "added" },
+                path.display()
+            );
+            Ok(())
+        }
+        ToolsCommand::Remove { name, file } => {
+            let path = tools_file(file)?;
+            let mut catalog = ToolCatalog::from_file(&path, ToolSource::User)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            if catalog.mcp.remove(&name).is_none() {
+                return Err(format!("`{name}` is not in {}", path.display()).into());
+            }
+            write_catalog(&path, &catalog)?;
+            eprintln!("removed `{name}` from {}", path.display());
+            Ok(())
+        }
+        ToolsCommand::Test {
+            name,
+            project,
+            timeout,
+        } => {
+            let config =
+                Config::load(&project).map_err(|e| format!("{}: {e}", project.display()))?;
+            let (catalog, notes) = agentuxd::tools::catalog(config.tools);
+            for note in &notes {
+                eprintln!("{note}");
+            }
+            let tool = catalog
+                .mcp
+                .get(&name)
+                .ok_or_else(|| format!("`{name}` is not in the tool catalog (see `aux tools`)"))?;
+            let server = agentuxd::tools::resolve(tool, agentuxd::tools::secret)
+                .map_err(|secret| format!("the secret {secret} is not set"))?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            let probe = runtime.block_on(agentuxd::tools::probe(
+                &server,
+                std::time::Duration::from_secs(timeout),
+            ))?;
+            println!("{name}: {} ({} catalog)", probe.server, tool.source);
+            if probe.tools.is_empty() {
+                println!("  no tools");
+            }
+            for tool in &probe.tools {
+                println!("  {tool}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Checks `catalog` by reading back what would be written, then replaces
+/// `path` with it.
+fn write_catalog(path: &std::path::Path, catalog: &agentux_config::ToolCatalog) -> Result {
+    let text = catalog.to_yaml();
+    agentux_config::ToolCatalog::from_yaml(&text, agentux_config::ToolSource::User)
+        .map_err(|e| format!("not written: {e}"))?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(())
+}
+
 fn tools(project: &std::path::Path, harness: Option<&str>) -> Result {
     let config = Config::load(project).map_err(|e| format!("{}: {e}", project.display()))?;
     let (catalog, notes) = agentuxd::tools::catalog(config.tools);

@@ -236,6 +236,53 @@ impl ToolCatalog {
     pub fn is_empty(&self) -> bool {
         self.mcp.is_empty()
     }
+
+    /// The catalog as a catalog file (what `aux tools add` writes). Every
+    /// string is written as a JSON string, which YAML reads as is.
+    pub fn to_yaml(&self) -> String {
+        let q = |s: &str| serde_json::to_string(s).expect("a string serializes");
+        let list = |items: &[String]| {
+            format!(
+                "[{}]",
+                items.iter().map(|s| q(s)).collect::<Vec<_>>().join(", ")
+            )
+        };
+        let mut out = String::from(
+            "# The AgentUX tool catalog: MCP servers every harness's sessions get.\n\
+             # Written by `aux tools`; see `aux tools --help`.\n",
+        );
+        if self.mcp.is_empty() {
+            out.push_str("mcp: []\n");
+            return out;
+        }
+        out.push_str("mcp:\n");
+        for tool in self.mcp.values() {
+            out.push_str(&format!("  - name: {}\n", q(&tool.name)));
+            out.push_str(&format!("    command: {}\n", q(&tool.command)));
+            if !tool.args.is_empty() {
+                out.push_str(&format!("    args: {}\n", list(&tool.args)));
+            }
+            if !tool.env.is_empty() {
+                out.push_str("    env:\n");
+                for (var, value) in &tool.env {
+                    match value {
+                        EnvValue::Plain(value) => {
+                            out.push_str(&format!("      {}: {}\n", q(var), q(value)))
+                        }
+                        EnvValue::Secret { secret } => out.push_str(&format!(
+                            "      {}: {{ secret: {} }}\n",
+                            q(var),
+                            q(secret)
+                        )),
+                    }
+                }
+            }
+            if let Some(harnesses) = &tool.harnesses {
+                out.push_str(&format!("    harnesses: {}\n", list(harnesses)));
+            }
+        }
+        out
+    }
 }
 
 /// The user's catalog file: `$XDG_CONFIG_HOME/agentux/tools.yaml`, or
@@ -388,6 +435,31 @@ mcp:
                 Source::User
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_written_catalog_reads_back_the_same() {
+        let catalog = ToolCatalog::from_yaml(GITHUB, Source::User).unwrap();
+        let written = catalog.to_yaml();
+        assert_eq!(
+            ToolCatalog::from_yaml(&written, Source::User).unwrap(),
+            catalog
+        );
+        let odd = ToolCatalog::from_yaml(
+            "mcp:\n  - name: odd\n    command: \"a: b # c\"\n    args: [\"it's\", \"\\\"q\\\"\"]\n",
+            Source::User,
+        )
+        .unwrap();
+        assert_eq!(odd.mcp["odd"].args, ["it's", "\"q\""]);
+        assert_eq!(
+            ToolCatalog::from_yaml(&odd.to_yaml(), Source::User).unwrap(),
+            odd
+        );
+        assert!(
+            ToolCatalog::from_yaml(&ToolCatalog::default().to_yaml(), Source::User)
+                .unwrap()
+                .is_empty()
         );
     }
 
