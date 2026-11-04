@@ -210,6 +210,15 @@ pub trait StepExecutor: Send + Sync + 'static {
         Box::pin(async { Ok(()) })
     }
 
+    /// Interrupts the turn in progress in a session for the human's `text`
+    /// (`sessions.prompt` with `interrupt`): the turn is cancelled and the
+    /// agent continues from `text` in the same session, as the same turn of
+    /// its step. `false` when the session is not in a turn this executor can
+    /// redirect; the caller then queues the message instead.
+    fn interrupt(&self, _run_id: &str, _session_id: &str, _text: &str) -> bool {
+        false
+    }
+
     /// The run finished or was cancelled: stop whatever is kept for it, such
     /// as harness sessions.
     fn release<'a>(&'a self, _run_id: &'a str) -> BoxFuture<'a, ()> {

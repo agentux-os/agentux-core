@@ -13,7 +13,7 @@
 //! and the bus's session prompt before its first prompt. Wakes from the bus
 //! are extra turns in the target session, queued behind a turn in progress.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -140,6 +140,8 @@ struct Slot {
     /// Permission requests of the session waiting for the human: the turn
     /// is not stalled while there are any.
     asking: Arc<AtomicUsize>,
+    /// The human's corrections for the turn in progress.
+    redirect: Arc<Redirect>,
     /// Held for a whole turn (or a step's turns): a wake for a session that
     /// is mid-turn waits here. Held as long as the session is open in its
     /// TUI, so turns wait for that too.
@@ -149,6 +151,61 @@ struct Slot {
 struct Live {
     session: Option<AcpSession>,
     events: Events,
+}
+
+/// Interrupt and redirect: the human's messages that stop a session's turn
+/// in progress, which then continues from them.
+#[derive(Default)]
+struct Redirect {
+    wake: tokio::sync::Notify,
+    state: Mutex<RedirectState>,
+}
+
+#[derive(Default)]
+struct RedirectState {
+    /// A turn is running and takes corrections.
+    open: bool,
+    texts: VecDeque<String>,
+}
+
+impl Redirect {
+    /// Queues `text` for the turn in progress; `false` if none is running.
+    fn push(&self, text: &str) -> bool {
+        let mut state = lock(&self.state);
+        if !state.open {
+            return false;
+        }
+        state.texts.push_back(text.to_string());
+        drop(state);
+        self.wake.notify_one();
+        true
+    }
+
+    fn pending(&self) -> bool {
+        !lock(&self.state).texts.is_empty()
+    }
+
+    fn open(&self) {
+        lock(&self.state).open = true;
+    }
+
+    /// The next correction, or `None`, closing the turn to new ones in the
+    /// same step: a message that comes after is queued as usual.
+    fn next(&self) -> Option<String> {
+        let mut state = lock(&self.state);
+        let next = state.texts.pop_front();
+        if next.is_none() {
+            state.open = false;
+        }
+        next
+    }
+
+    /// The turn ended without taking corrections; returns any left.
+    fn close(&self) -> Vec<String> {
+        let mut state = lock(&self.state);
+        state.open = false;
+        state.texts.drain(..).collect()
+    }
 }
 
 impl Slot {
@@ -353,6 +410,7 @@ impl AcpExecutor {
                     attached: AtomicBool::new(false),
                     host: host_slot,
                     asking,
+                    redirect: Arc::default(),
                     intro: Mutex::new(opened.system_prompt),
                     live: Arc::new(tokio::sync::Mutex::new(Live {
                         session: Some(session),
@@ -544,6 +602,13 @@ impl StepExecutor for AcpExecutor {
                 }
             }
         })
+    }
+
+    fn interrupt(&self, run_id: &str, session_id: &str, text: &str) -> bool {
+        match self.find(run_id, session_id) {
+            Some((_, slot)) if !slot.attached.load(Ordering::SeqCst) => slot.redirect.push(text),
+            _ => false,
+        }
     }
 
     fn wake<'a>(
@@ -793,6 +858,7 @@ enum TurnError {
 struct Watch {
     limits: StallLimits,
     asking: Arc<AtomicUsize>,
+    redirect: Arc<Redirect>,
 }
 
 impl Watch {
@@ -800,6 +866,7 @@ impl Watch {
         Self {
             limits,
             asking: Arc::clone(&slot.asking),
+            redirect: Arc::clone(&slot.redirect),
         }
     }
 
@@ -911,35 +978,67 @@ async fn turn(
         MESSAGE_FLUSH_EVERY,
     );
     let mut alive = Alive::new();
-    let stop = {
-        let prompt = session.prompt(text);
-        tokio::pin!(prompt);
-        loop {
-            let deadline = alive.deadline(watch);
-            tokio::select! {
-                stop = &mut prompt => break Ok(stop),
-                Some(event) = events.recv() => {
-                    alive.saw(&event);
-                    sink.push(event);
-                }
-                _ = tick.tick() => sink.flush(),
-                _ = tokio::time::sleep_until(deadline) => {
-                    if watch.waiting_for_human() || alive.asking_human() {
-                        alive.touch();
-                        continue;
+    watch.redirect.open();
+    let mut text = text.to_string();
+    let stop = loop {
+        let stop = {
+            let prompt = session.prompt(&text);
+            tokio::pin!(prompt);
+            // Asked the agent to stop for the human's correction.
+            let mut stopping = false;
+            loop {
+                let deadline = alive.deadline(watch);
+                tokio::select! {
+                    stop = &mut prompt => break Ok(stop),
+                    Some(event) = events.recv() => {
+                        alive.saw(&event);
+                        sink.push(event);
                     }
-                    // Give the agent a chance to end the turn cleanly.
-                    let _ = session.cancel();
-                    let _ = tokio::time::timeout(Duration::from_secs(30), &mut prompt).await;
-                    break Err(alive.stalled(watch));
+                    () = watch.redirect.wake.notified(), if !stopping => {
+                        if watch.redirect.pending() {
+                            stopping = true;
+                            // An agent that ignores it ends its turn first;
+                            // the correction comes next either way.
+                            let _ = session.cancel();
+                        }
+                    }
+                    _ = tick.tick() => sink.flush(),
+                    _ = tokio::time::sleep_until(deadline) => {
+                        if watch.waiting_for_human() || alive.asking_human() {
+                            alive.touch();
+                            continue;
+                        }
+                        // Give the agent a chance to end the turn cleanly.
+                        let _ = session.cancel();
+                        let _ = tokio::time::timeout(Duration::from_secs(30), &mut prompt).await;
+                        break Err(alive.stalled(watch));
+                    }
                 }
             }
+        };
+        while let Ok(event) = events.try_recv() {
+            sink.push(event);
         }
+        sink.flush();
+        if !matches!(stop, Ok(Ok(_))) {
+            watch.redirect.close();
+            break stop;
+        }
+        let Some(next) = watch.redirect.next() else {
+            break stop;
+        };
+        // The correction was recorded as the human's when it was accepted.
+        host.session_event(
+            session_id,
+            SessionEvent::Message {
+                from: MessageFrom::System,
+                text: "You interrupted the agent; it continues from your message.".into(),
+            },
+        );
+        sink.reply.clear();
+        alive.touch();
+        text = next;
     };
-    while let Ok(event) = events.try_recv() {
-        sink.push(event);
-    }
-    sink.flush();
     let stop = match stop {
         Ok(stop) => stop,
         // The session is not trusted any more: the next turn gets a new one.
@@ -1083,11 +1182,12 @@ fn permissions(
             let Some(host) = current else {
                 return Decision::Deny;
             };
-            asking.fetch_add(1, Ordering::SeqCst);
+            // Counted down also when the request is withdrawn mid-wait (the
+            // turn was cancelled or interrupted), which drops this future.
+            let _asking = Asking::new(asking);
             let allowed = host
                 .ask_permission(&session_id, &role, kind, title, detail)
                 .await;
-            asking.fetch_sub(1, Ordering::SeqCst);
             if allowed {
                 Decision::Allow
             } else {
@@ -1095,6 +1195,22 @@ fn permissions(
             }
         }
     })
+}
+
+/// One permission request waiting for the human, for [`Watch`].
+struct Asking(Arc<AtomicUsize>);
+
+impl Asking {
+    fn new(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Asking {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn describe(role: &str, harness: &str, request: &PermissionRequest) -> (String, String) {

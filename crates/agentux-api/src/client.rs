@@ -210,6 +210,22 @@ impl Client {
         let params = rpc::PromptSession {
             session_id: session_id.into(),
             text: text.into(),
+            interrupt: false,
+        };
+        self.call(method::SESSIONS_PROMPT, &params).await
+    }
+
+    /// Like [`Self::prompt_session`], but stops the session's turn in
+    /// progress so the agent continues from `text` (interrupt and redirect).
+    pub async fn interrupt_session(
+        &mut self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<rpc::Prompted, ClientError> {
+        let params = rpc::PromptSession {
+            session_id: session_id.into(),
+            text: text.into(),
+            interrupt: true,
         };
         self.call(method::SESSIONS_PROMPT, &params).await
     }

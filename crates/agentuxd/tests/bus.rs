@@ -1081,6 +1081,159 @@ async fn the_human_prompts_a_live_session_after_its_current_turn() {
     let _ = d.stop.send(());
 }
 
+/// Works on the implement step until it is stopped, then takes the human's
+/// correction.
+fn redirected(ctx: Ctx, turn: Turn) -> BoxFuture<'static, TurnResult> {
+    Box::pin(async move {
+        if turn.prompt.contains("## Your step:") {
+            ctx.note(format!("{} started the step", ctx.harness));
+            tokio::select! {
+                () = turn.cancelled() => ctx.note(format!("{} stopped", ctx.harness)),
+                () = tokio::time::sleep(Duration::from_secs(20)) => {
+                    ctx.note(format!("{} was never stopped", ctx.harness));
+                }
+            }
+            return Ok(acp::StopReason::Cancelled);
+        }
+        ctx.note(format!("{} heard: {}", ctx.harness, turn.prompt));
+        turn.message("Done, without the cache")?;
+        Ok(acp::StopReason::EndTurn)
+    })
+}
+
+/// Asks to run the migrations on the implement step, then takes the human's
+/// correction.
+fn redirected_while_asking(ctx: Ctx, turn: Turn) -> BoxFuture<'static, TurnResult> {
+    Box::pin(async move {
+        if turn.prompt.contains("## Your step:") {
+            let answer = turn
+                .request_permission("t1", "Run the migrations", acp::ToolKind::Execute)
+                .await?;
+            ctx.note(format!("{} was answered: {answer}", ctx.harness));
+            return Ok(acp::StopReason::Cancelled);
+        }
+        ctx.note(format!("{} heard: {}", ctx.harness, turn.prompt));
+        turn.message("Done, without migrating")?;
+        Ok(acp::StopReason::EndTurn)
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupt_withdraws_the_permission_request_the_turn_waits_on() {
+    let f = fixture(ONE_STEP);
+    let seen = Shared::default();
+    let mut d = daemon(&f, &seen, redirected_while_asking, &[]).await;
+    let run = start(&f, &d.engine, "Add a health endpoint").await;
+    eventually("the permission request", || {
+        d.engine
+            .requests(true)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.run_id == run.id && r.title.contains("Run the migrations"))
+    })
+    .await;
+    let session = d.engine.sessions(Some(&run.id)).unwrap().remove(0);
+
+    let prompted = d
+        .client
+        .interrupt_session(&session.id, "Do not migrate")
+        .await
+        .unwrap();
+    assert!(prompted.interrupted, "{prompted:?}");
+    eventually("the request withdrawn", || {
+        has_note(&seen, "fake-coder was answered: cancelled")
+    })
+    .await;
+    wait_for(&d.engine, &run.id, |r| r.status == RunStatus::Waiting).await;
+    assert!(has_note(&seen, "fake-coder heard: Do not migrate").is_some());
+    assert!(
+        !d.engine
+            .requests(true)
+            .unwrap()
+            .iter()
+            .any(|r| r.title.contains("Run the migrations")),
+        "the withdrawn request is not pending any more"
+    );
+    let _ = d.stop.send(());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_human_interrupts_a_turn_and_the_step_continues_from_the_correction() {
+    let f = fixture(ONE_STEP);
+    let seen = Shared::default();
+    let mut d = daemon(&f, &seen, redirected, &[]).await;
+    let run = start(&f, &d.engine, "Add a health endpoint").await;
+    eventually("the implementer at work", || {
+        has_note(&seen, "fake-coder started the step")
+    })
+    .await;
+    let session = d.engine.sessions(Some(&run.id)).unwrap().remove(0);
+
+    let prompted = d
+        .client
+        .interrupt_session(&session.id, "Skip the cache")
+        .await
+        .unwrap();
+    assert!(prompted.interrupted && !prompted.queued, "{prompted:?}");
+
+    // The step goes on from the correction instead of failing.
+    wait_for(&d.engine, &run.id, |r| r.status == RunStatus::Waiting).await;
+    assert!(has_note(&seen, "fake-coder stopped").is_some());
+    assert!(has_note(&seen, "fake-coder heard: Skip the cache").is_some());
+    let prompts = prompts_of(&seen, "fake-coder");
+    assert_eq!(prompts.len(), 2, "{prompts:#?}");
+    assert_eq!(prompts[1], "Skip the cache");
+
+    // In order: the step's prompt, the human's correction, the notice, the
+    // continuation's answer.
+    let events = d
+        .engine
+        .store()
+        .read(|tx| tx.events_since(0, Some(&run.id)))
+        .unwrap();
+    let said: Vec<(MessageFrom, String)> = events
+        .iter()
+        .filter_map(|e| match &e.body {
+            EventBody::SessionEvent {
+                event: SessionEvent::Message { from, text },
+                ..
+            } => Some((*from, text.clone())),
+            _ => None,
+        })
+        .collect();
+    let at = |want: MessageFrom, part: &str| {
+        said.iter()
+            .position(|(from, text)| *from == want && text.contains(part))
+            .unwrap_or_else(|| panic!("no {want:?} message with {part:?} in {said:#?}"))
+    };
+    let order = [
+        at(MessageFrom::User, "## Your step: implement"),
+        at(MessageFrom::Human, "Skip the cache"),
+        at(MessageFrom::System, "You interrupted the agent"),
+        at(MessageFrom::Agent, "Done, without the cache"),
+    ];
+    assert!(order.windows(2).all(|w| w[0] < w[1]), "{said:#?}");
+
+    // Between turns there is nothing to interrupt: the message is sent as
+    // usual.
+    eventually("the session idle", || {
+        (d.engine.sessions(Some(&run.id)).unwrap()[0].state == agentux_api::SessionState::Idle)
+            .then_some(())
+    })
+    .await;
+    let prompted = d
+        .client
+        .interrupt_session(&session.id, "Thanks")
+        .await
+        .unwrap();
+    assert!(!prompted.interrupted && !prompted.queued, "{prompted:?}");
+    eventually("the second message", || {
+        has_note(&seen, "fake-coder heard: Thanks")
+    })
+    .await;
+    let _ = d.stop.send(());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_human_posts_on_the_bus_and_wakes_the_target() {
     let f = fixture(ONE_STEP);

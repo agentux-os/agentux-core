@@ -300,7 +300,11 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
         method::RUNS_EVENTS => to_value(engine.run_events(parse(params)?)),
         method::SESSIONS_PROMPT => {
             let params: rpc::PromptSession = parse(params)?;
-            to_value(engine.prompt_session(&params.session_id, &params.text))
+            if params.interrupt {
+                to_value(engine.interrupt_session(&params.session_id, &params.text))
+            } else {
+                to_value(engine.prompt_session(&params.session_id, &params.text))
+            }
         }
         method::BUS_POST => to_value(engine.bus_post(parse(params)?)),
         method::HELPER_ASK => to_value(engine.ask_helper(parse(params)?).await),

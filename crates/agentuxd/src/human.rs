@@ -18,6 +18,17 @@ impl Engine {
     /// The message is recorded right away as a `human` session event; a
     /// delivery failure is logged on the run.
     pub fn prompt_session(&self, session_id: &str, text: &str) -> Result<Prompted, Error> {
+        self.say(session_id, text, false)
+    }
+
+    /// `sessions.prompt` with `interrupt`: stops the session's turn in
+    /// progress so the agent continues from `text`; a session that is not in
+    /// a turn (or whose agent cannot be redirected) gets it as usual.
+    pub fn interrupt_session(&self, session_id: &str, text: &str) -> Result<Prompted, Error> {
+        self.say(session_id, text, true)
+    }
+
+    fn say(&self, session_id: &str, text: &str, interrupt: bool) -> Result<Prompted, Error> {
         if text.trim().is_empty() {
             return Err(Error::InvalidParams("the message is empty".into()));
         }
@@ -47,6 +58,20 @@ impl Engine {
             Ok((session, record))
         })?;
         let queued = session.state != SessionState::Idle;
+        if interrupt
+            // In a turn: working, or waiting on a permission request.
+            && matches!(session.state, SessionState::Active | SessionState::Waiting)
+            && self
+                .inner
+                .executor
+                .interrupt(&session.run_id, &session.id, text)
+        {
+            return Ok(Prompted {
+                session,
+                queued: false,
+                interrupted: true,
+            });
+        }
         let host = Arc::new(RunHost {
             engine: self.clone(),
             run_id: session.run_id.clone(),
@@ -83,7 +108,11 @@ impl Engine {
                 }
             }
         });
-        Ok(Prompted { session, queued })
+        Ok(Prompted {
+            session,
+            queued,
+            interrupted: false,
+        })
     }
 
     /// `bus.post`: a message from the human on a run's bus, waking its
