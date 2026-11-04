@@ -391,6 +391,12 @@ pub fn pending_path() -> Option<PathBuf> {
 pub struct Handled {
     pub response: Value,
     pub event: Option<(String, Value)>,
+    pub gateway_command: Option<GatewayCommand>,
+}
+
+pub enum GatewayCommand {
+    Resume { after: i64 },
+    Acknowledge { through: i64 },
 }
 
 /// Recent answers by commandId: a command sent again gets the same answer.
@@ -447,6 +453,7 @@ pub async fn handle(
     let none = |response| Handled {
         response,
         event: None,
+        gateway_command: None,
     };
     if command_id.is_empty() {
         return none(error(&id, INVALID_PARAMS, "commandId is required"));
@@ -486,6 +493,39 @@ pub async fn handle(
     if let Some(answer) = answers.get(&command_id) {
         return none(answer.clone());
     }
+    let gateway_command = match method {
+        "node.resume" => match params
+            .get("lastAcknowledgedSequence")
+            .and_then(Value::as_i64)
+        {
+            Some(after) if after >= 0 => Some(GatewayCommand::Resume { after }),
+            _ => {
+                return none(error(
+                    &id,
+                    INVALID_PARAMS,
+                    "lastAcknowledgedSequence must be a non-negative integer",
+                ));
+            }
+        },
+        "node.events.ack" => match params.get("throughSequence").and_then(Value::as_i64) {
+            Some(through) if through >= 0 => Some(GatewayCommand::Acknowledge { through }),
+            _ => {
+                return none(error(
+                    &id,
+                    INVALID_PARAMS,
+                    "throughSequence must be a non-negative integer",
+                ));
+            }
+        },
+        _ => None,
+    };
+    if let Some(gateway_command) = gateway_command {
+        return Handled {
+            response: json!({ "jsonrpc": "2.0", "id": id, "result": null }),
+            event: None,
+            gateway_command: Some(gateway_command),
+        };
+    }
     let denied = |reason: &str| {
         Some((
             "command.denied".to_string(),
@@ -496,11 +536,13 @@ pub async fn handle(
         Decision::Deny => Handled {
             response: error(&id, DENIED, REASON_DENIED_BY_POLICY),
             event: denied(REASON_DENIED_BY_POLICY),
+            gateway_command: None,
         },
         Decision::Confirm => match pending.hold(&command_id, method, &params) {
             Ok(()) => Handled {
                 response: error(&id, HELD, REASON_AWAITING_CONFIRMATION),
                 event: denied(REASON_AWAITING_CONFIRMATION),
+                gateway_command: None,
             },
             Err(e) => none(error(&id, FAILED, &format!("cannot hold the command: {e}"))),
         },

@@ -24,7 +24,7 @@ base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
 crossterm = { version = "0.29", default-features = false }
 # AUXP, shared with agentux-command and tested against the protocol's schemas.
-auxp = { git = "https://github.com/agentux-os/agentux-protocol", rev = "aeced51393523ee7cd20c0b163cdb2664c2a038e" }
+auxp = { git = "https://github.com/agentux-os/agentux-protocol", rev = "a44991dfeb5eba0d25e97d87c22c8d21495f521d" }
 jiff = "0.2"
 portable-pty = "0.9"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
