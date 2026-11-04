@@ -150,6 +150,7 @@ dependencies = [
  "jiff",
  "portable-pty",
  "regex",
+ "reqwest",
  "rustix",
  "serde",
  "serde-saphyr",

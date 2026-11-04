@@ -18,6 +18,7 @@ clap.workspace = true
 jiff.workspace = true
 portable-pty.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 rustix = { version = "1", default-features = false, features = ["std", "process"] }
 serde.workspace = true
 serde-saphyr.workspace = true
