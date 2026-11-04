@@ -178,3 +178,77 @@ async fn api_round_trip_over_a_unix_socket() {
     server.await.unwrap().unwrap();
     assert!(!socket.exists());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_describes_the_run_it_would_start() {
+    let yaml = pipeline("cargo test").replace(
+        "  planner:\n    harness: fake-a\n",
+        "  planner:\n    harness: fake-a\n    model: big\n",
+    ) + "permissions:\n  read: allow\n  execute: ask\n  roles:\n    reviewer:\n      edit: deny\n";
+    let yaml = yaml.replace(
+        "  - step: plan\n    role: planner\n",
+        "  - step: plan\n    role: planner\n    approve: true\n",
+    );
+    let f = fixture(&yaml);
+    let socket = f.tmp.path().join("run").join("agentuxd.sock");
+    let engine = f.engine(Arc::new(FakeExecutor::default()));
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            server::serve(engine, &socket, async {
+                let _ = stopped.await;
+            })
+            .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut client = Client::connect(&socket).await.unwrap();
+    let project = client
+        .register_project(f.repo.to_str().unwrap())
+        .await
+        .unwrap();
+
+    let plan = client.describe_project(&project.id).await.unwrap();
+    assert_eq!(plan.source, "agentux.yaml");
+    let kinds: Vec<&str> = plan.steps.iter().map(|s| s.kind.as_str()).collect();
+    assert_eq!(
+        kinds,
+        ["plan", "implement", "gate", "review", "pull_request"]
+    );
+    assert!(plan.steps[0].approve, "the plan waits for approval");
+    assert_eq!(plan.steps[0].role.as_deref(), Some("planner"));
+    assert_eq!(plan.steps[2].checks, ["check"]);
+    assert_eq!(
+        (plan.steps[2].loop_to, plan.steps[2].loop_limit),
+        (Some(1), Some(3))
+    );
+    assert_eq!(
+        (plan.steps[3].loop_to, plan.steps[3].loop_limit),
+        (Some(1), Some(2))
+    );
+    assert_eq!(plan.roles["planner"].harness, "fake-a");
+    assert_eq!(plan.roles["planner"].model.as_deref(), Some("big"));
+    assert_eq!(plan.roles["reviewer"].harness, "fake-b");
+    assert_eq!(plan.checks[0].run, "cargo test");
+    let implementer = &plan.permissions["implementer"];
+    assert!(implementer["allow"].contains(&"read".to_string()));
+    assert!(implementer["ask"].contains(&"execute".to_string()));
+    assert!(plan.permissions["reviewer"]["deny"].contains(&"edit".to_string()));
+
+    // Nothing was started.
+    assert!(client.list_runs().await.unwrap().is_empty());
+    assert_eq!(
+        rpc_code(client.describe_project("nope").await),
+        code::NOT_FOUND
+    );
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+}

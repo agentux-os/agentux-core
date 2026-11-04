@@ -628,44 +628,21 @@ impl Engine {
         })
     }
 
-    /// Creates a run from the project's current `agentux.yaml` and starts it.
-    pub fn start_run(&self, params: StartRun) -> Result<Run> {
-        let prompt = params.prompt.filter(|p| !p.trim().is_empty());
-        if prompt.is_none() && params.issue.is_none() {
-            return Err(Error::InvalidParams(
-                "a run needs a prompt or an issue".into(),
-            ));
-        }
-        let project = self
-            .inner
-            .store
-            .read(|tx| tx.project(&params.project_id))?
-            .ok_or_else(|| Error::NotFound(format!("no project {}", params.project_id)))?;
-
-        let file = Path::new(&project.path).join(FILE_NAME);
-        let yaml = match fs::read_to_string(&file) {
-            Ok(text) => Some(text),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => {
-                return Err(Error::InvalidProject(format!(
-                    "cannot read {}: {e}",
-                    file.display()
-                )));
-            }
-        };
-        let config = match &yaml {
-            Some(text) => Config::from_yaml(text).map_err(|e| {
-                Error::InvalidProject(format!("{} is invalid: {e}", file.display()))
-            })?,
-            None => default_pipeline(Path::new(&project.path)),
-        };
+    /// The harness (and model) for each of `config`'s roles: the file's,
+    /// or for the built-in pipeline the user's preferences where usable,
+    /// else a usable harness.
+    fn resolve_roles(
+        &self,
+        config: &Config,
+        own_file: bool,
+    ) -> Result<(BTreeMap<String, String>, BTreeMap<String, String>)> {
         let mut roles: BTreeMap<String, String> = config
             .roles
             .iter()
             .map(|(name, role)| (name.clone(), role.harness.clone()))
             .collect();
         let mut models: BTreeMap<String, String> = BTreeMap::new();
-        if yaml.is_none() {
+        if !own_file {
             // The user's preferred harness and model per role, where usable.
             let prefs = self.prefs();
             let in_force = self.limits()?;
@@ -691,6 +668,116 @@ impl Engine {
                 }
             }
         }
+        Ok((roles, models))
+    }
+
+    /// What a run of `project_id` would do if started now
+    /// (`projects.describe`), resolved like [`Self::start_run`] does.
+    pub fn describe_project(&self, project_id: &str) -> Result<agentux_api::rpc::ProjectPlan> {
+        use agentux_api::rpc::{PlanCheck, PlanRole, PlanStep, ProjectPlan};
+        let project = self
+            .inner
+            .store
+            .read(|tx| tx.project(project_id))?
+            .ok_or_else(|| Error::NotFound(format!("no project {project_id}")))?;
+        let (config, yaml) = project_config(&project)?;
+        let own_file = yaml.is_some();
+        let (roles, models) = self.resolve_roles(&config, own_file)?;
+        let steps = config
+            .pipeline
+            .iter()
+            .map(|step| {
+                let mut out = PlanStep {
+                    kind: step.kind().as_str().to_string(),
+                    ..PlanStep::default()
+                };
+                match step {
+                    Step::Plan { role, approve }
+                    | Step::Implement { role, approve }
+                    | Step::Custom { role, approve, .. } => {
+                        out.role = Some(role.clone());
+                        out.approve = *approve;
+                    }
+                    Step::Review {
+                        role,
+                        approve,
+                        on_changes_requested,
+                    } => {
+                        out.role = Some(role.clone());
+                        out.approve = *approve;
+                        out.loop_to = on_changes_requested.as_ref().map(|l| l.target);
+                        out.loop_limit = on_changes_requested.as_ref().map(|l| l.limit);
+                    }
+                    Step::Gate { checks, on_fail } => {
+                        out.checks = checks.clone();
+                        out.loop_to = on_fail.as_ref().map(|l| l.target);
+                        out.loop_limit = on_fail.as_ref().map(|l| l.limit);
+                    }
+                    Step::PullRequest { draft, approve } => {
+                        out.draft = *draft;
+                        out.approve = *approve;
+                    }
+                }
+                out
+            })
+            .collect();
+        let permissions = roles
+            .keys()
+            .map(|role| {
+                let mut by_access: BTreeMap<String, Vec<String>> = BTreeMap::new();
+                for category in agentux_config::PERMISSION_CATEGORIES {
+                    let decided = config.permissions.decide(role, category);
+                    by_access
+                        .entry(decided.access.as_str().to_string())
+                        .or_default()
+                        .push(category.to_string());
+                }
+                (role.clone(), by_access)
+            })
+            .collect();
+        Ok(ProjectPlan {
+            project_id: project.id,
+            source: if own_file { FILE_NAME } else { "default" }.to_string(),
+            steps,
+            roles: roles
+                .into_iter()
+                .map(|(name, harness)| {
+                    // A run's own choice, else the file's for the role.
+                    let model = models
+                        .get(&name)
+                        .cloned()
+                        .or_else(|| config.roles.get(&name).and_then(|r| r.model.clone()));
+                    (name, PlanRole { harness, model })
+                })
+                .collect(),
+            checks: config
+                .checks
+                .iter()
+                .map(|c| PlanCheck {
+                    name: c.name.clone(),
+                    run: c.run.clone(),
+                })
+                .collect(),
+            budget_usd: config.budget.max_usd_per_run,
+            permissions,
+        })
+    }
+
+    /// Creates a run from the project's current `agentux.yaml` and starts it.
+    pub fn start_run(&self, params: StartRun) -> Result<Run> {
+        let prompt = params.prompt.filter(|p| !p.trim().is_empty());
+        if prompt.is_none() && params.issue.is_none() {
+            return Err(Error::InvalidParams(
+                "a run needs a prompt or an issue".into(),
+            ));
+        }
+        let project = self
+            .inner
+            .store
+            .read(|tx| tx.project(&params.project_id))?
+            .ok_or_else(|| Error::NotFound(format!("no project {}", params.project_id)))?;
+        let (config, yaml) = project_config(&project)?;
+        let (mut roles, mut models) = self.resolve_roles(&config, yaml.is_some())?;
         for (role, harness) in params.roles {
             let Some(slot) = roles.get_mut(&role) else {
                 return Err(Error::InvalidParams(format!(
@@ -2104,6 +2191,28 @@ async fn version_of(program: &str) -> Option<String> {
 /// takes the first usable one, and the reviewer prefers a different harness
 /// than the implementer. With none usable, the roles stay as they are (and
 /// the run says what is missing when it reaches them).
+/// `project`'s `agentux.yaml` with its text, or the built-in pipeline (and
+/// `None`) when it has none.
+fn project_config(project: &Project) -> Result<(Config, Option<String>)> {
+    let file = Path::new(&project.path).join(FILE_NAME);
+    match fs::read_to_string(&file) {
+        Ok(text) => match Config::from_yaml(&text) {
+            Ok(config) => Ok((config, Some(text))),
+            Err(e) => Err(Error::InvalidProject(format!(
+                "{} is invalid: {e}",
+                file.display()
+            ))),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Ok((default_pipeline(Path::new(&project.path)), None))
+        }
+        Err(e) => Err(Error::InvalidProject(format!(
+            "cannot read {}: {e}",
+            file.display()
+        ))),
+    }
+}
+
 fn default_roles(roles: &mut BTreeMap<String, String>, installed: &[String]) {
     let Some(first) = installed.first() else {
         return;

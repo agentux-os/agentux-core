@@ -15,6 +15,9 @@ pub const VERSION: &str = "2.0";
 pub mod method {
     pub const PROJECTS_REGISTER: &str = "projects.register";
     pub const PROJECTS_LIST: &str = "projects.list";
+    /// What a run of a project would do, before starting one
+    /// ([`super::DescribeProject`], [`super::ProjectPlan`]).
+    pub const PROJECTS_DESCRIBE: &str = "projects.describe";
     pub const RUNS_START: &str = "runs.start";
     /// The built-in harnesses and whether each is installed
     /// ([`super::HarnessInfo`]).
@@ -167,6 +170,73 @@ impl std::error::Error for Error {}
 pub struct RegisterProject {
     /// Any directory inside the project's git repository.
     pub path: String,
+}
+
+/// Params of `projects.describe`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescribeProject {
+    pub project_id: String,
+}
+
+/// What a run of a project would do, resolved as `runs.start` resolves it
+/// now: its steps, who plays each role, the checks that gate it, its budget
+/// and what its agents may do without asking.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectPlan {
+    pub project_id: String,
+    /// `agentux.yaml`, or `default` when the project has none (the built-in
+    /// pipeline with the checks detected in the repository).
+    pub source: String,
+    pub steps: Vec<PlanStep>,
+    /// Role name to the harness (and model) a run would give it.
+    pub roles: BTreeMap<String, PlanRole>,
+    pub checks: Vec<PlanCheck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
+    /// Role name to its tool-call categories by access: `allow`, `ask`,
+    /// `deny` (ADR 0021).
+    pub permissions: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanStep {
+    /// `plan`, `implement`, `gate`, `review`, `pull_request` or `custom`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    /// The run waits for the human's approval after the step.
+    pub approve: bool,
+    /// A gate's check names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
+    /// Where a failed gate or a review asking for changes goes back to (a
+    /// step index), and how many times at most.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_to: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loop_limit: Option<u32>,
+    /// A pull request step opens a draft.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub draft: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanRole {
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanCheck {
+    pub name: String,
+    /// The command, run with `sh -c` in the run's worktree.
+    pub run: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

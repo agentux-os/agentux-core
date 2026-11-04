@@ -202,6 +202,17 @@ impl Client {
         self.call(method::HELPER_ASK, params).await
     }
 
+    /// What a run of `project_id` would do (`projects.describe`).
+    pub async fn describe_project(
+        &mut self,
+        project_id: &str,
+    ) -> Result<rpc::ProjectPlan, ClientError> {
+        let params = rpc::DescribeProject {
+            project_id: project_id.into(),
+        };
+        self.call(method::PROJECTS_DESCRIBE, &params).await
+    }
+
     pub async fn prompt_session(
         &mut self,
         session_id: &str,

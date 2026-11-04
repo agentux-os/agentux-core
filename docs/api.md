@@ -20,6 +20,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 |---|---|---|
 | `projects.register` | `{ path }` — absolute path inside a git repository | `Project` (idempotent per repository) |
 | `projects.list` | — | `Project[]` |
+| `projects.describe` | `{ projectId }` | `{ projectId, source, steps: [{ kind, role?, approve, checks?, loopTo?, loopLimit?, draft? }], roles: { [role]: { harness, model? } }, checks: [{ name, run }], budgetUsd?, permissions: { [role]: { allow?, ask?, deny?: category[] } } }`: what a run would do if started now, resolved like `runs.start` (the project's `agentux.yaml`, or `source: "default"`, the built-in pipeline with the user's preferred, usable harnesses); for reviewing a run before starting it |
 | `runs.start` | `{ projectId, prompt?, issue?, title?, roles?, models?, origin? }` — `prompt` or `issue` required; `roles` maps role names to harness ids for this run, `models` role names to models; `origin` (`{ organizationId, missionId, commandRunId, definitionVersion? }`) names the organization's mission run it belongs to when AgentUX Command starts it, and the run keeps it | `Run` |
 | `harnesses.test` | `{ harness, model? }` | `{ harness, ok, detail, seconds, limit }`: one short prompt, answered like a helper question (no tools); a usage limit in the answer is recorded |
 | `preferences.get` | none | `AgentPrefs`: the user's agent preferences; see [Agent preferences](#agent-preferences) |

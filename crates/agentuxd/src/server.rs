@@ -261,6 +261,10 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
             to_value(engine.register_project(&params.path).await)
         }
         method::PROJECTS_LIST => to_value(engine.projects()),
+        method::PROJECTS_DESCRIBE => {
+            let params: rpc::DescribeProject = parse(params)?;
+            to_value(engine.describe_project(&params.project_id))
+        }
         method::RUNS_START => to_value(engine.start_run(parse(params)?)),
         method::HARNESSES_LIST => to_value(Ok(engine.harnesses().await)),
         method::HARNESSES_TEST => to_value(engine.test_harness(parse(params)?).await),
