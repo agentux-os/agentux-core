@@ -4,16 +4,17 @@
 //! This first, read-only phase sends what Command needs to see the node:
 //! `node.hello`, a `node.heartbeat` every 30 seconds, the agent CLIs
 //! (`harness.status`) when they change and every 5 minutes, usage limits
-//! (`harness.limits_changed`), pending approvals (`approval.requested`) and
-//! run progress (`run.updated`, `run.completed`, `run.failed`). It reads
+//! (`harness.limits_changed`), pending approvals (`approval.requested`),
+//! run progress (`run.updated`, `run.completed`, `run.failed`) and the safe
+//! tool-call lifecycle (`execution.activity`). It reads
 //! everything from the local `agentuxd` through its API; it never exposes
 //! the daemon's socket, its database or credentials. Commands from Command
 //! come with the next phase, behind the node's own policy.
 //!
 //! Messages are POSTed to `<command>/v1/protocol/messages` with the node's
 //! bearer token. Events get a sequence number that survives restarts
-//! ([`State`]); unsent ones wait in order and go out when Command answers
-//! again.
+//! ([`State`]); the optional replay capability retains them until Command
+//! acknowledges its contiguous durable cursor.
 //!
 //! Commands from Command come over a WebSocket the node opens
 //! ([`channel`]); the node's [`policy`] runs, holds or refuses each, and
@@ -23,15 +24,20 @@ pub mod channel;
 pub mod commands;
 pub mod policy;
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::{env, fs, io};
 
 use agentux_api::rpc::HarnessInfo;
 use agentux_api::{
-    Event, EventBody, HarnessLimit, PermissionRequest, RequestStatus, Run, RunStatus,
+    Event, EventBody, HarnessLimit, PermissionRequest, RequestStatus, Run, RunOrigin, RunStatus,
+    SessionEvent, SessionState, ToolStatus,
 };
+use auxp::activity::{ACTIVITY_SCHEMA_VERSION, Activity, ActivityKind};
+use auxp::replay::{ReplayResult, ReplayStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -53,6 +59,8 @@ pub const CAPABILITIES: &[&str] = &[
     "harness.test",
     "limits.clear",
     "preferences.set",
+    "execution.activity.v1",
+    "node.event_replay.v1",
 ];
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 const HARNESSES_EVERY: Duration = Duration::from_secs(300);
@@ -282,28 +290,72 @@ pub fn default_node_id() -> String {
     format!("node-{clean}")
 }
 
-/// What survives a restart: the last event sequence handed out.
+/// What survives a restart: event cursors, identity context, and messages not
+/// yet accepted by Command. Keeping the queue here makes delivery retries
+/// reuse the same event IDs and payloads.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct State {
     pub last_sequence: i64,
+    #[serde(default)]
+    pub last_local_event_sequence: i64,
+    #[serde(default)]
+    pub pending_outbox: VecDeque<Value>,
+    #[serde(default)]
+    pub accepted_capabilities: Vec<String>,
+    #[serde(default)]
+    pub acknowledged_sequence: i64,
+    #[serde(default)]
+    pub sessions: BTreeMap<String, SessionContext>,
+    #[serde(default)]
+    pub run_origins: BTreeMap<String, RunOrigin>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionContext {
+    pub run_id: String,
+    pub role_id: String,
 }
 
 impl State {
-    pub fn load(path: &Path) -> State {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+    pub fn load(path: &Path) -> io::Result<State> {
+        match fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(State::default()),
+            Err(error) => Err(error),
+        }
     }
 
-    pub fn save(&self, path: &Path) {
+    pub fn save(&self, path: &Path) -> io::Result<()> {
         if let Some(dir) = path.parent() {
-            let _ = fs::create_dir_all(dir);
+            fs::create_dir_all(dir)?;
         }
-        if let Ok(text) = serde_json::to_string(self) {
-            let _ = fs::write(path, text);
+        let text = serde_json::to_vec(self).map_err(io::Error::other)?;
+        let temporary = path.with_extension("json.tmp");
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
+        let mut file = options.open(&temporary)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all(&text)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 }
 
@@ -326,14 +378,19 @@ fn now() -> String {
 }
 
 impl Messages {
-    pub fn new(config: NodeConfig, state_path: Option<PathBuf>) -> Self {
-        let state = state_path.as_deref().map(State::load).unwrap_or_default();
-        Self {
+    pub fn new(config: NodeConfig, state_path: Option<PathBuf>) -> Result<Self, String> {
+        let state = state_path
+            .as_deref()
+            .map(State::load)
+            .transpose()
+            .map_err(|error| format!("cannot load gateway state: {error}"))?
+            .unwrap_or_default();
+        Ok(Self {
             config,
             state,
             state_path,
             counter: 0,
-        }
+        })
     }
 
     pub fn last_sequence(&self) -> i64 {
@@ -375,9 +432,6 @@ impl Messages {
     /// An event: the next sequence, kept across restarts.
     fn event(&mut self, method: &str, extra: Value) -> Value {
         self.state.last_sequence += 1;
-        if let Some(path) = &self.state_path {
-            self.state.save(path);
-        }
         let sequence = self.state.last_sequence;
         let mut params = self.base(extra);
         params.insert("sequence".into(), sequence.into());
@@ -445,6 +499,16 @@ impl Messages {
     pub fn from_event(&mut self, event: &Event) -> Option<Value> {
         match &event.body {
             EventBody::Run { run } => {
+                if run.status.is_terminal() {
+                    self.state.run_origins.remove(&run.id);
+                    self.state
+                        .sessions
+                        .retain(|_, session| session.run_id != run.id);
+                } else if let Some(origin) = &run.origin {
+                    self.state
+                        .run_origins
+                        .insert(run.id.clone(), origin.clone());
+                }
                 let method = match run.status {
                     RunStatus::Done => "run.completed",
                     RunStatus::Failed => "run.failed",
@@ -456,9 +520,209 @@ impl Messages {
                 Some(self.event("approval.requested", request_json(request)))
             }
             EventBody::Limits { limits } => Some(self.limits_changed(limits)),
+            EventBody::Session { session } => {
+                if session.state == SessionState::Ended {
+                    self.state.sessions.remove(&session.id);
+                } else {
+                    self.state.sessions.insert(
+                        session.id.clone(),
+                        SessionContext {
+                            run_id: session.run_id.clone(),
+                            role_id: session.role.clone(),
+                        },
+                    );
+                }
+                None
+            }
+            EventBody::SessionEvent {
+                session_id,
+                event: session_event,
+            } => self.activity_from_session_event(event.seq, session_id, session_event),
             _ => None,
         }
     }
+
+    fn activity_from_session_event(
+        &mut self,
+        sequence: i64,
+        session_id: &str,
+        event: &SessionEvent,
+    ) -> Option<Value> {
+        if !self
+            .state
+            .accepted_capabilities
+            .iter()
+            .any(|capability| capability == "execution.activity.v1")
+        {
+            return None;
+        }
+        let context = self.state.sessions.get(session_id)?;
+        let origin = self.state.run_origins.get(&context.run_id)?;
+        let (tool_call_id, kind) = match event {
+            SessionEvent::ToolCall {
+                tool_call_id,
+                tool,
+                status: Some(status),
+                ..
+            } => {
+                let tool_name = tool
+                    .as_ref()
+                    .map(|tool| match tool {
+                        agentux_api::ToolKind::Read => "read",
+                        agentux_api::ToolKind::Edit => "edit",
+                        agentux_api::ToolKind::Delete => "delete",
+                        agentux_api::ToolKind::Move => "move",
+                        agentux_api::ToolKind::Search => "search",
+                        agentux_api::ToolKind::Execute => "execute",
+                        agentux_api::ToolKind::Fetch => "fetch",
+                        agentux_api::ToolKind::Think | agentux_api::ToolKind::Other => "other",
+                    })
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "other".into());
+                let summary = match status {
+                    ToolStatus::Running => format!("Agent started a {tool_name} operation"),
+                    ToolStatus::Ok => format!("Agent completed a {tool_name} operation"),
+                    ToolStatus::Error => format!("Agent failed a {tool_name} operation"),
+                };
+                let kind = match status {
+                    ToolStatus::Running => ActivityKind::ToolStarted {
+                        tool_name: tool_name.clone(),
+                        summary: summary.clone(),
+                    },
+                    ToolStatus::Ok => ActivityKind::ToolCompleted {
+                        tool_name: tool_name.clone(),
+                        summary: summary.clone(),
+                    },
+                    ToolStatus::Error => ActivityKind::ToolFailed {
+                        tool_name: tool_name.clone(),
+                        summary: summary.clone(),
+                    },
+                };
+                (tool_call_id.clone(), kind)
+            }
+            _ => return None,
+        };
+        let activity = Activity {
+            schema_version: ACTIVITY_SCHEMA_VERSION.into(),
+            activity_id: activity_id(&self.config.node_id, sequence),
+            mission_id: origin.mission_id.clone(),
+            run_id: origin.command_run_id.clone(),
+            agent_id: session_id.to_string(),
+            role_id: context.role_id.clone(),
+            session_id: Some(session_id.to_string()),
+            task_id: None,
+            parent_task_id: None,
+            attempt: None,
+            causation_id: None,
+            delegation_id: None,
+            tool_call_id: Some(tool_call_id),
+            kind,
+        };
+        if activity.validate().is_err() {
+            return None;
+        }
+        let value = serde_json::to_value(activity).ok()?;
+        Some(self.event("execution.activity", json!({ "activity": value })))
+    }
+
+    fn commit_local_event(&mut self, seq: i64, outbox: &Outbox) -> Result<(), String> {
+        self.state.last_local_event_sequence = seq;
+        self.state.pending_outbox = outbox.queue.clone();
+        self.persist()
+    }
+
+    fn commit_outbox(&mut self, outbox: &Outbox) -> Result<(), String> {
+        self.state.pending_outbox = outbox.queue.clone();
+        self.persist()
+    }
+
+    fn accept_capabilities(&mut self, capabilities: Vec<String>) -> Result<(), String> {
+        self.state.accepted_capabilities = capabilities
+            .into_iter()
+            .filter(|capability| CAPABILITIES.contains(&capability.as_str()))
+            .collect();
+        self.persist()
+    }
+
+    fn commit_acknowledgement(&mut self, through: i64, outbox: &Outbox) -> Result<(), String> {
+        self.state.acknowledged_sequence = self.state.acknowledged_sequence.max(through);
+        self.state.pending_outbox = outbox.queue.clone();
+        self.persist()
+    }
+
+    fn replay_result(&self, after: i64, outbox: &mut Outbox) -> Result<ReplayResult, String> {
+        let high_water = self.state.last_sequence;
+        if after < 0 || after > high_water {
+            return Err(format!("replay cursor {after} is outside 0..={high_water}"));
+        }
+        let queued_sequences: Vec<i64> = outbox
+            .queue
+            .iter()
+            .filter_map(|message| message["params"]["sequence"].as_i64())
+            .collect();
+        let oldest_queued = queued_sequences.iter().copied().min();
+        let oldest_available = self
+            .state
+            .acknowledged_sequence
+            .saturating_add(1)
+            .max(oldest_queued.unwrap_or(high_water.saturating_add(1)));
+        let expired = after.saturating_add(1) < oldest_available;
+        let replayed = if expired {
+            0
+        } else {
+            outbox.replay_after(after).len() as i64
+        };
+        let result = ReplayResult {
+            status: if expired {
+                ReplayStatus::CursorExpired
+            } else {
+                ReplayStatus::Replay
+            },
+            node_id: self.config.node_id.clone(),
+            requested_after_sequence: after,
+            oldest_available_sequence: oldest_available,
+            high_water_sequence: high_water,
+            events_replayed: replayed,
+            snapshot_required: expired,
+        };
+        result.validate()?;
+        Ok(result)
+    }
+
+    fn persist(&self) -> Result<(), String> {
+        if let Some(path) = &self.state_path {
+            self.state
+                .save(path)
+                .map_err(|e| format!("cannot persist gateway state: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn replay_cursor(&self) -> i64 {
+        self.state.last_local_event_sequence
+    }
+
+    fn replay_enabled(&self) -> bool {
+        self.state
+            .accepted_capabilities
+            .iter()
+            .any(|capability| capability == "node.event_replay.v1")
+    }
+
+    fn pending_outbox(&self) -> Outbox {
+        Outbox {
+            queue: self.state.pending_outbox.clone(),
+            dropped: 0,
+            sent_event_ids: HashSet::new(),
+        }
+    }
+}
+
+fn activity_id(node_id: &str, local_sequence: i64) -> String {
+    let suffix = format!("-event-{local_sequence}");
+    let prefix_limit = 128usize.saturating_sub(suffix.chars().count());
+    let prefix = node_id.chars().take(prefix_limit).collect::<String>();
+    format!("{prefix}{suffix}")
 }
 
 fn limit_json(l: &HarnessLimit) -> Value {
@@ -525,8 +789,10 @@ fn request_json(request: &PermissionRequest) -> Value {
 
 /// Where messages go. [`Http`] in the daemon; tests plug in their own.
 pub trait Sink {
-    fn send(&self, message: &Value)
-    -> impl std::future::Future<Output = Result<(), String>> + Send;
+    fn send(
+        &self,
+        message: &Value,
+    ) -> impl std::future::Future<Output = Result<Option<Value>, String>> + Send;
 }
 
 /// POSTs to Command's `/v1/protocol/messages` with the node token.
@@ -554,7 +820,7 @@ impl Http {
 }
 
 impl Sink for Http {
-    async fn send(&self, message: &Value) -> Result<(), String> {
+    async fn send(&self, message: &Value) -> Result<Option<Value>, String> {
         let response = self
             .client
             .post(&self.url)
@@ -581,7 +847,7 @@ impl Sink for Http {
             }
         }
         if status.is_success() {
-            return Ok(());
+            return Ok(serde_json::from_str(&body).ok());
         }
         Err(format!("Command answered {status}: {}", body.trim()))
     }
@@ -592,6 +858,7 @@ impl Sink for Http {
 pub struct Outbox {
     queue: VecDeque<Value>,
     pub dropped: u64,
+    sent_event_ids: HashSet<String>,
 }
 
 impl Outbox {
@@ -611,15 +878,82 @@ impl Outbox {
         self.queue.is_empty()
     }
 
-    /// Sends in order until one fails; returns how many went.
-    pub async fn flush(&mut self, sink: &impl Sink) -> Result<usize, String> {
+    /// Sends in order until one fails. When replay is negotiated, sequenced
+    /// events remain queued until Command acknowledges their durable cursor.
+    pub async fn flush(
+        &mut self,
+        sink: &impl Sink,
+        retain_events: bool,
+    ) -> Result<(usize, Option<Vec<String>>), String> {
         let mut sent = 0;
-        while let Some(message) = self.queue.front() {
-            sink.send(message).await?;
-            self.queue.pop_front();
+        let mut accepted_capabilities = None;
+        let mut index = 0;
+        while index < self.queue.len() {
+            let message = self.queue[index].clone();
+            let event_id = message["params"]["eventId"].as_str();
+            if retain_events && event_id.is_some_and(|id| self.sent_event_ids.contains(id)) {
+                index += 1;
+                continue;
+            }
+            let response = sink.send(&message).await?;
+            if message["method"] == "node.hello" {
+                accepted_capabilities = Some(
+                    response
+                        .as_ref()
+                        .and_then(|value| value["result"]["acceptedCapabilities"].as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+            }
+            if let Some(event_id) = event_id.filter(|_| retain_events) {
+                self.sent_event_ids.insert(event_id.to_string());
+                index += 1;
+            } else {
+                if let Some(event_id) = event_id {
+                    self.sent_event_ids.remove(event_id);
+                }
+                self.queue.remove(index);
+            }
             sent += 1;
         }
-        Ok(sent)
+        Ok((sent, accepted_capabilities))
+    }
+
+    fn acknowledge_through(&mut self, through: i64) {
+        let sent_event_ids = &mut self.sent_event_ids;
+        self.queue.retain(|message| {
+            let sequence = message["params"]["sequence"].as_i64();
+            if sequence.is_some_and(|sequence| sequence <= through) {
+                if let Some(event_id) = message["params"]["eventId"].as_str() {
+                    sent_event_ids.remove(event_id);
+                }
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn replay_after(&mut self, after: i64) -> Vec<Value> {
+        let mut replay = Vec::new();
+        let sent_event_ids = &mut self.sent_event_ids;
+        for message in &self.queue {
+            let sequence = message["params"]["sequence"].as_i64().unwrap_or_default();
+            if sequence > after {
+                replay.push(message.clone());
+                if let Some(event_id) = message["params"]["eventId"].as_str() {
+                    sent_event_ids.remove(event_id);
+                }
+            }
+        }
+        replay.sort_by_key(|message| message["params"]["sequence"].as_i64().unwrap_or_default());
+        replay
     }
 }
 
@@ -674,9 +1008,14 @@ async fn run_loop(
     log: &mut impl FnMut(&str),
     stop: impl std::future::Future<Output = ()>,
 ) -> Result<(), String> {
-    let mut messages = Messages::new(config, state_path);
-    let mut outbox = Outbox::default();
+    let mut messages = Messages::new(config, state_path)?;
+    let mut outbox = messages.pending_outbox();
     outbox.push(messages.hello(agentux_version));
+    messages.commit_outbox(&outbox)?;
+    if let Ok((_, Some(capabilities))) = outbox.flush(&sink, messages.replay_enabled()).await {
+        messages.accept_capabilities(capabilities)?;
+    }
+    messages.commit_outbox(&outbox)?;
     tokio::pin!(stop);
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_EVERY);
@@ -695,12 +1034,19 @@ async fn run_loop(
                 tokio::select! {
                     _ = &mut stop => return Ok(()),
                     _ = tokio::time::sleep(Duration::from_secs(5)) => continue,
+                    Some(out) = out_rx.recv() => {
+                        handle_gateway_out(out, &mut messages, &mut outbox, log)?;
+                        continue;
+                    }
                 }
             }
         };
         let mut events = match agentux_api::Client::connect(&socket).await {
             Ok(c) => c
-                .subscribe(&agentux_api::rpc::Subscribe::default())
+                .subscribe(&agentux_api::rpc::Subscribe {
+                    since: Some(messages.replay_cursor()),
+                    ..Default::default()
+                })
                 .await
                 .map_err(|e| e.to_string())?,
             Err(e) => return Err(format!("cannot subscribe to agentuxd: {e}")),
@@ -708,7 +1054,8 @@ async fn run_loop(
         loop {
             tokio::select! {
                 _ = &mut stop => {
-                    let _ = outbox.flush(&sink).await;
+                    let _ = outbox.flush(&sink, messages.replay_enabled()).await;
+                    let _ = messages.commit_outbox(&outbox);
                     return Ok(());
                 }
                 _ = heartbeat.tick() => {
@@ -716,12 +1063,14 @@ async fn run_loop(
                     let active = runs.iter().filter(|r| !r.status.is_terminal()).count();
                     let waiting = runs.iter().filter(|r| r.status == RunStatus::Waiting).count();
                     outbox.push(messages.heartbeat("online", active, waiting));
+                    messages.commit_outbox(&outbox)?;
                 }
                 _ = harness_poll.tick() => {
                     if let Ok(harnesses) = client.harnesses().await {
                         let snapshot = serde_json::to_value(&harnesses).ok();
                         if snapshot != last_harnesses {
                             outbox.push(messages.harness_status(&harnesses));
+                            messages.commit_outbox(&outbox)?;
                             last_harnesses = snapshot;
                         }
                     }
@@ -731,6 +1080,7 @@ async fn run_loop(
                         if let Some(message) = messages.from_event(&event) {
                             outbox.push(message);
                         }
+                        messages.commit_local_event(event.seq, &outbox)?;
                         if matches!(event.body, EventBody::Limits { .. }) {
                             // Limits change what harness.list shows too.
                             harness_poll.reset_immediately();
@@ -741,24 +1091,28 @@ async fn run_loop(
                         break;
                     }
                 },
-                Some(out) = out_rx.recv() => match out {
-                    channel::Out::Event(method, payload) => outbox.push(messages.custom_event(&method, payload)),
-                    channel::Out::Log(line) => log(&line),
-                },
+                Some(out) = out_rx.recv() => handle_gateway_out(out, &mut messages, &mut outbox, log)?,
                 _ = retry.tick() => {}
             }
             if !outbox.is_empty() {
-                match outbox.flush(&sink).await {
-                    Ok(_) if !reachable => {
-                        reachable = true;
-                        log("Command is reachable again");
+                match outbox.flush(&sink, messages.replay_enabled()).await {
+                    Ok((_, accepted)) => {
+                        if let Some(accepted) = accepted {
+                            messages.accept_capabilities(accepted)?;
+                        }
+                        messages.commit_outbox(&outbox)?;
+                        if !reachable {
+                            reachable = true;
+                            log("Command is reachable again");
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) if e.starts_with(INSTANCE_MISMATCH) => {
+                        messages.commit_outbox(&outbox)?;
                         log(&e);
                         return Err(e);
                     }
                     Err(e) if reachable => {
+                        messages.commit_outbox(&outbox)?;
                         reachable = false;
                         log(&format!(
                             "{e}; keeping {} message(s) to send later",
@@ -770,6 +1124,54 @@ async fn run_loop(
             }
         }
     }
+}
+
+fn handle_gateway_out(
+    out: channel::Out,
+    messages: &mut Messages,
+    outbox: &mut Outbox,
+    log: &mut impl FnMut(&str),
+) -> Result<(), String> {
+    match out {
+        channel::Out::Event(method, payload) => {
+            outbox.push(messages.custom_event(&method, payload));
+            messages.commit_outbox(outbox)?;
+        }
+        channel::Out::Log(line) => log(&line),
+        channel::Out::Resume { after, id, reply } => {
+            let response = if !messages.replay_enabled() {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "node.event_replay.v1 was not negotiated" } })
+            } else {
+                if (0..=messages.last_sequence()).contains(&after) {
+                    outbox.acknowledge_through(after);
+                    messages.commit_acknowledgement(after, outbox)?;
+                }
+                match messages
+                    .replay_result(after, outbox)
+                    .and_then(|result| serde_json::to_value(result).map_err(|e| e.to_string()))
+                {
+                    Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+                    Err(error) => {
+                        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": error } })
+                    }
+                }
+            };
+            let _ = reply.send(response);
+        }
+        channel::Out::Acknowledge { through, id, reply } => {
+            let response = if !messages.replay_enabled() {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "node.event_replay.v1 was not negotiated" } })
+            } else if through > messages.last_sequence() {
+                json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "acknowledgement exceeds the highest emitted sequence" } })
+            } else {
+                outbox.acknowledge_through(through);
+                messages.commit_acknowledgement(through, outbox)?;
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "throughSequence": through } })
+            };
+            let _ = reply.send(response);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -873,7 +1275,7 @@ mod tests {
     fn messages_carry_the_envelope_and_sequences_survive_restarts() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("gateway.json");
-        let mut messages = Messages::new(config(), Some(state.clone()));
+        let mut messages = Messages::new(config(), Some(state.clone())).unwrap();
         let hello = messages.hello("0.4.8");
         assert_eq!(hello["method"], "node.hello");
         assert_eq!(hello["params"]["protocolVersion"], "v1");
@@ -887,19 +1289,172 @@ mod tests {
         assert_eq!(second["params"]["sequence"], 2);
         assert_eq!(second["params"]["eventId"], "node-01-2");
         assert!(first.get("id").is_none());
+        let mut outbox = Outbox::default();
+        outbox.push(first);
+        outbox.push(second);
+        messages.commit_outbox(&outbox).unwrap();
 
-        let mut again = Messages::new(config(), Some(state));
+        let mut again = Messages::new(config(), Some(state)).unwrap();
         assert_eq!(again.last_sequence(), 2);
         assert_eq!(again.limits_changed(&[])["params"]["sequence"], 3);
         // The token never goes into a message.
         assert!(!hello.to_string().contains("secret"));
     }
 
+    #[test]
+    fn tool_activity_is_typed_privacy_safe_and_stable_on_local_replay() {
+        let mut messages = Messages::new(config(), None).unwrap();
+        messages
+            .state
+            .accepted_capabilities
+            .push("execution.activity.v1".into());
+        messages.state.sessions.insert(
+            "session-1".into(),
+            SessionContext {
+                run_id: "local-run".into(),
+                role_id: "implementer".into(),
+            },
+        );
+        messages.state.run_origins.insert(
+            "local-run".into(),
+            RunOrigin {
+                organization_id: "org-demo".into(),
+                mission_id: "mission-1".into(),
+                command_run_id: "command-run-1".into(),
+                definition_version: None,
+            },
+        );
+        for (index, (status, expected_type)) in [
+            (ToolStatus::Running, "tool_started"),
+            (ToolStatus::Ok, "tool_completed"),
+            (ToolStatus::Error, "tool_failed"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = Event {
+                seq: 41,
+                at: 1_794_000_000_000,
+                run_id: Some("local-run".into()),
+                body: EventBody::SessionEvent {
+                    session_id: "session-1".into(),
+                    event: SessionEvent::ToolCall {
+                        tool_call_id: "tool-9".into(),
+                        tool: Some(agentux_api::ToolKind::Execute),
+                        title: Some("private title".into()),
+                        status: Some(status),
+                        output: Some("private output".into()),
+                    },
+                },
+            };
+            let message = messages.from_event(&event).unwrap();
+            let activity = &message["params"]["activity"];
+            assert_eq!(message["method"], "execution.activity");
+            assert_eq!(message["params"]["sequence"], index + 1);
+            assert_eq!(activity["schemaVersion"], "v1");
+            assert_eq!(activity["activityId"], "node-01-event-41");
+            assert_eq!(activity["missionId"], "mission-1");
+            assert_eq!(activity["runId"], "command-run-1");
+            assert_eq!(activity["roleId"], "implementer");
+            assert_eq!(activity["type"], expected_type);
+            assert_eq!(activity["toolName"], "execute");
+            assert!(!message.to_string().contains("private"));
+            auxp::validate(&message).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_event_cursor_and_outbox_survive_restart_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("gateway.json");
+        let mut messages = Messages::new(config(), Some(state_path.clone())).unwrap();
+        let mut outbox = Outbox::default();
+        outbox.push(messages.limits_changed(&[]));
+        messages.commit_local_event(17, &outbox).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let restored = Messages::new(config(), Some(state_path)).unwrap();
+        assert_eq!(restored.replay_cursor(), 17);
+        let restored_outbox = restored.pending_outbox();
+        assert_eq!(restored_outbox.len(), 1);
+        assert_eq!(restored_outbox.queue[0]["params"]["eventId"], "node-01-1");
+    }
+
+    #[test]
+    fn unreadable_gateway_state_fails_closed_instead_of_reusing_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("gateway.json");
+        fs::write(&state_path, "{corrupt").unwrap();
+        assert!(Messages::new(config(), Some(state_path)).is_err());
+    }
+
+    #[test]
+    fn replay_is_contiguous_and_acknowledgement_retires_only_committed_prefix() {
+        let mut messages = Messages::new(config(), None).unwrap();
+        let mut outbox = Outbox::default();
+        for _ in 0..3 {
+            outbox.push(messages.limits_changed(&[]));
+        }
+        messages.commit_outbox(&outbox).unwrap();
+
+        let replay = messages.replay_result(0, &mut outbox).unwrap();
+        assert_eq!(replay.status, ReplayStatus::Replay);
+        assert_eq!(replay.events_replayed, 3);
+
+        outbox.acknowledge_through(1);
+        messages.commit_acknowledgement(1, &outbox).unwrap();
+        let replay = messages.replay_result(1, &mut outbox).unwrap();
+        assert_eq!(replay.events_replayed, 2);
+
+        let expired = messages.replay_result(0, &mut outbox).unwrap();
+        assert_eq!(expired.status, ReplayStatus::CursorExpired);
+        assert!(expired.snapshot_required);
+        assert_eq!(expired.events_replayed, 0);
+    }
+
     struct Failing;
     impl Sink for Failing {
-        async fn send(&self, _: &Value) -> Result<(), String> {
+        async fn send(&self, _: &Value) -> Result<Option<Value>, String> {
             Err("down".into())
         }
+    }
+
+    struct Accepting;
+    impl Sink for Accepting {
+        async fn send(&self, _: &Value) -> Result<Option<Value>, String> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_mode_keeps_sent_events_until_ack_and_reuses_the_same_message() {
+        let mut messages = Messages::new(config(), None).unwrap();
+        let message = messages.limits_changed(&[]);
+        let mut outbox = Outbox::default();
+        outbox.push(message.clone());
+
+        assert_eq!(outbox.flush(&Accepting, true).await.unwrap().0, 1);
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox.flush(&Accepting, true).await.unwrap().0, 0);
+        let replay = outbox.replay_after(0);
+        assert_eq!(replay, vec![message.clone()]);
+        assert_eq!(outbox.flush(&Accepting, true).await.unwrap().0, 1);
+        assert_eq!(outbox.queue.front(), Some(&message));
+
+        outbox.acknowledge_through(1);
+        assert!(outbox.is_empty());
+
+        outbox.push(messages.limits_changed(&[]));
+        assert_eq!(outbox.flush(&Accepting, true).await.unwrap().0, 1);
+        assert_eq!(outbox.flush(&Accepting, false).await.unwrap().0, 1);
+        assert!(outbox.is_empty());
     }
 
     #[tokio::test]
@@ -910,7 +1465,7 @@ mod tests {
         }
         assert_eq!(outbox.len(), OUTBOX_MAX);
         assert_eq!(outbox.dropped, 2);
-        assert!(outbox.flush(&Failing).await.is_err());
+        assert!(outbox.flush(&Failing, true).await.is_err());
         assert_eq!(outbox.queue.front(), Some(&json!(2)));
     }
 }

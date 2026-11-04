@@ -26,8 +26,11 @@ Two Command servers in one institution therefore never share or take nodes. A no
 | `harness.limits_changed` | When the usage limits in force change |
 | `approval.requested` | A run waits for the human: kind, title, detail (cut at 4000 characters), options |
 | `run.updated` / `run.completed` / `run.failed` | A run changed: state, step, roles and models, activity, cost and budget, branch, pull request, error, and once a session opened, `agentIsolation` (`mode` `none` or `bubblewrap`, `network`, and `source`: `project`, `node-policy`, `command` or `default`) |
+| `execution.activity` | When an ACP session reports a tool call starting or reaching a terminal status: stable tool-call ID, session/role/run correlation and a generic safe summary. Tool titles, inputs, outputs, plans and reasoning are not sent. |
 
-Messages are POSTed to `<command>/v1/protocol/messages` with `Authorization: Bearer <node token>`. Events carry a `sequence` that keeps growing across restarts (`~/.local/state/agentux/gateway.json`) and an `eventId` of `<nodeId>-<sequence>`. While Command is unreachable they wait in order (up to 5000, oldest dropped first) and go out when it answers again; runs go on regardless.
+Messages are POSTed to `<command>/v1/protocol/messages` with `Authorization: Bearer <node token>`. Events carry a `sequence` that keeps growing across restarts (`~/.local/state/agentux/gateway.json`) and an `eventId` of `<nodeId>-<sequence>`. The gateway saves the pending outbox and its local event-log cursor atomically. After a restart it retries the same queued messages and resumes the daemon event stream from that cursor, preserving event IDs for retries. When `node.event_replay.v1` is accepted, sequenced events remain in the outbox until Command acknowledges a contiguous durable cursor; `node.resume` replays retained events in order and reports when the requested cursor expired. Without that capability, the gateway keeps legacy send-and-drain behavior. The outbox holds up to 5000 messages and drops the oldest first when full; runs go on regardless.
+
+`execution.activity.v1` is offered in `node.hello` and used only when Command returns it in `acceptedCapabilities`. The current Core emits `tool_started`, `tool_completed` and `tool_failed` when the ACP adapter reports the corresponding status. It does not infer task trees, delegation, progress percentages or artifacts from provider-specific data. `node.event_replay.v1` is negotiated the same way.
 
 ## Commands from Command
 

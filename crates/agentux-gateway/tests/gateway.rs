@@ -15,9 +15,9 @@ use serde_json::Value;
 struct Recorder(Arc<Mutex<Vec<Value>>>);
 
 impl Sink for Recorder {
-    async fn send(&self, message: &Value) -> Result<(), String> {
+    async fn send(&self, message: &Value) -> Result<Option<Value>, String> {
         self.0.lock().unwrap().push(message.clone());
-        Ok(())
+        Ok(None)
     }
 }
 

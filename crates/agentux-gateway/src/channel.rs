@@ -15,6 +15,7 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::oneshot;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -27,6 +28,16 @@ pub enum Out {
     /// An event to send to Command: method and payload.
     Event(String, Value),
     Log(String),
+    Resume {
+        after: i64,
+        id: Value,
+        reply: oneshot::Sender<Value>,
+    },
+    Acknowledge {
+        through: i64,
+        id: Value,
+        reply: oneshot::Sender<Value>,
+    },
 }
 
 /// How the node takes commands.
@@ -158,7 +169,19 @@ pub async fn command_loop(
                     let _ = jobs.send(request);
                 }
                 Some(handled) = done.recv() => {
-                    if let Err(e) = write.send(Message::text(handled.response.to_string())).await {
+                    let response = if let Some(command) = handled.gateway_command {
+                        let (reply, result) = oneshot::channel();
+                        let id = handled.response.get("id").cloned().unwrap_or(Value::Null);
+                        let command = match command {
+                            commands::GatewayCommand::Resume { after } => Out::Resume { after, id, reply },
+                            commands::GatewayCommand::Acknowledge { through } => Out::Acknowledge { through, id, reply },
+                        };
+                        let _ = out.send(command);
+                        result.await.unwrap_or(handled.response)
+                    } else {
+                        handled.response
+                    };
+                    if let Err(e) = write.send(Message::text(response.to_string())).await {
                         break format!("write error: {e}");
                     }
                     if let Some((method, payload)) = handled.event {
