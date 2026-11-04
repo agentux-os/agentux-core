@@ -1302,7 +1302,94 @@ mod tests {
     }
 
     #[test]
-    fn tool_activity_is_typed_privacy_safe_and_stable_on_local_replay() {
+    fn acp_tool_lifecycle_fixtures_emit_ordered_safe_replayable_activity() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("gateway.json");
+        let mut messages = Messages::new(config(), Some(state_path.clone())).unwrap();
+        messages
+            .state
+            .accepted_capabilities
+            .push("execution.activity.v1".into());
+        messages.state.sessions.insert(
+            "session-1".into(),
+            SessionContext {
+                run_id: "local-run".into(),
+                role_id: "implementer".into(),
+            },
+        );
+        messages.state.run_origins.insert(
+            "local-run".into(),
+            RunOrigin {
+                organization_id: "org-demo".into(),
+                mission_id: "mission-1".into(),
+                command_run_id: "command-run-1".into(),
+                definition_version: None,
+            },
+        );
+        let fixtures: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/acp-tool-lifecycle.json"))
+                .unwrap();
+        let mut emitted = Vec::new();
+        for fixture in fixtures {
+            let event: Event = serde_json::from_value(fixture["event"].clone()).unwrap();
+            let message = messages.from_event(&event).unwrap();
+            let activity = &message["params"]["activity"];
+            assert_eq!(message["method"], "execution.activity");
+            assert_eq!(message["params"]["sequence"], emitted.len() + 1);
+            assert_eq!(activity["schemaVersion"], "v1");
+            assert_eq!(
+                activity["activityId"],
+                format!("node-01-event-{}", event.seq)
+            );
+            assert_eq!(activity["missionId"], "mission-1");
+            assert_eq!(activity["runId"], "command-run-1");
+            assert_eq!(activity["roleId"], "implementer");
+            assert_eq!(activity["type"], fixture["expectedType"]);
+            assert_eq!(activity["toolName"], "execute");
+            assert_eq!(activity["toolCallId"], "tool-9");
+            assert!(!message.to_string().contains("PRIVATE"));
+            assert!(!message.to_string().contains("fixture-secret"));
+            auxp::validate(&message).unwrap();
+            emitted.push(message);
+        }
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|message| message["params"]["activity"]["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["tool_started", "tool_completed", "tool_failed"]
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|message| message["params"]["sequence"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+
+        let mut outbox = Outbox::default();
+        for message in emitted.iter().cloned() {
+            outbox.push(message);
+        }
+        messages.commit_outbox(&outbox).unwrap();
+        let restored = Messages::new(config(), Some(state_path)).unwrap();
+        assert_eq!(restored.pending_outbox().replay_after(0), emitted);
+    }
+
+    #[test]
+    fn execution_activity_is_suppressed_until_the_capability_is_accepted() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/acp-tool-lifecycle.json"))
+                .unwrap();
+        let event: Event = serde_json::from_value(fixture[0]["event"].clone()).unwrap();
+        let mut messages = Messages::new(config(), None).unwrap();
+
+        assert!(messages.from_event(&event).is_none());
+        assert_eq!(messages.last_sequence(), 0);
+    }
+
+    #[test]
+    fn session_plans_and_other_non_tool_events_do_not_become_activity() {
         let mut messages = Messages::new(config(), None).unwrap();
         messages
             .state
@@ -1324,43 +1411,61 @@ mod tests {
                 definition_version: None,
             },
         );
-        for (index, (status, expected_type)) in [
-            (ToolStatus::Running, "tool_started"),
-            (ToolStatus::Ok, "tool_completed"),
-            (ToolStatus::Error, "tool_failed"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (seq, session_event) in [
+            (
+                50,
+                SessionEvent::Plan {
+                    items: vec![agentux_api::PlanItem {
+                        text: "PRIVATE plan text".into(),
+                        status: agentux_api::PlanItemStatus::InProgress,
+                    }],
+                },
+            ),
+            (
+                51,
+                SessionEvent::Diff {
+                    tool_call_id: "tool-9".into(),
+                    path: "private.txt".into(),
+                    old_text: None,
+                    new_text: "PRIVATE file contents".into(),
+                },
+            ),
+            (
+                52,
+                SessionEvent::Message {
+                    from: agentux_api::MessageFrom::Agent,
+                    text: "PRIVATE response".into(),
+                },
+            ),
+            (
+                53,
+                SessionEvent::Usage {
+                    usage: agentux_api::SessionUsage {
+                        used_tokens: 1,
+                        context_tokens: 2,
+                        cost_usd: None,
+                    },
+                },
+            ),
+            (
+                54,
+                SessionEvent::Permission {
+                    request_id: "request-1".into(),
+                },
+            ),
+        ] {
             let event = Event {
-                seq: 41,
+                seq,
                 at: 1_794_000_000_000,
                 run_id: Some("local-run".into()),
                 body: EventBody::SessionEvent {
                     session_id: "session-1".into(),
-                    event: SessionEvent::ToolCall {
-                        tool_call_id: "tool-9".into(),
-                        tool: Some(agentux_api::ToolKind::Execute),
-                        title: Some("private title".into()),
-                        status: Some(status),
-                        output: Some("private output".into()),
-                    },
+                    event: session_event,
                 },
             };
-            let message = messages.from_event(&event).unwrap();
-            let activity = &message["params"]["activity"];
-            assert_eq!(message["method"], "execution.activity");
-            assert_eq!(message["params"]["sequence"], index + 1);
-            assert_eq!(activity["schemaVersion"], "v1");
-            assert_eq!(activity["activityId"], "node-01-event-41");
-            assert_eq!(activity["missionId"], "mission-1");
-            assert_eq!(activity["runId"], "command-run-1");
-            assert_eq!(activity["roleId"], "implementer");
-            assert_eq!(activity["type"], expected_type);
-            assert_eq!(activity["toolName"], "execute");
-            assert!(!message.to_string().contains("private"));
-            auxp::validate(&message).unwrap();
+            assert!(messages.from_event(&event).is_none());
         }
+        assert_eq!(messages.last_sequence(), 0);
     }
 
     #[test]
