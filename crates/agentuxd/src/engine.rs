@@ -1937,6 +1937,15 @@ impl Engine {
         }
         profile.git_dir = crate::sandbox::git_dir(worktree);
         profile.git_identity = crate::sandbox::git_identity(worktree);
+        let (extra, mut notes) = crate::sandbox::extra_paths(&home);
+        profile.extra_read_only = extra;
+        notes.extend(crate::sandbox::hooks_warning(worktree));
+        if !notes.is_empty() {
+            let _ = self
+                .inner
+                .store
+                .write(|tx| notes.into_iter().try_for_each(|note| tx.log(run_id, note)));
+        }
         profile
             .prepare()
             .map_err(|e| format!("cannot prepare the agent sandbox: {e}"))?;

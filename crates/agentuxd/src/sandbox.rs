@@ -68,6 +68,9 @@ pub struct Profile {
     pub git_identity: Option<(String, String)>,
     /// The API key variables of other harnesses, to keep out.
     pub other_keys: Vec<String>,
+    /// Host paths the machine or the user allows, mounted read-only
+    /// ([`extra_paths`]); never chosen by a project.
+    pub extra_read_only: Vec<PathBuf>,
     sandbox: HarnessSandbox,
 }
 
@@ -97,6 +100,7 @@ impl Profile {
             bus_socket: None,
             git_identity: None,
             other_keys,
+            extra_read_only: Vec::new(),
             sandbox,
         })
     }
@@ -196,6 +200,9 @@ impl Profile {
         bind(&mut bwrap, "--bind", &state, &state);
         if let Some((host, inside)) = self.credential() {
             bind(&mut bwrap, "--bind", &host, &inside);
+        }
+        for path in &self.extra_read_only {
+            bind(&mut bwrap, "--ro-bind", path, path);
         }
         for rel in self.sandbox.install {
             let path = self.home.join(rel);
@@ -327,6 +334,149 @@ fn resolver(args: &mut Vec<String>) {
     bind(args, "--ro-bind", &source, &real);
 }
 
+/// The machine's file of extra sandbox paths.
+pub const MACHINE_POLICY: &str = "/etc/agentux/sandbox.yaml";
+
+/// Locations no extra path may be, contain or be inside, relative to the
+/// home: credentials, keys, browser profiles and the harnesses' own state
+/// (ADR 0024).
+const DENIED: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".pki",
+    ".local/share/keyrings",
+    ".password-store",
+    ".config/gh",
+    ".config/hub",
+    ".config/git/credentials",
+    ".git-credentials",
+    ".netrc",
+    ".aws",
+    ".azure",
+    ".config/gcloud",
+    ".kube",
+    ".docker",
+    ".config/containers/auth.json",
+    ".mozilla",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/BraveSoftware",
+    ".var/app",
+    ".claude",
+    ".claude.json",
+    ".codex",
+    ".config/opencode",
+    ".local/share/opencode",
+    ".gemini",
+    ".config/agentux",
+    ".local/share/agentux",
+    ".local/state/agentux",
+];
+
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ExtraPaths {
+    #[serde(default)]
+    read_only: Vec<String>,
+}
+
+/// The extra read-only paths allowed by the machine (`/etc/agentux/
+/// sandbox.yaml`) and the user (`~/.config/agentux/sandbox.yaml`, which no
+/// sandbox can write), and notes on the ones refused. A path is refused
+/// when it doesn't exist, goes through a symlink, is the home or the root,
+/// or is, contains or is inside a [`DENIED`] location.
+pub fn extra_paths(home: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let user = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("agentux/sandbox.yaml");
+    let mut paths = Vec::new();
+    let mut notes = Vec::new();
+    for file in [PathBuf::from(MACHINE_POLICY), user] {
+        let Ok(text) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let listed: ExtraPaths = match serde_saphyr::from_str(&text) {
+            Ok(listed) => listed,
+            Err(e) => {
+                notes.push(format!("sandbox: {} is not used: {e}", file.display()));
+                continue;
+            }
+        };
+        for entry in listed.read_only {
+            match allowed(home, &entry) {
+                Ok(path) if !paths.contains(&path) => paths.push(path),
+                Ok(_) => {}
+                Err(why) => notes.push(format!(
+                    "sandbox: {entry} ({}) is not mounted: {why}",
+                    file.display()
+                )),
+            }
+        }
+    }
+    (paths, notes)
+}
+
+/// `entry` (`~/…` or absolute) as a path a sandbox may read, or why not.
+fn allowed(home: &Path, entry: &str) -> Result<PathBuf, String> {
+    let path = match entry.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None if entry == "~" => home.to_path_buf(),
+        None => PathBuf::from(entry),
+    };
+    if !path.is_absolute() {
+        return Err("not an absolute path".into());
+    }
+    let real = fs::canonicalize(&path).map_err(|e| format!("{e}"))?;
+    if real != path {
+        return Err(format!("it goes through a symlink (to {})", real.display()));
+    }
+    let home = fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if real == Path::new("/") || real == home || home.starts_with(&real) {
+        return Err("it would expose the whole home".into());
+    }
+    for denied in DENIED {
+        let denied = home.join(denied);
+        if real.starts_with(&denied) || denied.starts_with(&real) {
+            return Err(format!(
+                "{} holds credentials or harness state",
+                denied.display()
+            ));
+        }
+    }
+    Ok(real)
+}
+
+/// A warning when the repository runs hooks from its worktree
+/// (`core.hooksPath` inside it): the agent can edit them, and a person who
+/// commits in that worktree on the host would run them (ADR 0024).
+pub fn hooks_warning(worktree: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["config", "--get", "core.hooksPath"])
+        .output()
+        .ok()?;
+    let value = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if !out.status.success() || value.is_empty() {
+        return None;
+    }
+    let path = Path::new(&value);
+    let inside = if path.is_absolute() {
+        path.starts_with(worktree)
+    } else {
+        // Relative hooks paths are relative to the working tree.
+        !value.starts_with("..")
+    };
+    inside.then(|| {
+        format!(
+            "sandbox: this repository runs git hooks from {value} in its worktree, which the agent can edit; \
+             committing in this worktree on the host would run them (agentuxd's own git commands don't)"
+        )
+    })
+}
+
 /// The repository's git directory for `worktree`.
 pub fn git_dir(worktree: &Path) -> Option<PathBuf> {
     let out = std::process::Command::new("git")
@@ -455,6 +605,48 @@ mod tests {
             &args,
             &["--setenv", "GIT_COMMITTER_EMAIL", "ana@example.com"]
         ));
+    }
+
+    #[test]
+    fn extra_paths_are_mounted_read_only() {
+        let mut p = profile(AgentNetwork::None);
+        p.extra_read_only = vec![PathBuf::from("/home/ana/.cargo/registry")];
+        let (_, args) = p.command("x", &[]);
+        let path = "/home/ana/.cargo/registry";
+        assert!(has(&args, &["--ro-bind", path, path]));
+    }
+
+    #[test]
+    fn credential_locations_and_the_home_are_never_extra_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        for dir in [
+            ".cargo/registry",
+            ".ssh",
+            ".config/gh",
+            ".local/share/opencode",
+            "projects",
+        ] {
+            fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        std::os::unix::fs::symlink(home.join(".ssh"), home.join("keys")).unwrap();
+        let home = fs::canonicalize(&home).unwrap();
+        assert_eq!(
+            allowed(&home, "~/.cargo/registry").unwrap(),
+            home.join(".cargo/registry")
+        );
+        for refused in [
+            "~/.ssh",
+            "~/.config",
+            "~/.local/share",
+            "~",
+            "/",
+            "~/keys",
+            "~/missing",
+            "relative",
+        ] {
+            assert!(allowed(&home, refused).is_err(), "{refused} was allowed");
+        }
     }
 
     #[test]
