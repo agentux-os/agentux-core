@@ -294,6 +294,34 @@ impl Default for FakeExecutor {
 }
 
 impl FakeExecutor {
+    /// The stand-in `--fake-agents` uses (the live session's demo): every
+    /// step succeeds like [`FakeExecutor::default`], but the agents answer in
+    /// plain sentences about the run, as on screenshots and in the demo,
+    /// instead of `fake plan by planner done`.
+    pub fn demo() -> Self {
+        Self::new(|task| {
+            let what = task.title.trim().trim_end_matches('.');
+            let summary = match task.step {
+                StepKind::Plan => format!(
+                    "Plan for \u{201c}{what}\u{201d}:\n\
+                     1. Read the code and the tests it touches.\n\
+                     2. Make the change in small steps.\n\
+                     3. Add a test that fails without it.\n\
+                     4. Run the checks and open a pull request."
+                ),
+                StepKind::Implement if task.feedback.is_some() => {
+                    "Addressed the feedback and ran the tests again.".to_string()
+                }
+                StepKind::Implement => format!("Done: {what}, with a test that covers it."),
+                StepKind::Review => {
+                    "Approved: the change is small, tested and matches the plan.".to_string()
+                }
+                _ => format!("Finished the {} step.", task.step),
+            };
+            Ok(AgentOutcome::Done { summary })
+        })
+    }
+
     pub fn new(
         script: impl Fn(&AgentTask) -> Result<AgentOutcome, String> + Send + Sync + 'static,
     ) -> Self {

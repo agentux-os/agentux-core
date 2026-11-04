@@ -884,3 +884,27 @@ async fn agents_taking_over_are_notified() {
         ["codex reached its session limit", "opencode takes over"]
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_demo_agents_answer_in_plain_sentences() {
+    let yaml = pipeline("true").replace(
+        "  - step: plan\n    role: planner\n",
+        "  - step: plan\n    role: planner\n    approve: true\n",
+    );
+    let f = fixture(&yaml);
+    let engine = f.engine(Arc::new(FakeExecutor::demo()));
+    let run = f.start(&engine).await;
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Waiting);
+    let plan = &engine.requests(true).unwrap()[0];
+    assert!(
+        plan.detail
+            .starts_with(&format!("Plan for \u{201c}{}\u{201d}:\n1. ", run.title)),
+        "{}",
+        plan.detail
+    );
+    assert!(!plan.detail.contains("fake"), "{}", plan.detail);
+    engine.approve(&plan.id, None).unwrap();
+    let run = wait_until_settled(&engine, &run.id).await;
+    assert_eq!(run.status, RunStatus::Done, "{:?}", run.error);
+}
