@@ -1426,6 +1426,7 @@ async fn sessions_get_the_tool_catalogs_servers() {
             .any(|line| line.contains("AGENTUX_TEST_NO_SUCH_SECRET")),
         "{log:?}"
     );
-    d.engine.cancel(&run.id).unwrap();
+    // The run may already be done: its one step needs no approval.
+    let _ = d.engine.cancel(&run.id);
     let _ = d.stop.send(());
 }
