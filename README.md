@@ -149,6 +149,29 @@ aux bus-stdio --standalone [--project <dir>] [--role <r>]   # the same on an in-
 
 `aux bus-stdio` is the stdio MCP server harnesses launch to reach the bus: `agentuxd` passes it in ACP `session/new` with the session's token in its environment (not on the command line, where other local users could read it), and it forwards each tool call to the daemon (see the [`agentux-bus` README](crates/agentux-bus/README.md#transport-and-the-daemon-bridge)).
 
+## Tool catalog (MCP servers)
+
+Declare an MCP server once and every harness's sessions get it: Claude Code, Codex, OpenCode and Antigravity alike. agentuxd hands the servers to each session in ACP's `session/new`, next to the `agentux` bus, so there's no per-CLI configuration file to keep in sync. A run that falls back to another harness keeps its tools.
+
+The catalog has three layers, merged by name. A later layer replaces an entry of the same name:
+
+1. `/etc/agentux/tools.yaml`: the machine's (provisioning).
+2. `~/.config/agentux/tools.yaml`: the user's.
+3. The `tools` section of the project's `agentux.yaml`.
+
+```yaml
+mcp:                      # in agentux.yaml, under `tools:`
+  - name: github
+    command: github-mcp-server
+    args: [stdio]
+    env:
+      GITHUB_PERSONAL_ACCESS_TOKEN: { secret: GITHUB_PERSONAL_ACCESS_TOKEN }
+      GITHUB_TOOLSETS: repos,issues
+    harnesses: [claude-code, codex]   # optional: every harness when left out
+```
+
+Secrets are references. agentuxd looks each one up when a session starts, from its own environment, a systemd credential, or the desktop's secret service (`secret-tool store --label=NAME agentux-key NAME`). It passes the value to that server only. An entry whose secret isn't set is left out, and so is an entry that isn't for the session's harness. The run's log says which and why, never with a value. `aux tools [--project DIR] [--harness NAME]` shows the merged catalog and whether each secret is set.
+
 ## Crates
 
 A Cargo workspace. What exists today:

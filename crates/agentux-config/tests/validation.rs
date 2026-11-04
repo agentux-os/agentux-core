@@ -135,6 +135,7 @@ fn adr_example_parses_into_the_expected_config() {
             max_usd_per_run: Some(10.0),
         },
         permissions: Default::default(),
+        tools: Default::default(),
     };
     assert_eq!(config, expected);
 }

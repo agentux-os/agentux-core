@@ -33,6 +33,8 @@ struct Seen {
     prompts: Vec<(String, String)>,
     /// The bus MCP server each session got, by harness.
     servers: Vec<(String, McpServer)>,
+    /// Every MCP server each session got (the bus, then the tool catalog's).
+    all_servers: Vec<(String, Vec<McpServer>)>,
     /// `session/set_config_option` calls: (harness, config id, value).
     set_config: Vec<(String, String, String)>,
     /// Free-form notes from the agents.
@@ -92,11 +94,12 @@ impl Launcher for BusLauncher {
                 token: token_of(&server),
                 seen: Arc::clone(&self.seen),
             };
-            self.seen
-                .lock()
-                .unwrap()
-                .servers
-                .push((spec.harness.to_string(), server));
+            {
+                let mut seen = self.seen.lock().unwrap();
+                seen.servers.push((spec.harness.to_string(), server));
+                seen.all_servers
+                    .push((spec.harness.to_string(), spec.mcp_servers.to_vec()));
+            }
             let behave = self.behave;
             let turns = ctx.clone();
             let script = script(move |turn| {
@@ -1345,6 +1348,84 @@ async fn mail_and_exchanges_survive_a_daemon_restart() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let again = notes(&seen)[before..].to_vec();
     assert!(again.is_empty(), "{again:?}");
+    d.engine.cancel(&run.id).unwrap();
+    let _ = d.stop.send(());
+}
+
+const WITH_TOOLS: &str = "version: 1
+roles:
+  implementer:
+    harness: fake-coder
+pipeline:
+  - step: implement
+    role: implementer
+tools:
+  mcp:
+    - name: docs
+      command: docs-mcp
+      args: [--stdio]
+      env:
+        DOCS_MODE: read-only
+    - name: reviewer-only
+      command: other-mcp
+      harnesses: [fake-reviewer]
+    - name: needs-secret
+      command: secret-mcp
+      env:
+        KEY: { secret: AGENTUX_TEST_NO_SUCH_SECRET }
+";
+
+/// The tool catalog's MCP servers reach every session next to the bus;
+/// what a session goes without is in the run's log.
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_get_the_tool_catalogs_servers() {
+    let f = fixture(WITH_TOOLS);
+    let seen = Shared::default();
+    let d = daemon(&f, &seen, quiet, &[]).await;
+    let run = start(&f, &d.engine, "Use the docs").await;
+
+    let servers = eventually("a session", || {
+        seen.lock().unwrap().all_servers.first().cloned()
+    })
+    .await;
+    assert_eq!(servers.0, "fake-coder");
+    let names: Vec<_> = servers.1.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, [agentux_bus::SERVER_NAME, "docs"]);
+    let docs = &servers.1[1];
+    assert_eq!(docs.command, PathBuf::from("docs-mcp"));
+    assert_eq!(docs.args, ["--stdio"]);
+    assert_eq!(
+        docs.env,
+        [("DOCS_MODE".to_string(), "read-only".to_string())]
+    );
+
+    let log = eventually("the catalog notes", || {
+        let log: Vec<String> = d
+            .engine
+            .store()
+            .read(|tx| tx.events_since(0, Some(&run.id)))
+            .unwrap()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::Log { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        log.iter()
+            .any(|line| line.contains("`needs-secret`"))
+            .then_some(log)
+    })
+    .await;
+    assert!(
+        log.iter()
+            .any(|line| line.contains("`reviewer-only`") && line.contains("not for fake-coder")),
+        "{log:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|line| line.contains("AGENTUX_TEST_NO_SUCH_SECRET")),
+        "{log:?}"
+    );
     d.engine.cancel(&run.id).unwrap();
     let _ = d.stop.send(());
 }

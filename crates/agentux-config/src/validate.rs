@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use serde::Deserialize;
 
 use crate::isolation::{image_issue, parse_timeout};
+use crate::tools::{RawTools, Source};
 use crate::{
     Budget, Bus, Check, Config, ConfigError, DEFAULT_CHECK_TIMEOUT, Isolation, IsolationMode,
     Issue, Loop, Permissions, Role, SUPPORTED_VERSION, Step, StepKind,
@@ -26,6 +27,8 @@ pub(crate) struct RawConfig {
     budget: Budget,
     #[serde(default)]
     permissions: Permissions,
+    #[serde(default)]
+    tools: RawTools,
 }
 
 #[derive(Deserialize)]
@@ -203,6 +206,14 @@ impl RawConfig {
             }
         }
 
+        let tools = match self.tools.validate("tools.", Source::Project) {
+            Ok(tools) => tools,
+            Err(found) => {
+                issues.0.extend(found);
+                Default::default()
+            }
+        };
+
         if !issues.0.is_empty() {
             return Err(ConfigError::Invalid(issues.0));
         }
@@ -215,6 +226,7 @@ impl RawConfig {
             bus: self.bus,
             budget: self.budget,
             permissions: self.permissions,
+            tools,
         })
     }
 }
