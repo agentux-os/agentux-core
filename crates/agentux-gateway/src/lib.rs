@@ -319,11 +319,13 @@ pub struct SessionContext {
 }
 
 impl State {
-    pub fn load(path: &Path) -> State {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+    pub fn load(path: &Path) -> io::Result<State> {
+        match fs::read_to_string(path) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(State::default()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -376,14 +378,19 @@ fn now() -> String {
 }
 
 impl Messages {
-    pub fn new(config: NodeConfig, state_path: Option<PathBuf>) -> Self {
-        let state = state_path.as_deref().map(State::load).unwrap_or_default();
-        Self {
+    pub fn new(config: NodeConfig, state_path: Option<PathBuf>) -> Result<Self, String> {
+        let state = state_path
+            .as_deref()
+            .map(State::load)
+            .transpose()
+            .map_err(|error| format!("cannot load gateway state: {error}"))?
+            .unwrap_or_default();
+        Ok(Self {
             config,
             state,
             state_path,
             counter: 0,
-        }
+        })
     }
 
     pub fn last_sequence(&self) -> i64 {
@@ -1001,7 +1008,7 @@ async fn run_loop(
     log: &mut impl FnMut(&str),
     stop: impl std::future::Future<Output = ()>,
 ) -> Result<(), String> {
-    let mut messages = Messages::new(config, state_path);
+    let mut messages = Messages::new(config, state_path)?;
     let mut outbox = messages.pending_outbox();
     outbox.push(messages.hello(agentux_version));
     messages.commit_outbox(&outbox)?;
@@ -1268,7 +1275,7 @@ mod tests {
     fn messages_carry_the_envelope_and_sequences_survive_restarts() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("gateway.json");
-        let mut messages = Messages::new(config(), Some(state.clone()));
+        let mut messages = Messages::new(config(), Some(state.clone())).unwrap();
         let hello = messages.hello("0.4.8");
         assert_eq!(hello["method"], "node.hello");
         assert_eq!(hello["params"]["protocolVersion"], "v1");
@@ -1287,7 +1294,7 @@ mod tests {
         outbox.push(second);
         messages.commit_outbox(&outbox).unwrap();
 
-        let mut again = Messages::new(config(), Some(state));
+        let mut again = Messages::new(config(), Some(state)).unwrap();
         assert_eq!(again.last_sequence(), 2);
         assert_eq!(again.limits_changed(&[])["params"]["sequence"], 3);
         // The token never goes into a message.
@@ -1296,7 +1303,7 @@ mod tests {
 
     #[test]
     fn tool_activity_is_typed_privacy_safe_and_stable_on_local_replay() {
-        let mut messages = Messages::new(config(), None);
+        let mut messages = Messages::new(config(), None).unwrap();
         messages
             .state
             .accepted_capabilities
@@ -1360,7 +1367,7 @@ mod tests {
     fn local_event_cursor_and_outbox_survive_restart_together() {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join("gateway.json");
-        let mut messages = Messages::new(config(), Some(state_path.clone()));
+        let mut messages = Messages::new(config(), Some(state_path.clone())).unwrap();
         let mut outbox = Outbox::default();
         outbox.push(messages.limits_changed(&[]));
         messages.commit_local_event(17, &outbox).unwrap();
@@ -1373,7 +1380,7 @@ mod tests {
             );
         }
 
-        let restored = Messages::new(config(), Some(state_path));
+        let restored = Messages::new(config(), Some(state_path)).unwrap();
         assert_eq!(restored.replay_cursor(), 17);
         let restored_outbox = restored.pending_outbox();
         assert_eq!(restored_outbox.len(), 1);
@@ -1381,8 +1388,16 @@ mod tests {
     }
 
     #[test]
+    fn unreadable_gateway_state_fails_closed_instead_of_reusing_sequences() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("gateway.json");
+        fs::write(&state_path, "{corrupt").unwrap();
+        assert!(Messages::new(config(), Some(state_path)).is_err());
+    }
+
+    #[test]
     fn replay_is_contiguous_and_acknowledgement_retires_only_committed_prefix() {
-        let mut messages = Messages::new(config(), None);
+        let mut messages = Messages::new(config(), None).unwrap();
         let mut outbox = Outbox::default();
         for _ in 0..3 {
             outbox.push(messages.limits_changed(&[]));
@@ -1420,7 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_mode_keeps_sent_events_until_ack_and_reuses_the_same_message() {
-        let mut messages = Messages::new(config(), None);
+        let mut messages = Messages::new(config(), None).unwrap();
         let message = messages.limits_changed(&[]);
         let mut outbox = Outbox::default();
         outbox.push(message.clone());
