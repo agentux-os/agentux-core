@@ -1,0 +1,56 @@
+[
+  {
+    "event": {
+      "seq": 41,
+      "at": 1794000000000,
+      "runId": "local-run",
+      "kind": "session_event",
+      "sessionId": "session-1",
+      "event": {
+        "kind": "tool_call",
+        "toolCallId": "tool-9",
+        "tool": "execute",
+        "title": "PRIVATE title with token=fixture-secret",
+        "status": "running",
+        "output": "PRIVATE output with credential=fixture-secret"
+      }
+    },
+    "expectedType": "tool_started"
+  },
+  {
+    "event": {
+      "seq": 42,
+      "at": 1794000000001,
+      "runId": "local-run",
+      "kind": "session_event",
+      "sessionId": "session-1",
+      "event": {
+        "kind": "tool_call",
+        "toolCallId": "tool-9",
+        "tool": "execute",
+        "title": "PRIVATE title with token=fixture-secret",
+        "status": "ok",
+        "output": "PRIVATE output with credential=fixture-secret"
+      }
+    },
+    "expectedType": "tool_completed"
+  },
+  {
+    "event": {
+      "seq": 43,
+      "at": 1794000000002,
+      "runId": "local-run",
+      "kind": "session_event",
+      "sessionId": "session-1",
+      "event": {
+        "kind": "tool_call",
+        "toolCallId": "tool-9",
+        "tool": "execute",
+        "title": "PRIVATE title with token=fixture-secret",
+        "status": "error",
+        "output": "PRIVATE output with credential=fixture-secret"
+      }
+    },
+    "expectedType": "tool_failed"
+  }
+]

@@ -21,6 +21,19 @@ How each harness is launched as an ACP agent, as of 2026-10-03. Versions are pin
 | `opencode` | `opencode acp` | Native | [registry entry](https://github.com/agentclientprotocol/registry/blob/main/opencode/agent.json), [docs](https://opencode.ai/docs/acp/) |
 | `antigravity` (experimental) | `agy-acp-server --uid=` | Separate ACP server binary from Google (`agy_acp_server.par`, proprietary), downloaded from `dl.google.com`; it is not the `agy` CLI. On AgentUX OS, first-login installs it and links it as `~/.local/bin/agy-acp-server`; elsewhere, put it on `PATH` under that name. | [registry entry](https://github.com/agentclientprotocol/registry/blob/main/antigravity-acp/agent.json) |
 
+### AUXP execution activity coverage
+
+The gateway uses the shared ACP adapter output. For any harness below, Core emits `tool_started`, `tool_completed` or `tool_failed` only when ACP provides a tool-call status that maps to that lifecycle state and Command has accepted `execution.activity.v1`. The fixture suite pins these three mappings on the common ACP session event surface; it does not claim each vendor adapter always sends each status.
+
+| Harness | Activity coverage in Core | Evidence and limits |
+|---|---|---|
+| `claude-code` | `tool_started`, `tool_completed`, `tool_failed` when emitted as ACP `tool_call` / `tool_call_update` statuses | Common adapter path; no vendor-specific event fixture |
+| `codex` | `tool_started`, `tool_completed`, `tool_failed` when emitted as ACP `tool_call` / `tool_call_update` statuses | Common adapter path; no vendor-specific event fixture |
+| `opencode` | `tool_started`, `tool_completed`, `tool_failed` when emitted as ACP `tool_call` / `tool_call_update` statuses | Common adapter path; no vendor-specific event fixture |
+| `antigravity` (experimental) | `tool_started`, `tool_completed`, `tool_failed` when emitted as ACP `tool_call` / `tool_call_update` statuses | Common adapter path; experimental and no vendor-specific event fixture |
+
+Only generic summaries, normalized tool names and the ACP tool-call ID cross into AUXP. ACP titles, tool output, message text, thoughts, diffs, plan text and usage are not included. ACP `Plan` is a replaceable current-plan snapshot without stable task IDs; AUXP v1 has `plan_created` but no plan-update variant, so Core does not label repeated snapshots as newly created plans or infer task events from their entries ([follow-up #86](https://github.com/agentux-os/agentux-core/issues/86)). The current Core build does not enable ACP's unstable subagent updates; stable v1 provides no task/delegation lifecycle IDs, tool progress percentage, or content-addressed artifact reference, so those AUXP variants are not emitted. Permission requests, usage, messages, diffs and session metadata likewise do not become execution activity.
+
 ### Vendor session ids and the TUI
 
 `AcpSession::id` is the ACP session id. For the three non-experimental harnesses it is also the vendor's own session id, so the vendor's interactive TUI can resume the same conversation (`HarnessSpec::tui_resume`, used by `agentuxd`'s terminal mode). All three advertise `loadSession`, so the session can be reopened over ACP afterwards (`SessionOptions::load`; the history the agent replays while loading is dropped, not streamed as events).
