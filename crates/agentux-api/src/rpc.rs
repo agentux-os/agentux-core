@@ -511,6 +511,10 @@ pub struct RunEvents {
 pub struct PromptSession {
     pub session_id: String,
     pub text: String,
+    /// Stop the turn in progress and continue from `text` instead of
+    /// waiting for the turn to end.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interrupt: bool,
 }
 
 /// Result of `sessions.prompt`.
@@ -521,6 +525,10 @@ pub struct Prompted {
     /// The session was in a turn: the message waits for that turn (and any
     /// queued before it) to end.
     pub queued: bool,
+    /// The turn in progress was interrupted for the message: the agent
+    /// continues from it, in the same session and step.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// Params of `bus.post`: a message from the human on a run's bus.

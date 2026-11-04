@@ -504,14 +504,20 @@ impl Remote {
     }
 
     /// Sends a message to a live session as the human.
-    pub async fn say(&self, session_id: &str, text: &str) -> Result {
-        let prompted = self
-            .connect()
-            .await?
-            .prompt_session(session_id, text)
-            .await?;
+    pub async fn say(&self, session_id: &str, text: &str, interrupt: bool) -> Result {
+        let mut client = self.connect().await?;
+        let prompted = if interrupt {
+            client.interrupt_session(session_id, text).await?
+        } else {
+            client.prompt_session(session_id, text).await?
+        };
         let session = &prompted.session;
-        if prompted.queued {
+        if prompted.interrupted {
+            println!(
+                "interrupted the {} ({}): it continues from your message",
+                session.role, session.harness
+            );
+        } else if prompted.queued {
             println!(
                 "queued for the {} ({}): it gets your message after its current turn",
                 session.role, session.harness

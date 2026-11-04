@@ -166,6 +166,10 @@ enum Command {
     /// after the session's current turn
     Say {
         session_id: String,
+        /// Stop the current turn: the agent continues from your message, in
+        /// the same session and step
+        #[arg(long, short)]
+        interrupt: bool,
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
     },
@@ -884,7 +888,11 @@ fn remote(socket: Option<PathBuf>, command: Command) -> Result {
                 text,
             } => remote.post(&run_id, &to, reply_to, &text.join(" ")).await,
             Command::Bus { run_id, .. } => remote.bus(&run_id).await,
-            Command::Say { session_id, text } => remote.say(&session_id, &text.join(" ")).await,
+            Command::Say {
+                session_id,
+                interrupt,
+                text,
+            } => remote.say(&session_id, &text.join(" "), interrupt).await,
             Command::Cancel { run_id } => remote.cancel(&run_id).await,
             Command::Attach { session_id, shell } => {
                 attach::attach(remote.socket(), &session_id, shell).await

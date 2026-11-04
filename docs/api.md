@@ -33,7 +33,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `runs.cancel` | `{ runId }` | `Run` |
 | `runs.events` | `{ runId, sinceSeq?, limit? }` — `limit` defaults to 1000, at most 10000 | `{ events: Event[], more, headSeq }`: the run's stored events with `seq > sinceSeq`, oldest first; see [History](#history) |
 | `sessions.list` | `{ runId? }` | `Session[]`, oldest first |
-| `sessions.prompt` | `{ sessionId, text }` | `{ session: Session, queued }` — the human's message to a live session; see [Talking to a session](#talking-to-a-session) |
+| `sessions.prompt` | `{ sessionId, text, interrupt? }` | `{ session: Session, queued, interrupted }` — the human's message to a live session, optionally interrupting its turn; see [Talking to a session](#talking-to-a-session) |
 | `requests.list` | `{ pending? }` — `true` for the approvals inbox | `PermissionRequest[]`, newest first |
 | `requests.approve` | `{ requestId, answer? }` — `answer` is required for `question` requests | `PermissionRequest` |
 | `requests.deny` | `{ requestId, answer? }` | `PermissionRequest` (the run fails, except for `permission` requests, where the agent is told no and goes on, and `question` requests, where the agent is told the human declined) |
@@ -317,6 +317,8 @@ notifications: true                # desktop notifications
 ### Talking to a session
 
 `sessions.prompt { sessionId, text }` sends `text`, as typed, to a live session as an extra ACP turn (`aux say <session-id> <text...>`). Like a bus wake, it is queued behind the turn in progress (a step's or a wake's) and any message queued before it; `queued` in the result says whether the session was in a turn. The message is recorded when it is accepted, as a `session_event` with `{ kind: "message", from: "human", text }` (it is not recorded again as a `user` prompt when it is sent). The turn's events are `session_event`s like a step's; its permission requests are `permission` requests of the run's current step. An empty `text` is `-32602`, an unknown session `-32001`, and a session that has ended (or whose run has finished) `-32002`. If the session ends before the message's turn, a `log` event says the message was not handled.
+
+**Interrupt and redirect.** With `interrupt: true` (`aux say --interrupt`), a session in a turn (`active`, or `waiting` on a permission request) does not wait: the daemon cancels the turn over ACP (a permission request it was waiting on is withdrawn) and, once the agent has stopped, sends `text` in the same session as the continuation of the same turn, so a step goes on from the correction instead of failing; the result says `interrupted: true`. The session's events show, in order, the interrupted turn, the human's message, a `system` message saying the agent continues from it, and the continuation. An agent that ignores the cancellation finishes its turn first and gets the message right after, like a queued one. A session that is not in a turn, is open in its TUI, or is between two turns of a step gets the message as without `interrupt` (`interrupted: false`).
 
 ### Terminal mode
 
