@@ -90,6 +90,9 @@ fn ps_document(
                 "updatedAt": run.updated_at,
             });
             let object = value.as_object_mut().expect("an object");
+            if let Some(isolation) = &run.agent_isolation {
+                object.insert("agentIsolation".into(), json!(isolation));
+            }
             if let Some(project) = projects.get(run.project_id.as_str()) {
                 object.insert(
                     "project".into(),
@@ -371,8 +374,8 @@ impl Remote {
             println!("no {}runs", if all { "" } else { "active " });
         } else {
             println!(
-                "{:<10} {:<10} {:<10} {:<13} {:<16} TITLE / ACTIVITY",
-                "RUN", "PROJECT", "STATUS", "STEP", "LOOPS"
+                "{:<10} {:<10} {:<10} {:<13} {:<16} {:<10} TITLE / ACTIVITY",
+                "RUN", "PROJECT", "STATUS", "STEP", "LOOPS", "AGENTS"
             );
             for run in &runs {
                 let project = projects.get(&run.project_id).map_or("?", String::as_str);
@@ -383,13 +386,22 @@ impl Remote {
                     run.review_round,
                     run.review_max_rounds
                 );
+                // Where its agents run: on the host or in the sandbox.
+                let agents = run
+                    .agent_isolation
+                    .as_ref()
+                    .map_or("-", |i| match i.mode.as_str() {
+                        "none" => "host",
+                        _ => "sandbox",
+                    });
                 println!(
-                    "{:<10} {:<10} {:<10} {:<13} {:<16} {} — {}",
+                    "{:<10} {:<10} {:<10} {:<13} {:<16} {:<10} {} — {}",
                     run.id,
                     truncate(project, 10),
                     run.status.as_str(),
                     run.step.as_str(),
                     loops,
+                    agents,
                     run.title,
                     run.activity
                 );

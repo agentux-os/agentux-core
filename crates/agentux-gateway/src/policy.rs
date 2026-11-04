@@ -9,7 +9,8 @@
 //! ```
 //!
 //! Methods the file does not name keep [`Policy::default`]'s decision;
-//! methods this gateway does not know are denied.
+//! methods this gateway does not know are denied. The file's `agents`
+//! section is `agentuxd`'s ([`agentux_config::NodeAgents`]).
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -17,7 +18,7 @@ use std::{fs, io};
 
 use serde::Deserialize;
 
-pub const SYSTEM_POLICY: &str = "/etc/agentux/node-policy.yaml";
+pub const SYSTEM_POLICY: &str = agentux_config::NODE_POLICY;
 
 /// A policy's answer, and every command method with its default decision
 /// (AUXP's): what does not change code or settings runs; starting runs and
@@ -32,6 +33,9 @@ pub struct Policy(BTreeMap<String, Decision>);
 struct File {
     #[serde(default)]
     commands: BTreeMap<String, Decision>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    agents: agentux_config::NodeAgents,
 }
 
 impl Default for Policy {

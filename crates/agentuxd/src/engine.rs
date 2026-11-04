@@ -732,6 +732,7 @@ impl Engine {
                 sessions: Default::default(),
                 models,
                 origin: params.origin,
+                agent_isolation: None,
             },
             phase: Phase::Setup,
             loops: Default::default(),
@@ -1908,7 +1909,7 @@ impl Engine {
         harness: &str,
         worktree: &Path,
     ) -> std::result::Result<Option<crate::sandbox::Profile>, String> {
-        let isolation = self
+        let (isolation, from_command) = self
             .inner
             .store
             .read(|tx| {
@@ -1916,10 +1917,24 @@ impl Engine {
                     .run(run_id)?
                     .ok_or_else(|| Error::NotFound(format!("no run {run_id}")))?;
                 let root = project_root(tx, &record)?;
-                config_of(&record, &root).map(|config| config.isolation.agents)
+                config_of(&record, &root)
+                    .map(|config| (config.isolation.agents, record.run.origin.is_some()))
             })
             .map_err(|e| format!("cannot read the run's isolation: {e}"))?;
-        if isolation.mode == agentux_config::AgentIsolationMode::None {
+        // An unreadable node policy may be the one requiring the sandbox.
+        let node = agentux_config::NodeAgents::load(Path::new(agentux_config::NODE_POLICY))
+            .map_err(|e| format!("{e}; the session is not started"))?;
+        let (mode, source) = isolation.decide(node, from_command);
+        let sandboxed = mode == agentux_config::AgentIsolationMode::Bubblewrap;
+        self.record_isolation(
+            run_id,
+            agentux_api::AgentIsolation {
+                mode: mode.as_str().into(),
+                network: sandboxed.then(|| isolation.network.as_str().into()),
+                source: source.as_str().into(),
+            },
+        );
+        if !sandboxed {
             return Ok(None);
         }
         let home = std::env::var_os("HOME")
@@ -1950,6 +1965,29 @@ impl Engine {
             .prepare()
             .map_err(|e| format!("cannot prepare the agent sandbox: {e}"))?;
         Ok(Some(profile))
+    }
+
+    /// Records that a session of `run_id` runs with `isolation`, unless one
+    /// already ran with less.
+    fn record_isolation(&self, run_id: &str, isolation: agentux_api::AgentIsolation) {
+        let result = self.inner.store.write(|tx| {
+            let Some(mut record) = tx.run(run_id)? else {
+                return Ok(());
+            };
+            let weaker = record
+                .run
+                .agent_isolation
+                .as_ref()
+                .is_none_or(|old| isolation.strength() < old.strength());
+            if weaker {
+                record.run.agent_isolation = Some(isolation);
+                tx.save_run(&mut record)?;
+            }
+            Ok::<_, Error>(())
+        });
+        if let Err(e) = result {
+            eprintln!("agentuxd: run {run_id}: cannot record its isolation: {e}");
+        }
     }
 
     /// The tool catalog's MCP servers for a session of `run_id` with

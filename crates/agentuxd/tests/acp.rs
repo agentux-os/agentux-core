@@ -240,6 +240,16 @@ async fn a_full_pipeline_through_acp_agents() {
         skipped.starts_with("PR skipped: the project has no `origin` remote"),
         "{skipped}"
     );
+    // Nothing asked for a sandbox, and the run says its agents ran on the
+    // host.
+    assert_eq!(
+        run.agent_isolation,
+        Some(agentux_api::AgentIsolation {
+            mode: "none".into(),
+            network: None,
+            source: "default".into(),
+        })
+    );
 
     // Prompts carried the plan and the reviewer's comments.
     {
@@ -636,6 +646,46 @@ fn run_log(engine: &Engine, run_id: &str) -> String {
             "
 ",
         )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_from_command_is_sandboxed_or_does_not_start_its_agents() {
+    let f = fixture(CAREFUL_PIPELINE);
+    let seen = Shared::default();
+    let (executor, launched) = executor(&seen, careful);
+    let engine = f.engine(executor);
+    let project = engine
+        .register_project(f.repo.to_str().unwrap())
+        .await
+        .unwrap();
+    let run = engine
+        .start_run(agentux_api::rpc::StartRun {
+            project_id: project.id,
+            prompt: Some("Create hello.txt".into()),
+            origin: Some(agentux_api::RunOrigin {
+                organization_id: "acme".into(),
+                mission_id: "ship".into(),
+                command_run_id: "run-1a2b".into(),
+                definition_version: None,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    let run = wait_until_settled(&engine, &run.id).await;
+    // The project doesn't say, so a run from Command gets the sandbox; the
+    // fake harness isn't verified for it, so it never starts unconfined.
+    assert_eq!(run.status, RunStatus::Failed);
+    assert!(
+        run.error.as_deref().unwrap_or("").contains("sandbox"),
+        "{:?}",
+        run.error
+    );
+    assert!(launched.lock().unwrap().is_empty());
+    let isolation = run.agent_isolation.unwrap();
+    assert_eq!(
+        (isolation.mode.as_str(), isolation.source.as_str()),
+        ("bubblewrap", "command")
+    );
 }
 
 /// The careful pipeline with a permission policy.

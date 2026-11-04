@@ -156,9 +156,16 @@ Agent sessions can run in a Bubblewrap sandbox ([ADR 0023](https://github.com/ag
 ```yaml
 isolation:
   agents:
-    mode: bubblewrap   # none (default) | bubblewrap
+    mode: bubblewrap   # none | bubblewrap
     network: outbound  # outbound (default) | none
 ```
+
+**Who decides.** In this order:
+1. A machine can require the sandbox for every session in `/etc/agentux/node-policy.yaml` (`agents: { isolation: required }`). This wins over a project's `mode: none`.
+2. Otherwise the project's `mode` decides.
+3. A project that doesn't set `mode` runs on the host, except for runs started from AgentUX Command, which get the sandbox.
+
+`aux node status` shows the machine's setting. A run records the weakest isolation any of its sessions had: `aux ps` shows `host` or `sandbox` under AGENTS, its JSON and `runs.get` carry `agentIsolation` (`mode`, `network`, `source`), and so do its AUXP `run.*` events.
 
 A sandboxed session sees:
 

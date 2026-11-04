@@ -89,6 +89,7 @@ name = "agentux-gateway"
 version = "0.5.2"
 dependencies = [
  "agentux-api",
+ "agentux-config",
  "agentux-store",
  "agentuxd",
  "auxp",

@@ -32,6 +32,7 @@ fn sample_run(project_id: &str) -> RunRecord {
             sessions: BTreeMap::new(),
             models: BTreeMap::new(),
             origin: None,
+            agent_isolation: None,
         },
         phase: Phase::Setup,
         loops: BTreeMap::new(),
