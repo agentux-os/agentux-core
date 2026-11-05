@@ -6,9 +6,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{
-    BusEndpoint, Event, PermissionRequest, Run, Session, SnapshotProjectionType, StepAttempt,
-};
+use crate::{BusEndpoint, Event, PermissionRequest, Run, Session, StepAttempt};
 
 pub const VERSION: &str = "2.0";
 
