@@ -678,6 +678,16 @@ mod node_source_tests {
         assert!(invalid.validate().is_err());
         invalid.capacity = serde_json::json!({"apiKey": 1});
         assert!(invalid.validate().is_err());
+        invalid.capacity = serde_json::json!({"memoryBytes": -1});
+        assert!(invalid.validate().is_err());
+        invalid.capacity = serde_json::json!({"measurements": {"cpu": 8}});
+        assert!(invalid.validate().is_err());
+        invalid.capacity = serde_json::Value::Object(
+            (0..65)
+                .map(|i| (format!("metric{i}"), serde_json::json!(i)))
+                .collect(),
+        );
+        assert!(invalid.validate().is_err());
     }
 
     #[test]

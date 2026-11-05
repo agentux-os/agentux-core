@@ -252,12 +252,19 @@ async fn gateway_harness_inventory_is_durable_and_captured_with_its_event_head()
             .unwrap(),
         Some(3)
     );
-    let capture = client.snapshot_source_capture("org-a").await.unwrap();
+    let capture = client
+        .snapshot_source_capture("org-a", "node-a")
+        .await
+        .unwrap();
     assert_eq!(capture["capturedEventHead"], 3);
     assert_eq!(capture["node"]["state"]["nodeId"], "node-a");
     assert_eq!(capture["node"]["updatedSequence"], 2);
     assert_eq!(capture["nodeAlerts"][0]["state"]["alertId"], "disk-low");
     assert_eq!(capture["nodeAlerts"][0]["updatedSequence"], 3);
+    assert!(matches!(
+        client.snapshot_source_capture("org-a", "node-other").await,
+        Err(ClientError::Rpc(_))
+    ));
     assert_eq!(capture["harnesses"][0]["id"], "codex");
     assert_eq!(capture["harnesses"][0]["updatedSequence"], 1);
     assert_eq!(
