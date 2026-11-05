@@ -202,6 +202,7 @@ pub struct MaterializedSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DurableCapture {
     pub organization_id: String,
     pub captured_event_head: i64,
