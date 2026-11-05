@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust workspace, `rusqlite`, serde JSON-RPC over the local Unix socket, AUXP v1 schemas and fixtures.
 
-**Spec:** `docs/superpowers/specs/2026-11-05-node-alert-domain-design.md`; Core #102; Protocol #18.
+**Spec:** `docs/superpowers/specs/2026-11-05-node-alert-domain-design.md`; Core #102; merged Protocol #18 / Protocol #19.
 
 ## Global Constraints
 
@@ -26,6 +26,8 @@
 - Harness values containing credential-like fields: reject or omit them before durable storage.
 - Missing alert producer or protocol payload contract: report an explicit blocker rather than claiming an empty complete projection.
 
+**Dependency update:** Protocol #18 merged as [agentux-protocol#19](https://github.com/agentux-os/agentux-protocol/pull/19) (`0ca8d7d`). The schema blocker is cleared. Core #104 owns connecting concrete lifecycle producers; this plan may persist and capture typed state but must keep the alert projection unavailable until such a producer is connected.
+
 ---
 
 ### Task 1: Specify the typed event and source boundary
@@ -39,8 +41,8 @@
 - Consumes: Core #110 alert lifecycle decision and current AUXP snapshot projection identity rules.
 - Produces: explicit mapping of node, harness, and alert source identities, safe fields, event shapes, and sequence behavior.
 
-- [ ] Confirm the Protocol #18 issue is open and linked to Core #102.
-- [ ] Record any source fields that cannot be finalized until Protocol #18 is merged; do not invent wire semantics.
+- [x] Confirm Protocol #18 is merged as Protocol #19 and linked to Core #102.
+- [x] Use its final wire fields: node state is `{ nodeId, status, capacity }` with `ready`/`draining`/`error`; alerts are full `active`/`resolved` states or explicit removal, with stable IDs, producer/code, condition key, safe summary, and observation timestamps. Heartbeat remains unsequenced.
 
 ### Task 2: Add durable typed projection records and mutations
 
