@@ -22,6 +22,8 @@ pub mod method {
     /// The built-in harnesses and whether each is installed
     /// ([`super::HarnessInfo`]).
     pub const HARNESSES_LIST: &str = "harnesses.list";
+    /// Persist a complete harness inventory observed by the trusted gateway.
+    pub const HARNESS_INVENTORY_REPLACE: &str = "harnesses.inventory_replace";
     /// The harness limits in force ([`crate::HarnessLimit`]).
     pub const LIMITS_LIST: &str = "limits.list";
     /// The tool catalog: the machine's, the user's and, with a project, its
@@ -42,6 +44,10 @@ pub mod method {
     pub const RUNS_EVENTS: &str = "runs.events";
     /// Atomic durable checkpoint source capture; not a wire snapshot endpoint.
     pub const SNAPSHOT_SOURCE_CAPTURE: &str = "snapshots.source_capture";
+    /// Atomically persist a materialized checkpoint and its sequence binding.
+    pub const SNAPSHOT_MATERIALIZE: &str = "snapshots.materialize";
+    /// Read an existing immutable checkpoint binding after a restart.
+    pub const SNAPSHOT_BINDING_GET: &str = "snapshots.binding_get";
     pub const SESSIONS_LIST: &str = "sessions.list";
     pub const SESSIONS_PROMPT: &str = "sessions.prompt";
     pub const REQUESTS_LIST: &str = "requests.list";
@@ -294,6 +300,13 @@ pub struct HarnessInfo {
     /// own files tell (Codex).
     #[serde(default)]
     pub quota: Vec<QuotaWindow>,
+}
+
+/// Complete installed-harness inventory reported by the local gateway.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessInventory {
+    pub harnesses: Vec<HarnessInfo>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -550,6 +563,41 @@ pub struct ListRequests {
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotSourceCapture {
     pub organization_id: String,
+}
+
+/// Immutable checkpoint payload and the matching Core/gateway sequence boundary.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotMaterialization {
+    pub organization_id: String,
+    pub node_id: String,
+    pub checkpoint_id: String,
+    pub snapshot_id: String,
+    pub captured_event_head: i64,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub high_water_sequence: i64,
+    pub payload: Value,
+}
+
+/// Immutable binding from a captured Core event head to the gateway sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotBinding {
+    pub organization_id: String,
+    pub node_id: String,
+    pub checkpoint_id: String,
+    pub snapshot_id: String,
+    pub captured_event_head: i64,
+    pub high_water_sequence: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotBindingRef {
+    pub organization_id: String,
+    pub node_id: String,
+    pub checkpoint_id: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

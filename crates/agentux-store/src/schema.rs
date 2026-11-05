@@ -199,6 +199,35 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX snapshot_business_projections_by_org
         ON snapshot_business_projections (organization_id, projection_type, projection_id);
     ",
+    // 12: durable local harness current state and sequence-bound removals.
+    "
+    CREATE TABLE snapshot_harnesses (
+        harness_id       TEXT PRIMARY KEY,
+        current_state    TEXT,
+        updated_sequence INTEGER NOT NULL,
+        removed_sequence INTEGER,
+        CHECK ((current_state IS NULL) = (removed_sequence IS NOT NULL))
+    );
+    ",
+    // 13: distinguish an observed empty inventory from one never captured.
+    "
+    CREATE TABLE snapshot_harness_inventory_state (
+        singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+        updated_sequence INTEGER NOT NULL
+    );
+    ",
+    // 14: immutable sequence binding for a captured node checkpoint.
+    "
+    CREATE TABLE snapshot_capture_bindings (
+        organization_id       TEXT NOT NULL,
+        node_id               TEXT NOT NULL,
+        checkpoint_id         TEXT NOT NULL,
+        snapshot_id           TEXT NOT NULL,
+        captured_event_head   INTEGER NOT NULL,
+        high_water_sequence   INTEGER NOT NULL,
+        PRIMARY KEY (organization_id, node_id, checkpoint_id)
+    );
+    ",
 ];
 
 /// The schema version this build writes.

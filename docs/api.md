@@ -29,11 +29,14 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `limits.list` | none | `HarnessLimit[]`: the usage limits in force; see [Usage limits](#usage-limits) |
 | `limits.clear` | `{ harness, model? }` — without `model`, every limit of the harness | `HarnessLimit[]` still in force; runs waiting for the harness go on |
 | `harnesses.list` | none | `[{ id, command, installed, signedIn, experimental, limits, version, usage: { todayUsd, weekUsd, weekSessions }, quota: [{ label, usedPercent, resetsAt, seenAt }] }]`: the built-in harnesses, whether each one's vendor program (`command`) is on the daemon's `PATH`, whether the user signed in to it (`null`: cannot tell), its `--version`, what its sessions cost, and its plan's usage windows where the harness's own files say (Codex) |
+| `harnesses.inventory_replace` | `{ harnesses }` | `number \| null`: trusted local gateway replaces Core's durable full inventory; a changed inventory emits one sequenced `harness.status` source event, while an unchanged inventory is a no-op |
 | `runs.list` | `{ projectId? }` | `Run[]`, newest first |
 | `runs.get` | `{ runId }` | `{ run: Run, attempts: StepAttempt[], requests: PermissionRequest[], sessions: Session[] }` |
 | `runs.cancel` | `{ runId }` | `Run` |
 | `runs.events` | `{ runId, sinceSeq?, limit? }` — `limit` defaults to 1000, at most 10000 | `{ events: Event[], more, headSeq }`: the run's stored events with `seq > sinceSeq`, oldest first; see [History](#history) |
 | `snapshots.source_capture` | `{ organizationId }` | Atomic durable Core projection sources and the SQLite event head from one read transaction, plus explicit unavailable projection reasons; this is an internal data-boundary primitive and does not claim complete AUXP checkpoint coverage |
+| `snapshots.materialize` | `{ organizationId, nodeId, checkpointId, snapshotId, capturedEventHead, createdAtMs, expiresAtMs, highWaterSequence, payload }` | Atomically persists immutable snapshot pages and their sequence binding; identical retries succeed and conflicting retries fail |
+| `snapshots.binding_get` | `{ organizationId, nodeId, checkpointId }` | Reads the immutable binding for restart recovery, or `null` if no checkpoint exists |
 | `sessions.list` | `{ runId? }` | `Session[]`, oldest first |
 | `sessions.prompt` | `{ sessionId, text, interrupt? }` | `{ session: Session, queued, interrupted }` — the human's message to a live session, optionally interrupting its turn; see [Talking to a session](#talking-to-a-session) |
 | `requests.list` | `{ pending? }` — `true` for the approvals inbox | `PermissionRequest[]`, newest first |
@@ -100,9 +103,9 @@ Where the replay ends, the subscription gets one notification of its own, exactl
 
 ### Snapshot projection source ownership
 
-`snapshots.source_capture` returns durable business-projection records from the same SQLite read transaction as `capturedEventHead`. This branch adds a typed storage foundation, organization/run ownership checks, same-transaction sequence markers, and retained tombstones. It does **not** claim that `artifact`, `task`, or `command` inventories are complete: `unavailable` continues to list all three until their lifecycle producers are connected. Consumers must not treat an empty table as an authoritative empty inventory.
+`snapshots.source_capture` returns durable harness and business-projection records from the same SQLite read transaction as `capturedEventHead`. The gateway writes a complete harness inventory; changes and removals share one SQLite event sequence, and removed harnesses remain as tombstones. `snapshots.materialize` atomically stores immutable pages with the binding between that Core event head and the gateway's high-water sequence; `snapshots.binding_get` recovers the binding after a restart. This still does **not** claim complete checkpoint coverage: node, node-alert, artifact, task, and command sources remain explicitly listed in `unavailable`. Consumers must not treat an unavailable source as an authoritative empty inventory.
 
-The intended owners are the artifact lifecycle producer, the typed task lifecycle producer, and the node gateway for Command lifecycle. No producer currently writes these records. Follow-up work must connect each owner, source organization scope from authenticated/enrolled context, and test its real create/update/remove/restart lifecycle before coverage changes to `sourced`. A task requires a run whose persisted `RunOrigin` belongs to that organization; an artifact may be organization-owned without a run, but any supplied run link must belong to the same organization. Local-only runs cannot be stored or captured. Command rows may omit `runId`; Protocol #17 requires `commandId`, `organizationId`, `status`, and non-empty `currentState`, while `method` is optional. The future gateway writer must bind its `organizationId` to the enrolled node configuration. Command parameters and credentials must never enter projection state.
+The intended owners are the artifact lifecycle producer, the typed task lifecycle producer, and the node gateway for Command lifecycle. No producer currently writes the business-projection rows. Follow-up work must connect each owner, source organization scope from authenticated/enrolled context, and test its real create/update/remove/restart lifecycle before coverage changes to `sourced`. A task requires a run whose persisted `RunOrigin` belongs to that organization; an artifact may be organization-owned without a run, but any supplied run link must belong to the same organization. Local-only runs cannot be stored or captured. Command rows may omit `runId`; Protocol #17 requires `commandId`, `organizationId`, `status`, and non-empty `currentState`, while `method` is optional. The future gateway writer must bind its `organizationId` to the enrolled node configuration. Command parameters and credentials must never enter projection state.
 
 Snapshot capability remains disabled while any required source is unavailable.
 
@@ -117,6 +120,8 @@ Snapshot capability remains disabled while any required source is unavailable.
 | `session_event` | `sessionId`, `event: SessionEvent` | Something happened in a session |
 | `bus_message` | `message: BusMessage` | Traffic on the run's agent bus (see [Agent bus](#agent-bus)) |
 | `limits` | `limits: HarnessLimit[]` | The usage limits in force changed (no `runId`) |
+| `harness_status` | `harnesses: HarnessInfo[]` | The complete local harness inventory changed (no `runId`) |
+| `harness_status` | `harnesses: HarnessInfo[]` | The complete local harness inventory changed (no `runId`) |
 
 Session events are stored in the event log like the others, so `events.subscribe` with `since: 0` replays a run's sessions. Agent message chunks are coalesced (up to about 4 KB, or 750 ms); reasoning chunks are not recorded; tool output and diff texts are cut at 16 KB.
 

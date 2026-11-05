@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use agentux_api::rpc::HarnessInfo;
 use agentux_api::{
     AttemptStatus, BusMessage, CheckResult, Event, EventBody, HarnessLimit, PermissionRequest,
     Project, PullRequest, RequestKind, RequestStatus, Run, RunStatus, Session, SessionState,
@@ -265,6 +266,62 @@ fn parse_business_projection_type(value: &str) -> Result<SnapshotProjectionType>
     }
 }
 
+fn harness_projection_state(harness: &HarnessInfo) -> Result<serde_json::Value> {
+    let mut current_state = serde_json::Map::new();
+    current_state.insert("harnessId".into(), harness.id.clone().into());
+    current_state.insert("installed".into(), harness.installed.into());
+    current_state.insert("signedIn".into(), harness.signed_in.into());
+    current_state.insert("experimental".into(), harness.experimental.into());
+    current_state.insert(
+        "version".into(),
+        serde_json::to_value(&harness.version).map_err(|error| Error::Data(error.to_string()))?,
+    );
+    current_state.insert(
+        "usage".into(),
+        serde_json::to_value(&harness.usage).map_err(|error| Error::Data(error.to_string()))?,
+    );
+    current_state.insert(
+        "limits".into(),
+        serde_json::to_value(&harness.limits).map_err(|error| Error::Data(error.to_string()))?,
+    );
+    let quota = harness
+        .quota
+        .iter()
+        .map(|quota| {
+            let mut value = serde_json::Map::new();
+            value.insert(
+                "label".into(),
+                serde_json::to_value(&quota.label)
+                    .map_err(|error| Error::Data(error.to_string()))?,
+            );
+            value.insert(
+                "usedPercent".into(),
+                serde_json::to_value(quota.used_percent)
+                    .map_err(|error| Error::Data(error.to_string()))?,
+            );
+            value.insert(
+                "resetsAt".into(),
+                serde_json::to_value(quota.resets_at)
+                    .map_err(|error| Error::Data(error.to_string()))?,
+            );
+            Ok(serde_json::Value::Object(value))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    current_state.insert("quota".into(), serde_json::Value::Array(quota));
+    let current_state = serde_json::Value::Object(current_state);
+    Ok(serde_json::json!({
+        "harnessId": harness.id,
+        "installed": harness.installed,
+        "signedIn": harness.signed_in,
+        "experimental": harness.experimental,
+        "version": harness.version,
+        "usage": harness.usage,
+        "limits": harness.limits,
+        "quota": current_state["quota"].clone(),
+        "currentState": current_state,
+    }))
+}
+
 impl Tx<'_> {
     /// Pins opaque, already captured data under an immutable organization/node/checkpoint key.
     /// Conflicting retries fail instead of replacing the original capture.
@@ -325,11 +382,145 @@ impl Tx<'_> {
         body.map(|body| from_json(&body)).transpose()
     }
 
+    /// Binds a materialized checkpoint's local capture head to the gateway's
+    /// sequenced high-water mark. Matching retries are idempotent; conflicting
+    /// retries cannot replace the original binding.
+    pub fn bind_snapshot(
+        &mut self,
+        binding: &agentux_api::rpc::SnapshotBinding,
+    ) -> Result<agentux_api::rpc::SnapshotBinding> {
+        if binding.organization_id.trim().is_empty()
+            || binding.node_id.trim().is_empty()
+            || binding.checkpoint_id.trim().is_empty()
+            || binding.snapshot_id.trim().is_empty()
+            || binding.captured_event_head < 0
+            || binding.high_water_sequence < 0
+            || binding.captured_event_head > self.last_event_seq()?
+        {
+            return Err(Error::Data("invalid snapshot sequence binding".into()));
+        }
+        let materialized: Option<String> = self
+            .tx
+            .query_row(
+                "SELECT body FROM snapshot_materializations
+                 WHERE organization_id = ?1 AND node_id = ?2 AND checkpoint_id = ?3",
+                params![
+                    binding.organization_id,
+                    binding.node_id,
+                    binding.checkpoint_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(materialized) = materialized else {
+            return Err(Error::Data(
+                "snapshot binding requires a durable materialization".into(),
+            ));
+        };
+        let materialized: snapshot::MaterializedSnapshot = from_json(&materialized)?;
+        if materialized.snapshot_id != binding.snapshot_id
+            || materialized.captured_event_head != binding.captured_event_head
+            || materialized.expires_at_ms <= now_ms()
+        {
+            return Err(Error::Data(
+                "snapshot binding does not match the materialized capture".into(),
+            ));
+        }
+        let existing: Option<(String, i64, i64)> = self
+            .tx
+            .query_row(
+                "SELECT snapshot_id, captured_event_head, high_water_sequence
+                 FROM snapshot_capture_bindings
+                 WHERE organization_id = ?1 AND node_id = ?2 AND checkpoint_id = ?3",
+                params![
+                    binding.organization_id,
+                    binding.node_id,
+                    binding.checkpoint_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing
+                == (
+                    binding.snapshot_id.clone(),
+                    binding.captured_event_head,
+                    binding.high_water_sequence,
+                )
+            {
+                return Ok(binding.clone());
+            }
+            return Err(Error::Data(
+                "checkpoint id already has a different sequence binding".into(),
+            ));
+        }
+        self.tx.execute(
+            "INSERT INTO snapshot_capture_bindings (
+                 organization_id, node_id, checkpoint_id, snapshot_id,
+                 captured_event_head, high_water_sequence
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                binding.organization_id,
+                binding.node_id,
+                binding.checkpoint_id,
+                binding.snapshot_id,
+                binding.captured_event_head,
+                binding.high_water_sequence
+            ],
+        )?;
+        Ok(binding.clone())
+    }
+
+    pub fn snapshot_binding(
+        &self,
+        organization_id: &str,
+        node_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<Option<agentux_api::rpc::SnapshotBinding>> {
+        self.tx
+            .query_row(
+                "SELECT bindings.organization_id, bindings.node_id, bindings.checkpoint_id,
+                        bindings.snapshot_id,
+                        bindings.captured_event_head, bindings.high_water_sequence
+                 FROM snapshot_capture_bindings AS bindings
+                 INNER JOIN snapshot_materializations AS snapshots
+                   ON snapshots.organization_id = bindings.organization_id
+                  AND snapshots.node_id = bindings.node_id
+                  AND snapshots.checkpoint_id = bindings.checkpoint_id
+                 WHERE bindings.organization_id = ?1 AND bindings.node_id = ?2
+                   AND bindings.checkpoint_id = ?3 AND snapshots.expires_at_ms > ?4",
+                params![organization_id, node_id, checkpoint_id, now_ms()],
+                |row| {
+                    Ok(agentux_api::rpc::SnapshotBinding {
+                        organization_id: row.get(0)?,
+                        node_id: row.get(1)?,
+                        checkpoint_id: row.get(2)?,
+                        snapshot_id: row.get(3)?,
+                        captured_event_head: row.get(4)?,
+                        high_water_sequence: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn prune_snapshot_materializations(&mut self, now_ms: i64) -> Result<usize> {
-        Ok(self.tx.execute(
+        let removed = self.tx.execute(
             "DELETE FROM snapshot_materializations WHERE expires_at_ms<=?1",
             [now_ms],
-        )?)
+        )?;
+        self.tx.execute(
+            "DELETE FROM snapshot_capture_bindings
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM snapshot_materializations AS snapshots
+                 WHERE snapshots.organization_id = snapshot_capture_bindings.organization_id
+                   AND snapshots.node_id = snapshot_capture_bindings.node_id
+                   AND snapshots.checkpoint_id = snapshot_capture_bindings.checkpoint_id
+             )",
+            [],
+        )?;
+        Ok(removed)
     }
 
     // ---- events ----
@@ -412,6 +603,113 @@ impl Tx<'_> {
             .query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?)
     }
 
+    /// Replaces the complete durable harness inventory observed by the local
+    /// gateway. State rows and the event that publishes the complete set share
+    /// one SQLite transaction and one event sequence.
+    pub fn replace_harness_inventory(&mut self, harnesses: &[HarnessInfo]) -> Result<Option<i64>> {
+        let mut desired = BTreeMap::new();
+        for harness in harnesses {
+            if harness.id.trim().is_empty() {
+                return Err(Error::Data("harness id is required".into()));
+            }
+            let state = harness_projection_state(harness)?;
+            let body = to_json(&state)?;
+            if desired.insert(harness.id.clone(), body).is_some() {
+                return Err(Error::Data(format!(
+                    "duplicate harness id {:?}",
+                    harness.id
+                )));
+            }
+        }
+
+        let mut statement = self.tx.prepare(
+            "SELECT harness_id, current_state FROM snapshot_harnesses
+             WHERE current_state IS NOT NULL ORDER BY harness_id",
+        )?;
+        let current = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+        drop(statement);
+        let initialized = self.harness_inventory_updated_sequence()?.is_some();
+        if initialized && current == desired {
+            return Ok(None);
+        }
+
+        self.emit(
+            None,
+            EventBody::HarnessStatus {
+                harnesses: harnesses.to_vec(),
+            },
+        )?;
+        let sequence = self.events.last().expect("emit appends an event").seq;
+
+        for (id, state) in &desired {
+            self.tx.execute(
+                "INSERT INTO snapshot_harnesses (
+                     harness_id, current_state, updated_sequence, removed_sequence
+                 ) VALUES (?1, ?2, ?3, NULL)
+                 ON CONFLICT (harness_id) DO UPDATE SET
+                     current_state = excluded.current_state,
+                     updated_sequence = excluded.updated_sequence,
+                     removed_sequence = NULL",
+                params![id, state, sequence],
+            )?;
+        }
+        for id in current.keys().filter(|id| !desired.contains_key(*id)) {
+            self.tx.execute(
+                "UPDATE snapshot_harnesses
+                 SET current_state = NULL, updated_sequence = ?2, removed_sequence = ?2
+                 WHERE harness_id = ?1 AND current_state IS NOT NULL",
+                params![id, sequence],
+            )?;
+        }
+        self.tx.execute(
+            "INSERT INTO snapshot_harness_inventory_state (singleton, updated_sequence)
+             VALUES (1, ?1)
+             ON CONFLICT (singleton) DO UPDATE SET updated_sequence = excluded.updated_sequence",
+            [sequence],
+        )?;
+        Ok(Some(sequence))
+    }
+
+    fn harness_inventory_updated_sequence(&self) -> Result<Option<i64>> {
+        Ok(self
+            .tx
+            .query_row(
+                "SELECT updated_sequence FROM snapshot_harness_inventory_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn harness_projections(&self) -> Result<Vec<snapshot::HarnessProjectionEntry>> {
+        let mut statement = self.tx.prepare(
+            "SELECT harness_id, current_state, updated_sequence, removed_sequence
+             FROM snapshot_harnesses ORDER BY harness_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, state, updated_sequence, removed_at_sequence) = row?;
+            Ok(snapshot::HarnessProjectionEntry {
+                id,
+                state: state.as_deref().map(from_json).transpose()?,
+                updated_sequence,
+                removed_at_sequence,
+            })
+        })
+        .collect()
+    }
+
     /// Captures all currently durable, Command-owned projections and the local
     /// SQLite event head using this same read transaction.
     pub fn capture_checkpoint_sources(
@@ -454,6 +752,14 @@ impl Tx<'_> {
             .into_iter()
             .filter(|session| run_ids.contains(session.run_id.as_str()))
             .collect();
+        let mut unavailable = snapshot::unavailable_projections();
+        if self.harness_inventory_updated_sequence()?.is_none() {
+            unavailable.push(snapshot::UnavailableProjection {
+                kind: snapshot::ProjectionKind::Harness,
+                reason: "the trusted gateway has not delivered a complete harness inventory yet"
+                    .into(),
+            });
+        }
         Ok(snapshot::DurableCapture {
             organization_id: organization_id.into(),
             captured_event_head: self.last_event_seq()?,
@@ -461,9 +767,10 @@ impl Tx<'_> {
             approvals,
             sessions,
             limits: self.limits(now)?,
+            harnesses: self.harness_projections()?,
             gates,
             business_projections: self.business_projections(organization_id)?,
-            unavailable: snapshot::unavailable_projections(),
+            unavailable,
         })
     }
 

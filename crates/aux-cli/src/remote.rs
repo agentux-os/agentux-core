@@ -653,6 +653,7 @@ impl Printer {
             EventBody::BusMessage { message } => println!("  {}", bus_line(message)),
             EventBody::Project { .. }
             | EventBody::Limits { .. }
+            | EventBody::HarnessStatus { .. }
             | EventBody::SnapshotProjectionChanged { .. } => {}
         }
         None
