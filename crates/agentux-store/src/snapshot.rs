@@ -157,18 +157,23 @@ impl BusinessProjection {
             .and_then(Value::as_object)
             .filter(|current| !current.is_empty())
             .ok_or("projection state requires a complete currentState object")?;
-        if current.get(field).and_then(Value::as_str) != Some(self.id.as_str())
-            || current.get("organizationId").and_then(Value::as_str)
-                != Some(self.organization_id.as_str())
+        if matches!(
+            self.projection_type,
+            BusinessProjectionKind::Task | BusinessProjectionKind::Command
+        ) && self
+            .state
+            .get("status")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
         {
-            return Err("currentState identity and organization must match the projection".into());
+            return Err(format!("{family} state requires a non-empty status"));
         }
         let state_run_id = self.state.get("runId").and_then(Value::as_str);
-        let current_run_id = current.get("runId").and_then(Value::as_str);
-        if state_run_id != current_run_id || state_run_id != self.run_id.as_deref() {
-            return Err(format!(
-                "{family} state and indexed runId must agree, including when absent"
-            ));
+        if state_run_id != self.run_id.as_deref() {
+            return Err(format!("{family} state and indexed runId must agree"));
+        }
+        if self.projection_type == BusinessProjectionKind::Task && state_run_id.is_none() {
+            return Err("task state requires runId".into());
         }
         Ok(())
     }

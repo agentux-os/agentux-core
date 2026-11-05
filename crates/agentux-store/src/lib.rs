@@ -521,13 +521,10 @@ impl Tx<'_> {
         projection: &snapshot::BusinessProjection,
     ) -> Result<i64> {
         projection.validate().map_err(Error::Data)?;
-        if matches!(
-            projection.projection_type,
-            SnapshotProjectionType::Artifact | SnapshotProjectionType::Task
-        ) && projection.run_id.is_none()
+        if projection.projection_type == SnapshotProjectionType::Task && projection.run_id.is_none()
         {
             return Err(Error::Data(
-                "artifact and task projections must belong to a Command-owned run".into(),
+                "task projections must belong to a Command-owned run".into(),
             ));
         }
         if let Some(run_id) = projection.run_id.as_deref() {
