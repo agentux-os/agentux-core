@@ -196,6 +196,16 @@ It never sees the daemon's control socket, `/run/user` (D-Bus, keyring, SSH agen
 
 **Failures.** A missing `bwrap` or `pasta` fails the session instead of running it unconfined. The TUI handoff opens in the same sandbox. Antigravity isn't supported in the sandbox until its paths are verified.
 
+**Checking it with your real agents.** `scripts/sandbox-real-harnesses.sh` runs each agent CLI you're signed in to in the sandbox, on a throwaway project and an `agentuxd` of its own (its own socket and database; your daemon and runs aren't touched). Each agent is asked to create a file in its worktree and to try writing one in `$HOME` and one in the project's main checkout. The script checks that the run recorded `agentIsolation` `bubblewrap/outbound`, that the session ran that harness and finished, that the file is in the worktree, and that nothing landed outside. Then it runs one harness again with `network: none`, which must fail with a message rather than hang. It needs `aux` (and `agentuxd`, or `aux daemon` stands in), `bwrap`, `pasta`, `git` and `jq`:
+
+```sh
+cargo build --release --locked --bin aux --bin agentuxd
+scripts/sandbox-real-harnesses.sh --bin target/release                # claude-code, codex, opencode
+scripts/sandbox-real-harnesses.sh --harness codex --harness antigravity --keep
+```
+
+Harnesses that aren't installed or signed in are skipped. It prints a PASS/FAIL/SKIP table per harness and check and exits non-zero on a FAIL. It runs the agents unattended (`--auto-approve-permissions`, inside the sandbox) and spends a little of your plan or API credit. It prints nothing from your environment or the CLIs' files. The logs go to a directory it names at the end; they hold the agents' replies and stderr, so review them before sharing. Your `~/.config/agentux` (preferences, tool catalog, `sandbox.yaml`) is left out unless you pass `--user-config`. CI runs the same script with `--fake`: scripted ACP agents and a throwaway home, through the real Bubblewrap and pasta.
+
 ## Tool catalog (MCP servers and instructions)
 
 Declare an MCP server once and every harness's sessions get it: Claude Code, Codex, OpenCode and Antigravity alike. agentuxd hands the servers to each session in ACP's `session/new`, next to the `agentux` bus, so there's no per-CLI configuration file to keep in sync. A run that falls back to another harness keeps its tools.

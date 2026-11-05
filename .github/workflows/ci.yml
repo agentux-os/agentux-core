@@ -57,6 +57,10 @@ jobs:
           # The container-isolation tests skip without podman; the runner
           # has it, so a skip here would hide a regression.
           AGENTUX_REQUIRE_PODMAN: "1"
+      # scripts/sandbox-real-harnesses.sh, which owners run with their
+      # signed-in agents, here with scripted ones in the real sandbox.
+      - name: Agent sandbox check, scripted
+        run: bash scripts/sandbox-real-harnesses.sh --fake --bin target/debug
 
   deny:
     name: dependencies (cargo-deny)
