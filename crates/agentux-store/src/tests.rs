@@ -836,6 +836,9 @@ fn migration_11_preserves_version_10_rows_and_scopes_projection_ids_by_org() {
              DROP TABLE snapshot_capture_bindings;
              DROP TABLE snapshot_harness_inventory_state;
              DROP TABLE snapshot_harnesses;
+             DROP TABLE snapshot_node_alert_inventory_state;
+             DROP TABLE snapshot_node_alerts;
+             DROP TABLE snapshot_node_state;
              PRAGMA user_version = 10;",
         )
         .unwrap();
