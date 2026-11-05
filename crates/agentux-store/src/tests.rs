@@ -869,8 +869,11 @@ fn command_owned_pull_request_is_projected_and_removed_with_run_state() {
     assert_eq!(artifact.organization_id, "org-a");
     assert_eq!(artifact.run_id.as_deref(), Some(record.run.id.as_str()));
     let state = artifact.state.as_ref().unwrap();
-    assert_eq!(state["kind"], "pull_request");
-    assert_eq!(state["uri"], "https://github.com/acme/app/pull/42");
+    assert_eq!(state["currentState"]["kind"], "pull_request");
+    assert_eq!(
+        state["currentState"]["uri"],
+        "https://github.com/acme/app/pull/42"
+    );
     assert_eq!(state["currentState"]["number"], 42);
 
     record.run.pull_request = None;
