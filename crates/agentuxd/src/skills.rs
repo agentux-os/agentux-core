@@ -406,6 +406,211 @@ fn make_writable(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Where sessions' skills directories are, under the user's data directory.
+pub const SESSIONS_DIR: &str = "agentux/sessions";
+
+fn data_home() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/share"))
+        })
+}
+
+/// A session's skills: the directory to add to its workspace roots, and
+/// Claude Code's plugin option. Notes for the run's log say which skills it
+/// got, from where and by which digest, and which it goes without and why.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Delivery {
+    /// The session's skills directory, if it got any skill.
+    pub dir: Option<PathBuf>,
+    pub additional_directories: Vec<PathBuf>,
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+    pub notes: Vec<String>,
+}
+
+/// How a harness gets the catalog's skills (ADR 0026).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Claude Code: a local plugin, `agentux`, with only the skills in it,
+    /// through the adapter's `_meta.claudeCode.options.plugins`.
+    Plugin,
+    /// Codex: `<dir>/.agents/skills`, which `codex-acp` takes from
+    /// `additionalDirectories`.
+    AgentsDir,
+}
+
+fn route(harness: &str) -> Option<Route> {
+    match harness {
+        "claude-code" => Some(Route::Plugin),
+        "codex" => Some(Route::AgentsDir),
+        _ => None,
+    }
+}
+
+/// The catalog's skills for `harness`'s session `session_id`, copied from
+/// the store into `~/.local/share/agentux/sessions/<session_id>`; `project`
+/// is the run's worktree, which a project catalog's paths are relative to.
+pub fn deliver(
+    catalog: &agentux_config::ToolCatalog,
+    harness: &str,
+    session_id: &str,
+    project: &Path,
+) -> Delivery {
+    let skills: Vec<&Skill> = catalog
+        .skills
+        .values()
+        .filter(|s| s.applies_to(harness))
+        .collect();
+    if skills.is_empty() {
+        return Delivery::default();
+    }
+    let (Some(store), Some(home)) = (Store::user(), data_home()) else {
+        return Delivery {
+            notes: vec!["skills: no data directory (HOME is not set); the session goes without the catalog's skills".into()],
+            ..Delivery::default()
+        };
+    };
+    deliver_with(
+        &store,
+        &home.join(SESSIONS_DIR).join(session_id),
+        harness,
+        skills,
+        project,
+    )
+}
+
+/// [`deliver`] with a given store and session directory.
+pub fn deliver_with(
+    store: &Store,
+    dir: &Path,
+    harness: &str,
+    mut skills: Vec<&Skill>,
+    project: &Path,
+) -> Delivery {
+    let mut out = Delivery::default();
+    let Some(route) = route(harness) else {
+        let names: Vec<_> = skills.iter().map(|s| format!("`{}`", s.name)).collect();
+        out.notes.push(format!(
+            "skills: {harness} gets the catalog's skills in a later AgentUX release (ADR 0026, step 2); this session goes without {}",
+            names.join(", ")
+        ));
+        return out;
+    };
+    // The machine's first, then the user's, then the project's; by name.
+    skills.sort_by(|a, b| a.source.cmp(&b.source).then_with(|| a.name.cmp(&b.name)));
+    let _ = remove_tree(dir);
+    if let Err(e) = fs::create_dir_all(dir) {
+        out.notes.push(format!(
+            "skills: cannot create {}: {e}; the session goes without them",
+            dir.display()
+        ));
+        return out;
+    }
+    let skills_dir = match route {
+        Route::Plugin => dir.join("agentux/skills"),
+        Route::AgentsDir => dir.join(".agents/skills"),
+    };
+    let mut total = 0;
+    let mut delivered = 0;
+    for skill in skills {
+        let from = format!("`{}` from the {} catalog", skill.name, skill.source);
+        if delivered == agentux_config::MAX_SESSION_SKILLS {
+            out.notes.push(format!(
+                "skills: {from} left out: a session gets at most {} skills",
+                agentux_config::MAX_SESSION_SKILLS
+            ));
+            continue;
+        }
+        let stored = match store.resolve(skill, Some(project)) {
+            Ok(stored) => stored,
+            Err(e) => {
+                out.notes.push(format!("skills: {from} left out: {e}"));
+                continue;
+            }
+        };
+        if total + stored.bytes > agentux_config::MAX_SESSION_SKILL_BYTES {
+            out.notes.push(format!(
+                "skills: {from} left out: the session's skills would be over {} MiB",
+                agentux_config::MAX_SESSION_SKILL_BYTES / (1024 * 1024)
+            ));
+            continue;
+        }
+        if let Err(e) = copy_checked(&stored.dir, &skills_dir.join(&skill.name), false) {
+            out.notes.push(format!("skills: {from} left out: {e}"));
+            continue;
+        }
+        total += stored.bytes;
+        delivered += 1;
+        let origin = match (&skill.git, &skill.rev) {
+            (Some(git), Some(rev)) => format!("{git} at {}", &rev[..rev.len().min(12)]),
+            _ => skill.path.clone().unwrap_or_default(),
+        };
+        let how = match route {
+            Route::Plugin => "plugin agentux",
+            Route::AgentsDir => ".agents/skills",
+        };
+        out.notes.push(format!(
+            "skills: {from} ({origin}, {}) for {harness}, through {how}",
+            stored.digest
+        ));
+    }
+    if delivered == 0 {
+        let _ = remove_tree(dir);
+        return out;
+    }
+    if route == Route::Plugin {
+        let plugin = dir.join("agentux");
+        let manifest = serde_json::json!({
+            "name": "agentux",
+            "description": "Skills from the AgentUX tool catalog",
+            "version": "1.0.0",
+        });
+        let written = fs::create_dir_all(plugin.join(".claude-plugin")).and_then(|()| {
+            fs::write(
+                plugin.join(".claude-plugin/plugin.json"),
+                serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+            )
+        });
+        if let Err(e) = written {
+            out.notes.push(format!(
+                "skills: cannot write the agentux plugin: {e}; the session goes without them"
+            ));
+            let _ = remove_tree(dir);
+            return out;
+        }
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "claudeCode".into(),
+            serde_json::json!({ "options": { "plugins": [ { "type": "local", "path": plugin } ] } }),
+        );
+        out.meta = Some(meta);
+    }
+    let _ = read_only(dir);
+    out.additional_directories = vec![dir.to_path_buf()];
+    out.dir = Some(dir.to_path_buf());
+    out
+}
+
+/// Removes session `session_id`'s skills directory, if it has one.
+pub fn remove_session_dir(session_id: &str) {
+    if let Some(home) = data_home() {
+        let _ = remove_tree(&home.join(SESSIONS_DIR).join(session_id));
+    }
+}
+
+/// Removes a read-only tree.
+fn remove_tree(dir: &Path) -> io::Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    make_writable(dir)?;
+    fs::remove_dir_all(dir)
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -621,5 +826,131 @@ mod tests {
 
         skill.rev = Some("0".repeat(40));
         assert!(store.resolve(&skill, None).is_err());
+    }
+
+    fn delivered(tmp: &Path, harness: &str, names: &[&str]) -> (Delivery, PathBuf) {
+        let repo = tmp.join("repo");
+        for name in names {
+            skill_dir(&repo.join("skills"), name, "Body.");
+        }
+        let entries: Vec<Skill> = names
+            .iter()
+            .map(|name| entry(name, &format!("skills/{name}"), ToolSource::Project))
+            .collect();
+        let store = Store::new(tmp.join("store"));
+        let dir = tmp.join("sessions/s1");
+        (
+            deliver_with(&store, &dir, harness, entries.iter().collect(), &repo),
+            dir,
+        )
+    }
+
+    #[test]
+    fn claude_code_gets_an_agentux_plugin_with_only_the_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (out, dir) = delivered(tmp.path(), "claude-code", &["notes", "pdf"]);
+        assert_eq!(out.dir.as_deref(), Some(dir.as_path()));
+        assert_eq!(out.additional_directories, std::slice::from_ref(&dir));
+        let plugin = dir.join("agentux");
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(plugin.join(".claude-plugin/plugin.json")).unwrap())
+                .unwrap();
+        assert_eq!(manifest["name"], "agentux");
+        assert!(plugin.join("skills/notes/SKILL.md").is_file());
+        assert!(plugin.join("skills/pdf/scripts/run.sh").is_file());
+        let mut top: Vec<_> = fs::read_dir(&plugin)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        top.sort();
+        assert_eq!(
+            top,
+            [".claude-plugin", "skills"],
+            "no hooks, agents, commands or MCP servers"
+        );
+        assert!(!dir.join(".claude").exists(), "nothing loads twice");
+        let meta = serde_json::Value::Object(out.meta.unwrap());
+        assert_eq!(meta["claudeCode"]["options"]["plugins"][0]["type"], "local");
+        assert_eq!(
+            meta["claudeCode"]["options"]["plugins"][0]["path"],
+            plugin.to_string_lossy().as_ref()
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("`notes` from the project catalog") && n.contains("sha256:"))
+        );
+        let mode = fs::metadata(plugin.join("skills/notes/SKILL.md"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o222, 0, "read-only");
+
+        remove_tree(&dir).unwrap();
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn codex_gets_agents_skills_and_others_wait_for_step_2() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (out, dir) = delivered(tmp.path(), "codex", &["notes"]);
+        assert!(dir.join(".agents/skills/notes/SKILL.md").is_file());
+        assert_eq!(out.meta, None);
+        assert_eq!(out.additional_directories, [dir]);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (out, dir) = delivered(tmp.path(), "opencode", &["notes"]);
+        assert_eq!(out.dir, None);
+        assert!(out.additional_directories.is_empty() && !dir.exists());
+        assert!(
+            out.notes[0].contains("opencode gets the catalog's skills in a later AgentUX release")
+        );
+    }
+
+    #[test]
+    fn a_skill_that_fails_is_left_out_and_the_others_go_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        skill_dir(&repo.join("skills"), "good", "Body.");
+        let entries = [
+            entry("good", "skills/good", ToolSource::Project),
+            entry("missing", "skills/missing", ToolSource::Project),
+        ];
+        let store = Store::new(tmp.path().join("store"));
+        let dir = tmp.path().join("sessions/s2");
+        let out = deliver_with(&store, &dir, "codex", entries.iter().collect(), &repo);
+        assert!(dir.join(".agents/skills/good").is_dir());
+        assert!(!dir.join(".agents/skills/missing").exists());
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.starts_with("skills: `missing` from the project catalog left out")),
+            "{:?}",
+            out.notes
+        );
+
+        // Nothing delivered: no directory at all.
+        let only_bad = [entry("missing", "skills/missing", ToolSource::Project)];
+        let empty = tmp.path().join("sessions/s3");
+        let out = deliver_with(&store, &empty, "codex", only_bad.iter().collect(), &repo);
+        assert_eq!(out.dir, None);
+        assert!(!empty.exists());
+    }
+
+    #[test]
+    fn a_session_gets_at_most_32_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..33).map(|i| format!("s{i:02}")).collect();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (out, dir) = delivered(tmp.path(), "codex", &refs);
+        assert_eq!(
+            fs::read_dir(dir.join(".agents/skills")).unwrap().count(),
+            32
+        );
+        assert!(
+            out.notes
+                .iter()
+                .any(|n| n.contains("`s32`") && n.contains("at most 32 skills"))
+        );
     }
 }

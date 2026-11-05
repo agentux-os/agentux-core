@@ -59,6 +59,10 @@ pub struct LaunchSpec<'a> {
     pub load: Option<&'a str>,
     /// Run the harness in this sandbox (ADRs 0023 and 0024).
     pub sandbox: Option<&'a crate::sandbox::Profile>,
+    /// More workspace roots, and `_meta`, for `session/new` and
+    /// `session/load`: the tool catalog's skills (ADR 0026).
+    pub additional_directories: &'a [PathBuf],
+    pub meta: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Starts harness sessions. The daemon uses [`HarnessLauncher`]; tests plug in
@@ -104,6 +108,7 @@ impl Launcher for HarnessLauncher {
                 .with_mcp_servers(spec.mcp_servers.to_vec())
                 .with_model(spec.model.map(str::to_string))
                 .with_load(spec.load.map(str::to_string))
+                .with_skills(spec.additional_directories.to_vec(), spec.meta.cloned())
                 .start(spec.cwd, permissions)
                 .await
                 .map_err(|e| e.to_string())
@@ -126,6 +131,9 @@ struct Slot {
     mcp_servers: Vec<McpServer>,
     /// The sandbox it runs in, to reload it in the same one.
     sandbox: Option<crate::sandbox::Profile>,
+    /// Its skills (ADR 0026), to reload it with them.
+    additional_directories: Vec<PathBuf>,
+    meta: Option<serde_json::Map<String, serde_json::Value>>,
     /// The agent can reopen the session with `session/load`.
     can_load: bool,
     /// Handed over to the harness's TUI: turns wait (see
@@ -371,6 +379,8 @@ impl AcpExecutor {
             mcp_servers: &opened.mcp_servers,
             load: None,
             sandbox: opened.sandbox.as_ref(),
+            additional_directories: &opened.additional_directories,
+            meta: opened.meta.as_ref(),
         };
         match self.launcher.launch(spec, handler).await {
             Ok((session, events)) => {
@@ -406,6 +416,8 @@ impl AcpExecutor {
                     worktree: want.worktree.to_path_buf(),
                     mcp_servers: opened.mcp_servers,
                     sandbox: opened.sandbox,
+                    additional_directories: opened.additional_directories,
+                    meta: opened.meta,
                     can_load: session.can_load(),
                     attached: AtomicBool::new(false),
                     host: host_slot,
@@ -495,6 +507,8 @@ impl AcpExecutor {
             mcp_servers: &[],
             load: None,
             sandbox: None,
+            additional_directories: &[],
+            meta: None,
         };
         let (session, mut events) = self
             .launcher
@@ -736,6 +750,8 @@ impl StepExecutor for AcpExecutor {
                 mcp_servers: &slot.mcp_servers,
                 load: Some(&slot.vendor_id),
                 sandbox: slot.sandbox.as_ref(),
+                additional_directories: &slot.additional_directories,
+                meta: slot.meta.as_ref(),
             };
             let launched = self.launcher.launch(spec, handler).await;
             slot.attached.store(false, Ordering::SeqCst);

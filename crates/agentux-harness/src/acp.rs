@@ -2,7 +2,7 @@
 //! speaking ACP (protocol v1) over stdio, driven by the official
 //! `agent-client-protocol` SDK.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,6 +46,12 @@ pub struct SessionOptions {
     /// one with `session/new`. The agent must advertise `loadSession`. The
     /// history it replays while loading is not passed on as events.
     pub load: Option<String>,
+    /// More workspace roots (ACP `additionalDirectories`), e.g. the session's
+    /// skills directory (ADR 0026).
+    pub additional_directories: Vec<PathBuf>,
+    /// `_meta` of `session/new` and `session/load`, for an adapter's own
+    /// options (Claude Code's `claudeCode.options.plugins`).
+    pub meta: Option<acp::Meta>,
 }
 
 /// What became of the model asked for in [`SessionOptions::model`].
@@ -88,6 +94,18 @@ impl AcpHarness {
     /// Reopen this session (`session/load`) instead of creating a new one.
     pub fn with_load(mut self, session_id: Option<String>) -> Self {
         self.options.load = session_id;
+        self
+    }
+
+    /// More workspace roots and `_meta` for every session this harness
+    /// starts or reopens (the tool catalog's skills, ADR 0026).
+    pub fn with_skills(
+        mut self,
+        additional_directories: Vec<PathBuf>,
+        meta: Option<acp::Meta>,
+    ) -> Self {
+        self.options.additional_directories = additional_directories;
+        self.options.meta = meta;
         self
     }
 
@@ -251,7 +269,7 @@ impl AcpSession {
         let (session_id, config_options) = match &options.load {
             None => {
                 let session = connection
-                    .send_request(new_session_request(cwd, &mcp_servers))
+                    .send_request(new_session_request(cwd, &mcp_servers, options))
                     .block_task()
                     .await?;
                 (session.session_id, session.config_options)
@@ -263,7 +281,9 @@ impl AcpSession {
                 let loaded = connection
                     .send_request(
                         acp::LoadSessionRequest::new(session_id.clone(), cwd)
-                            .mcp_servers(acp_mcp_servers(&mcp_servers)),
+                            .mcp_servers(acp_mcp_servers(&mcp_servers))
+                            .additional_directories(options.additional_directories.clone())
+                            .meta(options.meta.clone()),
                     )
                     .block_task()
                     .await;
@@ -481,9 +501,17 @@ impl Drop for AgentProcess {
     }
 }
 
-/// The `session/new` request for `cwd`, with `mcp_servers` as stdio servers.
-fn new_session_request(cwd: &Path, servers: &[McpServer]) -> acp::NewSessionRequest {
-    acp::NewSessionRequest::new(cwd).mcp_servers(acp_mcp_servers(servers))
+/// The `session/new` request for `cwd`, with `mcp_servers` and the
+/// options' extra roots and `_meta`.
+fn new_session_request(
+    cwd: &Path,
+    servers: &[McpServer],
+    options: &SessionOptions,
+) -> acp::NewSessionRequest {
+    acp::NewSessionRequest::new(cwd)
+        .mcp_servers(acp_mcp_servers(servers))
+        .additional_directories(options.additional_directories.clone())
+        .meta(options.meta.clone())
 }
 
 /// `mcp_servers` as ACP servers: HTTP when they have a URL, stdio otherwise.
@@ -677,6 +705,38 @@ fn select_option(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_new_carries_the_skills_roots_and_meta() {
+        let mut meta = acp::Meta::new();
+        meta.insert(
+            "claudeCode".into(),
+            serde_json::json!({"options": {"plugins": [{"type": "local", "path": "/s/agentux"}]}}),
+        );
+        let options = SessionOptions {
+            additional_directories: vec![PathBuf::from("/s")],
+            meta: Some(meta),
+            ..SessionOptions::default()
+        };
+        let request =
+            serde_json::to_value(new_session_request(Path::new("/w"), &[], &options)).unwrap();
+        assert_eq!(request["additionalDirectories"], serde_json::json!(["/s"]));
+        assert_eq!(
+            request["_meta"]["claudeCode"]["options"]["plugins"][0]["path"],
+            "/s/agentux"
+        );
+        // Without skills, neither is sent.
+        let plain = serde_json::to_value(new_session_request(
+            Path::new("/w"),
+            &[],
+            &SessionOptions::default(),
+        ))
+        .unwrap();
+        assert!(
+            plain.get("additionalDirectories").is_none() && plain.get("_meta").is_none(),
+            "{plain}"
+        );
+    }
 
     fn option(id: &str, kind: acp::PermissionOptionKind) -> acp::PermissionOption {
         acp::PermissionOption::new(id.to_string(), id, kind)

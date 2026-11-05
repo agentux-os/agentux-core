@@ -128,6 +128,8 @@ impl Launcher for BusLauncher {
                 mcp_servers: spec.mcp_servers.to_vec(),
                 model: spec.model.map(str::to_string),
                 load: spec.load.map(str::to_string),
+                additional_directories: spec.additional_directories.to_vec(),
+                meta: spec.meta.cloned(),
             };
             AcpSession::connect_with(transport, spec.cwd, &options, permissions)
                 .await

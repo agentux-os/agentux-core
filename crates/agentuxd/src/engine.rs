@@ -2112,7 +2112,12 @@ impl Engine {
         &self,
         run_id: &str,
         harness: &str,
-    ) -> (Vec<agentux_harness::McpServer>, Option<String>, Vec<String>) {
+    ) -> (
+        Vec<agentux_harness::McpServer>,
+        Option<String>,
+        agentux_config::ToolCatalog,
+        Vec<String>,
+    ) {
         let mut notes = Vec::new();
         let project = self
             .inner
@@ -2132,7 +2137,8 @@ impl Engine {
         notes.extend(more);
         let (servers, more) = crate::tools::servers(&catalog, harness, crate::tools::secret);
         notes.extend(more);
-        (servers, catalog.instructions_for(harness), notes)
+        let instructions = catalog.instructions_for(harness);
+        (servers, instructions, catalog, notes)
     }
 }
 
@@ -2478,7 +2484,8 @@ impl StepHost for RunHost {
         }
         // The tool catalog's MCP servers, the same for every harness; the
         // run's log says which ones this session goes without.
-        let (tools, instructions, notes) = self.engine.session_tools(&self.run_id, harness);
+        let (tools, instructions, catalog, notes) =
+            self.engine.session_tools(&self.run_id, harness);
         mcp_servers.extend(tools);
         for note in notes {
             self.record("a tool catalog note", |tx| Ok(tx.log(&self.run_id, note)?));
@@ -2496,11 +2503,22 @@ impl StepHost for RunHost {
                     .join("\n\n"),
             ),
         };
+        // The catalog's skills, in a directory of this session's own (ADR
+        // 0026), read-only in the sandbox at the same path.
+        let skills = crate::skills::deliver(&catalog, harness, &session.id, Path::new(&self.cwd));
+        for note in skills.notes {
+            self.record("a skills note", |tx| Ok(tx.log(&self.run_id, note)?));
+        }
+        if let (Some(profile), Some(dir)) = (&mut sandbox, &skills.dir) {
+            profile.extra_read_only.push(dir.clone());
+        }
         Ok(OpenedSession {
             id: session.id,
             mcp_servers,
             system_prompt,
             sandbox,
+            additional_directories: skills.additional_directories,
+            meta: skills.meta,
         })
     }
 
@@ -2510,6 +2528,7 @@ impl StepHost for RunHost {
         });
         if state == SessionState::Ended {
             self.engine.bus_leave(session_id);
+            crate::skills::remove_session_dir(session_id);
         }
     }
 
