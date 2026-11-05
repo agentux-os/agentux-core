@@ -11,10 +11,11 @@ The node-alert contract assigns enrolled alert relay and authenticated
 organization/node scoping to the gateway. Runtime implementation remains
 tracked in Core #102.
 
-When enrolled, the gateway relays sequenced Core-owned alert events and binds
-exported state to the authenticated organization and node identity. Command
-projects the received state; it does not create, resolve, or rewrite Core alert
-identities or statuses. Command separately derives fleet presence (`online`,
+Once implemented, the gateway will relay sequenced Core-owned alert events and
+bind exported state to the authenticated organization and node identity.
+Command will project the received state; it will not create, resolve, or
+rewrite Core alert identities or statuses. Command separately derives fleet
+presence (`online`,
 `degraded`, and `offline`) from heartbeat freshness. Fleet presence is not a
 `node_alert`.
 
