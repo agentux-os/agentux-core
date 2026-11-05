@@ -972,7 +972,7 @@ impl Tx<'_> {
                 );
                 if !allowed {
                     return Err(Error::Data(format!(
-                        "invalid command lifecycle transition: {old_status} -> {}",
+                        "invalid command lifecycle transition: {old_status} -> {}; local reconciliation is required",
                         update.status.as_str()
                     )));
                 }
