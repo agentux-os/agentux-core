@@ -414,6 +414,9 @@ pub struct ToolsListing {
     /// The catalog's instructions (names, never needed to show their text).
     #[serde(default)]
     pub instructions: Vec<InstructionInfo>,
+    /// The catalog's skills (ADR 0026).
+    #[serde(default)]
+    pub skills: Vec<SkillInfo>,
     /// Catalog files that could not be used, and why.
     #[serde(default)]
     pub notes: Vec<String>,
@@ -443,6 +446,9 @@ pub struct ToolInfo {
     /// while one isn't.
     #[serde(default)]
     pub secrets: Vec<ToolSecret>,
+    /// A user or project entry of the same name is left out.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 /// One instruction of the tool catalog.
@@ -455,6 +461,28 @@ pub struct InstructionInfo {
     pub harnesses: Option<Vec<String>>,
     /// The text's length in characters.
     pub chars: usize,
+    /// A user or project entry of the same name is left out.
+    #[serde(default)]
+    pub locked: bool,
+}
+
+/// One skill of the tool catalog.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillInfo {
+    pub name: String,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harnesses: Option<Vec<String>>,
+    /// `path` or `git`.
+    pub origin: String,
+    /// The pinned commit of a `git` skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    #[serde(default)]
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

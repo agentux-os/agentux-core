@@ -649,6 +649,18 @@ fn tools_command(command: ToolsCommand) -> Result {
                 let (header, secret) = assignment(text, "--secret-header")?;
                 header_values.insert(header, EnvValue::Secret { secret });
             }
+            // A name the machine locked would be left out of every session.
+            if let Ok(machine) = ToolCatalog::from_file(
+                std::path::Path::new(agentux_config::TOOLS_MACHINE_FILE),
+                ToolSource::Machine,
+            ) && machine.mcp.get(&name).is_some_and(|t| t.locked)
+            {
+                return Err(format!(
+                    "`{name}` is locked by the machine catalog ({}); a user entry of that name would be left out",
+                    agentux_config::TOOLS_MACHINE_FILE
+                )
+                .into());
+            }
             let replaced = catalog.mcp.contains_key(&name);
             catalog.mcp.insert(
                 name.clone(),
@@ -660,6 +672,7 @@ fn tools_command(command: ToolsCommand) -> Result {
                     args,
                     env: values,
                     harnesses: (!harnesses.is_empty()).then_some(harnesses),
+                    locked: false,
                     source: ToolSource::User,
                 },
             );
@@ -745,7 +758,12 @@ fn tools(project: &std::path::Path, harness: Option<&str>) -> Result {
         if harness.is_some_and(|h| !entry.applies_to(h)) {
             continue;
         }
-        println!("{} (instructions, {} catalog)", entry.name, entry.source);
+        println!(
+            "{} (instructions, {} catalog{})",
+            entry.name,
+            entry.source,
+            if entry.locked { ", locked" } else { "" }
+        );
         match &entry.harnesses {
             Some(list) => println!("  harnesses: {}", list.join(", ")),
             None => println!("  harnesses: all"),
@@ -755,6 +773,39 @@ fn tools(project: &std::path::Path, harness: Option<&str>) -> Result {
             entry.text.chars().count()
         );
     }
+    for skill in catalog.skills.values() {
+        if harness.is_some_and(|h| !skill.applies_to(h)) {
+            continue;
+        }
+        println!(
+            "{} (skill, {} catalog{})",
+            skill.name,
+            skill.source,
+            if skill.locked { ", locked" } else { "" }
+        );
+        match (&skill.path, &skill.git) {
+            (Some(path), _) => println!("  path: {path}"),
+            (None, Some(git)) => {
+                let at = skill
+                    .subdir
+                    .as_deref()
+                    .map(|d| format!(" {d}"))
+                    .unwrap_or_default();
+                println!(
+                    "  git: {git} at {}{at}",
+                    skill.rev.as_deref().unwrap_or("?")
+                );
+            }
+            (None, None) => {}
+        }
+        if let Some(digest) = &skill.digest {
+            println!("  digest: {digest}");
+        }
+        match &skill.harnesses {
+            Some(list) => println!("  harnesses: {}", list.join(", ")),
+            None => println!("  harnesses: all"),
+        }
+    }
     for tool in catalog.mcp.values() {
         if harness.is_some_and(|h| !tool.applies_to(h)) {
             continue;
@@ -763,7 +814,12 @@ fn tools(project: &std::path::Path, harness: Option<&str>) -> Result {
             .chain(tool.args.iter().map(String::as_str))
             .collect::<Vec<_>>()
             .join(" ");
-        println!("{} ({} catalog)", tool.name, tool.source);
+        println!(
+            "{} ({} catalog{})",
+            tool.name,
+            tool.source,
+            if tool.locked { ", locked" } else { "" }
+        );
         match &tool.url {
             Some(url) => println!("  url: {url}"),
             None => println!("  command: {command}"),
