@@ -180,6 +180,94 @@ async fn api_round_trip_over_a_unix_socket() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn gateway_harness_inventory_is_durable_and_captured_with_its_event_head() {
+    let f = fixture(&pipeline("true"));
+    let socket = f.tmp.path().join("run").join("agentuxd.sock");
+    let engine = f.engine(Arc::new(FakeExecutor::default()));
+    let (stop, stopped) = oneshot::channel::<()>();
+    let server = tokio::spawn({
+        let socket = socket.clone();
+        async move {
+            server::serve(engine, &socket, async {
+                let _ = stopped.await;
+            })
+            .await
+        }
+    });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "socket never appeared"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut client = Client::connect(&socket).await.unwrap();
+    let harness = rpc::HarnessInfo {
+        id: "codex".into(),
+        command: "codex".into(),
+        installed: true,
+        signed_in: Some(true),
+        experimental: false,
+        limits: vec![],
+        version: Some("1.2.3".into()),
+        usage: Default::default(),
+        quota: vec![],
+    };
+    assert_eq!(
+        client
+            .replace_harness_inventory(std::slice::from_ref(&harness))
+            .await
+            .unwrap(),
+        Some(1)
+    );
+    let capture = client.snapshot_source_capture("org-a").await.unwrap();
+    assert_eq!(capture["capturedEventHead"], 1);
+    assert_eq!(capture["harnesses"][0]["id"], "codex");
+    assert_eq!(capture["harnesses"][0]["updatedSequence"], 1);
+    assert_eq!(
+        capture["harnesses"][0]["state"]["currentState"]["installed"],
+        true
+    );
+
+    let now = agentux_store::now_ms();
+    let materialization = rpc::SnapshotMaterialization {
+        organization_id: "org-a".into(),
+        node_id: "node-a".into(),
+        checkpoint_id: "checkpoint-1".into(),
+        snapshot_id: "snapshot-1".into(),
+        captured_event_head: 1,
+        created_at_ms: now,
+        expires_at_ms: now + agentux_store::snapshot::MIN_RETENTION.as_millis() as i64,
+        high_water_sequence: 1,
+        payload: serde_json::json!({"entries": []}),
+    };
+    let binding = rpc::SnapshotBinding {
+        organization_id: "org-a".into(),
+        node_id: "node-a".into(),
+        checkpoint_id: "checkpoint-1".into(),
+        snapshot_id: "snapshot-1".into(),
+        captured_event_head: 1,
+        high_water_sequence: 1,
+    };
+    assert_eq!(
+        client.materialize_snapshot(&materialization).await.unwrap(),
+        binding
+    );
+    assert_eq!(
+        client
+            .snapshot_binding("org-a", "node-a", "checkpoint-1")
+            .await
+            .unwrap(),
+        Some(binding)
+    );
+
+    let _ = stop.send(());
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_project_describes_the_run_it_would_start() {
     let yaml = pipeline("cargo test").replace(
         "  planner:\n    harness: fake-a\n",

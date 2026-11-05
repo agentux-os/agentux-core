@@ -50,12 +50,10 @@ impl ProjectionKind {
         match self {
             Self::Approval | Self::Limit | Self::Run | Self::Session => SourceKind::Sourced,
             Self::Gate => SourceKind::Derived,
-            Self::Artifact
-            | Self::Command
-            | Self::Harness
-            | Self::Node
-            | Self::NodeAlert
-            | Self::Task => SourceKind::Unavailable,
+            Self::Harness => SourceKind::Sourced,
+            Self::Artifact | Self::Command | Self::Node | Self::NodeAlert | Self::Task => {
+                SourceKind::Unavailable
+            }
         }
     }
 }
@@ -87,8 +85,7 @@ pub fn unavailable_projections() -> Vec<UnavailableProjection> {
             ProjectionKind::Command => Some(
                 "durable storage exists, but the authenticated gateway command lifecycle producer is not connected",
             ),
-            ProjectionKind::Harness => Some("installed harness inventory is runtime-derived and not durably materialized"),
-            ProjectionKind::Node => Some("node identity and heartbeat state are gateway-owned, not in the agentux-store transaction"),
+            ProjectionKind::Node => Some("authoritative node state and its sequence are not yet persisted in the Core SQLite transaction"),
             ProjectionKind::NodeAlert => Some("Core has no durable node alert projection"),
             ProjectionKind::Task => Some(
                 "durable storage exists, but the typed task lifecycle producer is not connected",
@@ -124,6 +121,18 @@ pub struct BusinessProjectionEntry {
     pub organization_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<Value>,
+    pub updated_sequence: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at_sequence: Option<i64>,
+}
+
+/// A local harness projection and its last state/removal sequence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessProjectionEntry {
+    pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<Value>,
     pub updated_sequence: i64,
@@ -200,6 +209,8 @@ pub struct DurableCapture {
     pub approvals: Vec<PermissionRequest>,
     pub sessions: Vec<Session>,
     pub limits: Vec<HarnessLimit>,
+    /// Durable local harness inventory and retained removals.
+    pub harnesses: Vec<HarnessProjectionEntry>,
     /// Gate state is derived solely from the durable run checks and attempt counters.
     pub gates: Vec<Value>,
     /// Explicitly written business state and retained tombstones for the

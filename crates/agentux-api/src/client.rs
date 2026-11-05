@@ -91,6 +91,20 @@ impl Client {
         self.call(method::HARNESSES_LIST, &()).await
     }
 
+    /// Replaces Core's durable harness inventory with one complete gateway observation.
+    pub async fn replace_harness_inventory(
+        &mut self,
+        harnesses: &[rpc::HarnessInfo],
+    ) -> Result<Option<i64>, ClientError> {
+        self.call(
+            method::HARNESS_INVENTORY_REPLACE,
+            &rpc::HarnessInventory {
+                harnesses: harnesses.to_vec(),
+            },
+        )
+        .await
+    }
+
     pub async fn test_harness(
         &mut self,
         params: &rpc::TestHarness,
@@ -170,6 +184,33 @@ impl Client {
             method::SNAPSHOT_SOURCE_CAPTURE,
             &rpc::SnapshotSourceCapture {
                 organization_id: organization_id.into(),
+            },
+        )
+        .await
+    }
+
+    /// Atomically stores immutable checkpoint pages and their sequence binding.
+    pub async fn materialize_snapshot(
+        &mut self,
+        materialization: &rpc::SnapshotMaterialization,
+    ) -> Result<rpc::SnapshotBinding, ClientError> {
+        self.call(method::SNAPSHOT_MATERIALIZE, materialization)
+            .await
+    }
+
+    /// Reads the immutable sequence binding for checkpoint recovery.
+    pub async fn snapshot_binding(
+        &mut self,
+        organization_id: &str,
+        node_id: &str,
+        checkpoint_id: &str,
+    ) -> Result<Option<rpc::SnapshotBinding>, ClientError> {
+        self.call(
+            method::SNAPSHOT_BINDING_GET,
+            &rpc::SnapshotBindingRef {
+                organization_id: organization_id.into(),
+                node_id: node_id.into(),
+                checkpoint_id: checkpoint_id.into(),
             },
         )
         .await

@@ -84,6 +84,227 @@ fn business_projection(
     }
 }
 
+fn harness_info(id: &str, installed: bool) -> agentux_api::rpc::HarnessInfo {
+    agentux_api::rpc::HarnessInfo {
+        id: id.into(),
+        command: format!("{id}-cli"),
+        installed,
+        signed_in: Some(installed),
+        experimental: false,
+        limits: vec![],
+        version: Some("1.2.3".into()),
+        usage: Default::default(),
+        quota: vec![],
+    }
+}
+
+#[test]
+fn harness_source_updates_tombstones_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let store = Store::open(&path).unwrap();
+
+    let duplicate = store.write(|tx| {
+        tx.replace_harness_inventory(&[harness_info("codex", true), harness_info("codex", false)])
+    });
+    assert!(duplicate.is_err());
+    assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 0);
+
+    let created_sequence = store
+        .write(|tx| tx.replace_harness_inventory(&[harness_info("codex", true)]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(created_sequence, 1);
+    let initial = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    let state = initial.harnesses[0].state.as_ref().unwrap();
+    assert_eq!(state["harnessId"], "codex");
+    assert_eq!(state["currentState"]["installed"], true);
+    assert!(state.get("command").is_none());
+    assert!(state.get("token").is_none());
+    assert_eq!(
+        store
+            .write(|tx| tx.replace_harness_inventory(&[harness_info("codex", true)]))
+            .unwrap(),
+        None
+    );
+
+    let updated_sequence = store
+        .write(|tx| tx.replace_harness_inventory(&[harness_info("codex", false)]))
+        .unwrap()
+        .unwrap();
+    let removed_sequence = store
+        .write(|tx| tx.replace_harness_inventory(&[]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(updated_sequence, 2);
+    assert_eq!(removed_sequence, 3);
+    drop(store);
+
+    let reopened = Store::open(&path).unwrap();
+    let captured = reopened
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    assert_eq!(captured.captured_event_head, 3);
+    assert_eq!(captured.harnesses.len(), 1);
+    assert_eq!(captured.harnesses[0].id, "codex");
+    assert_eq!(captured.harnesses[0].removed_at_sequence, Some(3));
+    assert_eq!(captured.harnesses[0].updated_sequence, 3);
+    assert_eq!(captured.harnesses[0].state, None);
+
+    let events = reopened.read(|tx| tx.events_since(0, None)).unwrap();
+    assert!(matches!(
+        &events[0].body,
+        EventBody::HarnessStatus { harnesses } if harnesses.len() == 1
+    ));
+    assert!(matches!(
+        &events[1].body,
+        EventBody::HarnessStatus { harnesses } if !harnesses[0].installed
+    ));
+    assert!(matches!(
+        &events[2].body,
+        EventBody::HarnessStatus { harnesses } if harnesses.is_empty()
+    ));
+}
+
+#[test]
+fn harness_inventory_is_unavailable_until_the_gateway_observes_it() {
+    let store = Store::open_in_memory().unwrap();
+    let before = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    assert!(
+        before
+            .unavailable
+            .iter()
+            .any(|entry| entry.kind == snapshot::ProjectionKind::Harness)
+    );
+
+    assert_eq!(
+        store.write(|tx| tx.replace_harness_inventory(&[])).unwrap(),
+        Some(1)
+    );
+    let after = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    assert!(
+        !after
+            .unavailable
+            .iter()
+            .any(|entry| entry.kind == snapshot::ProjectionKind::Harness)
+    );
+    assert!(after.harnesses.is_empty());
+    assert_eq!(after.captured_event_head, 1);
+}
+
+#[test]
+fn harness_capture_matches_the_last_committed_inventory_event_under_concurrency() {
+    use std::sync::Barrier;
+
+    let store = Store::open_in_memory().unwrap();
+    store
+        .write(|tx| tx.replace_harness_inventory(&[harness_info("codex", true)]))
+        .unwrap();
+    let barrier = std::sync::Arc::new(Barrier::new(2));
+    let writer_store = store.clone();
+    let writer_barrier = barrier.clone();
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        for index in 0..100 {
+            writer_store
+                .write(|tx| tx.replace_harness_inventory(&[harness_info("codex", index % 2 == 0)]))
+                .unwrap();
+            std::thread::yield_now();
+        }
+    });
+    let reader_store = store.clone();
+    let reader = std::thread::spawn(move || {
+        barrier.wait();
+        for _ in 0..100 {
+            let (captured, events) = reader_store
+                .read(|tx| {
+                    Ok::<_, Error>((
+                        tx.capture_checkpoint_sources("org-a", now_ms())?,
+                        tx.events_since(0, None)?,
+                    ))
+                })
+                .unwrap();
+            let (sequence, event_installed) = events
+                .iter()
+                .filter_map(|event| match &event.body {
+                    EventBody::HarnessStatus { harnesses }
+                        if event.seq <= captured.captured_event_head =>
+                    {
+                        Some((event.seq, harnesses[0].installed))
+                    }
+                    _ => None,
+                })
+                .last()
+                .unwrap();
+            let source = captured
+                .harnesses
+                .iter()
+                .find(|entry| entry.id == "codex")
+                .unwrap();
+            assert_eq!(source.updated_sequence, sequence);
+            assert_eq!(source.state.as_ref().unwrap()["installed"], event_installed);
+        }
+    });
+    writer.join().unwrap();
+    reader.join().unwrap();
+}
+
+#[test]
+fn snapshot_binding_is_immutable_and_survives_restart_in_core_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let store = Store::open(&path).unwrap();
+    let now = now_ms();
+    let materialized = snapshot::MaterializedSnapshot {
+        organization_id: "org-a".into(),
+        node_id: "node-a".into(),
+        checkpoint_id: "checkpoint-1".into(),
+        snapshot_id: "snapshot-1".into(),
+        captured_event_head: 0,
+        created_at_ms: now,
+        expires_at_ms: now + snapshot::MIN_RETENTION.as_millis() as i64,
+        payload: serde_json::json!({"entries": []}),
+    };
+    let binding = agentux_api::rpc::SnapshotBinding {
+        organization_id: "org-a".into(),
+        node_id: "node-a".into(),
+        checkpoint_id: "checkpoint-1".into(),
+        snapshot_id: "snapshot-1".into(),
+        captured_event_head: 0,
+        high_water_sequence: 7,
+    };
+    let stored = store
+        .write(|tx| {
+            tx.materialize_snapshot(&materialized)?;
+            tx.bind_snapshot(&binding)
+        })
+        .unwrap();
+    assert_eq!(stored, binding);
+    assert_eq!(
+        store.write(|tx| tx.bind_snapshot(&binding)).unwrap(),
+        binding
+    );
+
+    let mut conflict = binding.clone();
+    conflict.high_water_sequence = 8;
+    assert!(store.write(|tx| tx.bind_snapshot(&conflict)).is_err());
+    drop(store);
+
+    let reopened = Store::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .read(|tx| tx.snapshot_binding("org-a", "node-a", "checkpoint-1"))
+            .unwrap(),
+        Some(binding)
+    );
+}
+
 #[test]
 fn business_projection_validation_accepts_protocol_minimum_state() {
     for (projection_type, id, id_field, run_id, status) in [
@@ -847,7 +1068,7 @@ fn snapshot_source_marks_unsupported_projections_unavailable() {
             SourceKind::Unavailable,
             SourceKind::Unavailable,
             SourceKind::Derived,
-            SourceKind::Unavailable,
+            SourceKind::Sourced,
             SourceKind::Sourced,
             SourceKind::Unavailable,
             SourceKind::Unavailable,

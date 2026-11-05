@@ -267,6 +267,15 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
         }
         method::RUNS_START => to_value(engine.start_run(parse(params)?)),
         method::HARNESSES_LIST => to_value(Ok(engine.harnesses().await)),
+        method::HARNESS_INVENTORY_REPLACE => {
+            let params: rpc::HarnessInventory = parse(params)?;
+            to_value(
+                engine
+                    .store()
+                    .write(|tx| tx.replace_harness_inventory(&params.harnesses))
+                    .map_err(Error::from),
+            )
+        }
         method::HARNESSES_TEST => to_value(engine.test_harness(parse(params)?).await),
         method::PREFERENCES_GET => to_value(engine.get_prefs()),
         method::PREFERENCES_SET => {
@@ -317,6 +326,60 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
                         tx.capture_checkpoint_sources(
                             &params.organization_id,
                             agentux_store::now_ms(),
+                        )
+                    })
+                    .map_err(Error::from),
+            )
+        }
+        method::SNAPSHOT_MATERIALIZE => {
+            let materialization: rpc::SnapshotMaterialization = parse(params)?;
+            let snapshot = agentux_store::snapshot::MaterializedSnapshot {
+                organization_id: materialization.organization_id.clone(),
+                node_id: materialization.node_id.clone(),
+                checkpoint_id: materialization.checkpoint_id.clone(),
+                snapshot_id: materialization.snapshot_id.clone(),
+                captured_event_head: materialization.captured_event_head,
+                created_at_ms: materialization.created_at_ms,
+                expires_at_ms: materialization.expires_at_ms,
+                payload: materialization.payload,
+            };
+            let binding = rpc::SnapshotBinding {
+                organization_id: materialization.organization_id,
+                node_id: materialization.node_id,
+                checkpoint_id: materialization.checkpoint_id,
+                snapshot_id: materialization.snapshot_id,
+                captured_event_head: materialization.captured_event_head,
+                high_water_sequence: materialization.high_water_sequence,
+            };
+            to_value(
+                engine
+                    .store()
+                    .write(|tx| {
+                        tx.materialize_snapshot(&snapshot)?;
+                        tx.bind_snapshot(&binding)
+                    })
+                    .map_err(Error::from),
+            )
+        }
+        method::SNAPSHOT_BINDING_GET => {
+            let request: rpc::SnapshotBindingRef = parse(params)?;
+            if request.organization_id.trim().is_empty()
+                || request.node_id.trim().is_empty()
+                || request.checkpoint_id.trim().is_empty()
+            {
+                return Err(rpc::Error::new(
+                    code::INVALID_PARAMS,
+                    "organizationId, nodeId, and checkpointId are required",
+                ));
+            }
+            to_value(
+                engine
+                    .store()
+                    .read(|tx| {
+                        tx.snapshot_binding(
+                            &request.organization_id,
+                            &request.node_id,
+                            &request.checkpoint_id,
                         )
                     })
                     .map_err(Error::from),

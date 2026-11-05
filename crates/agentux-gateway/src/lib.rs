@@ -309,18 +309,6 @@ pub struct State {
     pub sessions: BTreeMap<String, SessionContext>,
     #[serde(default)]
     pub run_origins: BTreeMap<String, RunOrigin>,
-    #[serde(default)]
-    pub snapshot_bindings: BTreeMap<String, SnapshotBinding>,
-}
-
-/// Durable sequence binding for a completed local capture. It is data-layer
-/// groundwork only; no AUXP checkpoint is served while coverage is incomplete.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SnapshotBinding {
-    pub snapshot_id: String,
-    pub captured_local_event_head: i64,
-    pub high_water_sequence: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -411,24 +399,16 @@ impl Messages {
         self.state.last_sequence
     }
 
-    /// Bind a captured SQLite head only after the serial gateway event loop
-    /// has sequenced every local event through that head.
-    pub fn bind_snapshot(
-        &mut self,
+    /// Prepare an immutable Core-owned binding after the serial gateway event
+    /// loop has sequenced every local event through the captured head.
+    pub fn snapshot_binding_candidate(
+        &self,
         checkpoint_id: &str,
         snapshot_id: &str,
         local_event_head: i64,
-    ) -> Result<SnapshotBinding, String> {
+    ) -> Result<agentux_api::rpc::SnapshotBinding, String> {
         if checkpoint_id.is_empty() || snapshot_id.is_empty() || local_event_head < 0 {
             return Err("snapshot binding identifiers and event head are invalid".into());
-        }
-        if let Some(existing) = self.state.snapshot_bindings.get(checkpoint_id) {
-            if existing.snapshot_id == snapshot_id
-                && existing.captured_local_event_head == local_event_head
-            {
-                return Ok(existing.clone());
-            }
-            return Err("checkpoint id already has a different sequence binding".into());
         }
         if self.state.last_local_event_sequence != local_event_head {
             return Err(format!(
@@ -436,16 +416,58 @@ impl Messages {
                 self.state.last_local_event_sequence
             ));
         }
-        let binding = SnapshotBinding {
+        Ok(agentux_api::rpc::SnapshotBinding {
+            organization_id: self.config.organization_id.clone(),
+            node_id: self.config.node_id.clone(),
+            checkpoint_id: checkpoint_id.into(),
             snapshot_id: snapshot_id.into(),
-            captured_local_event_head: local_event_head,
+            captured_event_head: local_event_head,
             high_water_sequence: self.state.last_sequence,
-        };
-        self.state
-            .snapshot_bindings
-            .insert(checkpoint_id.into(), binding.clone());
-        self.persist()?;
-        Ok(binding)
+        })
+    }
+
+    pub async fn materialize_and_bind_snapshot(
+        &self,
+        client: &mut agentux_api::Client,
+        checkpoint_id: &str,
+        snapshot_id: &str,
+        local_event_head: i64,
+        payload: Value,
+        created_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<agentux_api::rpc::SnapshotBinding, String> {
+        if let Some(existing) = client
+            .snapshot_binding(
+                &self.config.organization_id,
+                &self.config.node_id,
+                checkpoint_id,
+            )
+            .await
+            .map_err(|error| format!("cannot read snapshot sequence binding: {error}"))?
+        {
+            if existing.snapshot_id == snapshot_id
+                && existing.captured_event_head == local_event_head
+            {
+                return Ok(existing);
+            }
+            return Err("checkpoint id already has a different sequence binding".into());
+        }
+        let binding =
+            self.snapshot_binding_candidate(checkpoint_id, snapshot_id, local_event_head)?;
+        client
+            .materialize_snapshot(&agentux_api::rpc::SnapshotMaterialization {
+                organization_id: binding.organization_id,
+                node_id: binding.node_id,
+                checkpoint_id: binding.checkpoint_id,
+                snapshot_id: binding.snapshot_id,
+                captured_event_head: binding.captured_event_head,
+                created_at_ms,
+                expires_at_ms,
+                high_water_sequence: binding.high_water_sequence,
+                payload,
+            })
+            .await
+            .map_err(|error| format!("cannot persist snapshot materialization: {error}"))
     }
 
     fn base(&mut self, extra: Value) -> Map<String, Value> {
@@ -571,6 +593,7 @@ impl Messages {
                 Some(self.event("approval.requested", request_json(request)))
             }
             EventBody::Limits { limits } => Some(self.limits_changed(limits)),
+            EventBody::HarnessStatus { harnesses } => Some(self.harness_status(harnesses)),
             EventBody::Session { session } => {
                 if session.state == SessionState::Ended {
                     self.state.sessions.remove(&session.id);
@@ -1082,7 +1105,6 @@ async fn run_loop(
     let mut heartbeat = tokio::time::interval(HEARTBEAT_EVERY);
     let mut harness_poll = tokio::time::interval(HARNESSES_EVERY);
     let mut retry = tokio::time::interval(Duration::from_secs(5));
-    let mut last_harnesses: Option<Value> = None;
     let mut reachable = true;
 
     loop {
@@ -1128,11 +1150,8 @@ async fn run_loop(
                 }
                 _ = harness_poll.tick() => {
                     if let Ok(harnesses) = client.harnesses().await {
-                        let snapshot = serde_json::to_value(&harnesses).ok();
-                        if snapshot != last_harnesses {
-                            outbox.push(messages.harness_status(&harnesses));
-                            messages.commit_outbox(&outbox)?;
-                            last_harnesses = snapshot;
+                        if let Err(error) = client.replace_harness_inventory(&harnesses).await {
+                            log(&format!("cannot persist harness inventory: {error}"));
                         }
                     }
                 }
@@ -1245,20 +1264,61 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_binding_requires_the_local_event_stream_to_reach_the_capture_head() {
+    fn durable_harness_inventory_events_relay_as_harness_status() {
         let mut messages = Messages::new(config(), None).unwrap();
-        assert!(messages.bind_snapshot("cp", "snap", 3).is_err());
+        let event = Event {
+            seq: 1,
+            at: 1,
+            run_id: None,
+            body: EventBody::HarnessStatus {
+                harnesses: vec![HarnessInfo {
+                    id: "codex".into(),
+                    command: "codex".into(),
+                    installed: true,
+                    signed_in: Some(true),
+                    experimental: false,
+                    limits: vec![],
+                    version: Some("1.2.3".into()),
+                    usage: Default::default(),
+                    quota: vec![],
+                }],
+            },
+        };
+        let message = messages.from_event(&event).unwrap();
+        assert_eq!(message["method"], "harness.status");
+        assert_eq!(message["params"]["sequence"], 1);
+        assert_eq!(message["params"]["harnesses"][0]["id"], "codex");
+    }
+
+    #[test]
+    fn snapshot_binding_candidate_requires_the_local_event_stream_to_reach_the_capture_head() {
+        let mut messages = Messages::new(config(), None).unwrap();
+        assert!(
+            messages
+                .snapshot_binding_candidate("cp", "snap", 3)
+                .is_err()
+        );
         for seq in 1..=3 {
             let outbox = messages.pending_outbox();
             messages.commit_local_event(seq, &outbox).unwrap();
         }
-        let binding = messages.bind_snapshot("cp", "snap", 3).unwrap();
+        let binding = messages
+            .snapshot_binding_candidate("cp", "snap", 3)
+            .unwrap();
         assert_eq!(binding.high_water_sequence, 0);
-        assert_eq!(messages.bind_snapshot("cp", "snap", 3).unwrap(), binding);
-        assert!(messages.bind_snapshot("cp", "other", 3).is_err());
+        assert_eq!(
+            messages
+                .snapshot_binding_candidate("cp", "snap", 3)
+                .unwrap(),
+            binding
+        );
+        assert!(messages.snapshot_binding_candidate("", "snap", 3).is_err());
         let after = messages.custom_event("run.updated", json!({"runId":"r1"}));
         assert_eq!(after["params"]["sequence"], 1);
-        assert_eq!(messages.bind_snapshot("cp", "snap", 3).unwrap(), binding);
+        let later = messages
+            .snapshot_binding_candidate("cp", "snap", 3)
+            .unwrap();
+        assert_ne!(later.high_water_sequence, binding.high_water_sequence);
     }
 
     fn config() -> NodeConfig {

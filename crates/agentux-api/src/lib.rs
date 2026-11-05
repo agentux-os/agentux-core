@@ -577,6 +577,10 @@ pub enum EventBody {
     Limits {
         limits: Vec<HarnessLimit>,
     },
+    /// Complete harness inventory captured by Core at one local event sequence.
+    HarnessStatus {
+        harnesses: Vec<rpc::HarnessInfo>,
+    },
     /// A typed durable projection changed. The projection body lives in the
     /// store; this marker gives the change a position in the event sequence.
     SnapshotProjectionChanged {
