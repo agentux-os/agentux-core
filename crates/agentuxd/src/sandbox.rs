@@ -113,6 +113,12 @@ impl Profile {
             .join(&self.harness)
     }
 
+    /// The variables the harness gets for its state in the sandbox
+    /// (OpenCode's `XDG_CONFIG_HOME`, ...).
+    pub fn harness_env(&self) -> Vec<(String, String)> {
+        self.sandbox.env(&self.state_dir())
+    }
+
     fn npm_cache(&self) -> PathBuf {
         self.home.join(SANDBOX_DIR).join("npm")
     }
