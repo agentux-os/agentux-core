@@ -429,43 +429,34 @@ impl Messages {
     pub async fn materialize_and_bind_snapshot(
         &self,
         client: &mut agentux_api::Client,
-        checkpoint_id: &str,
-        snapshot_id: &str,
-        local_event_head: i64,
-        payload: Value,
-        created_at_ms: i64,
-        expires_at_ms: i64,
+        mut materialization: agentux_api::rpc::SnapshotMaterialization,
     ) -> Result<agentux_api::rpc::SnapshotBinding, String> {
         if let Some(existing) = client
             .snapshot_binding(
                 &self.config.organization_id,
                 &self.config.node_id,
-                checkpoint_id,
+                &materialization.checkpoint_id,
             )
             .await
             .map_err(|error| format!("cannot read snapshot sequence binding: {error}"))?
         {
-            if existing.snapshot_id == snapshot_id
-                && existing.captured_event_head == local_event_head
+            if existing.snapshot_id == materialization.snapshot_id
+                && existing.captured_event_head == materialization.captured_event_head
             {
                 return Ok(existing);
             }
             return Err("checkpoint id already has a different sequence binding".into());
         }
-        let binding =
-            self.snapshot_binding_candidate(checkpoint_id, snapshot_id, local_event_head)?;
+        let binding = self.snapshot_binding_candidate(
+            &materialization.checkpoint_id,
+            &materialization.snapshot_id,
+            materialization.captured_event_head,
+        )?;
+        materialization.organization_id = binding.organization_id;
+        materialization.node_id = binding.node_id;
+        materialization.high_water_sequence = binding.high_water_sequence;
         client
-            .materialize_snapshot(&agentux_api::rpc::SnapshotMaterialization {
-                organization_id: binding.organization_id,
-                node_id: binding.node_id,
-                checkpoint_id: binding.checkpoint_id,
-                snapshot_id: binding.snapshot_id,
-                captured_event_head: binding.captured_event_head,
-                created_at_ms,
-                expires_at_ms,
-                high_water_sequence: binding.high_water_sequence,
-                payload,
-            })
+            .materialize_snapshot(&materialization)
             .await
             .map_err(|error| format!("cannot persist snapshot materialization: {error}"))
     }
@@ -1149,10 +1140,9 @@ async fn run_loop(
                     messages.commit_outbox(&outbox)?;
                 }
                 _ = harness_poll.tick() => {
-                    if let Ok(harnesses) = client.harnesses().await {
-                        if let Err(error) = client.replace_harness_inventory(&harnesses).await {
-                            log(&format!("cannot persist harness inventory: {error}"));
-                        }
+                    if let Ok(harnesses) = client.harnesses().await
+                        && let Err(error) = client.replace_harness_inventory(&harnesses).await {
+                        log(&format!("cannot persist harness inventory: {error}"));
                     }
                 }
                 event = events.next() => match event {

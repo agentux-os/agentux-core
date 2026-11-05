@@ -272,17 +272,38 @@ fn harness_projection_state(harness: &HarnessInfo) -> Result<serde_json::Value> 
     current_state.insert("installed".into(), harness.installed.into());
     current_state.insert("signedIn".into(), harness.signed_in.into());
     current_state.insert("experimental".into(), harness.experimental.into());
-    current_state.insert("version".into(), to_json(&harness.version)?);
-    current_state.insert("usage".into(), to_json(&harness.usage)?);
-    current_state.insert("limits".into(), to_json(&harness.limits)?);
+    current_state.insert(
+        "version".into(),
+        serde_json::to_value(&harness.version).map_err(|error| Error::Data(error.to_string()))?,
+    );
+    current_state.insert(
+        "usage".into(),
+        serde_json::to_value(&harness.usage).map_err(|error| Error::Data(error.to_string()))?,
+    );
+    current_state.insert(
+        "limits".into(),
+        serde_json::to_value(&harness.limits).map_err(|error| Error::Data(error.to_string()))?,
+    );
     let quota = harness
         .quota
         .iter()
         .map(|quota| {
             let mut value = serde_json::Map::new();
-            value.insert("label".into(), to_json(&quota.label)?);
-            value.insert("usedPercent".into(), to_json(&quota.used_percent)?);
-            value.insert("resetsAt".into(), to_json(&quota.resets_at)?);
+            value.insert(
+                "label".into(),
+                serde_json::to_value(&quota.label)
+                    .map_err(|error| Error::Data(error.to_string()))?,
+            );
+            value.insert(
+                "usedPercent".into(),
+                serde_json::to_value(&quota.used_percent)
+                    .map_err(|error| Error::Data(error.to_string()))?,
+            );
+            value.insert(
+                "resetsAt".into(),
+                serde_json::to_value(&quota.resets_at)
+                    .map_err(|error| Error::Data(error.to_string()))?,
+            );
             Ok(serde_json::Value::Object(value))
         })
         .collect::<Result<Vec<_>>>()?;
