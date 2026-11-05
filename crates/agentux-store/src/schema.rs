@@ -166,7 +166,7 @@ const MIGRATIONS: &[&str] = &[
         current_state    TEXT,
         updated_sequence INTEGER NOT NULL,
         removed_sequence INTEGER,
-        PRIMARY KEY (projection_type, projection_id),
+        PRIMARY KEY (organization_id, projection_type, projection_id),
         CHECK ((current_state IS NULL) = (removed_sequence IS NOT NULL))
     );
     CREATE INDEX snapshot_business_projections_by_org

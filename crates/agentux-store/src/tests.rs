@@ -85,6 +85,66 @@ fn business_projection(
 }
 
 #[test]
+fn business_projection_validation_accepts_protocol_minimum_state() {
+    for (projection_type, id, id_field) in [
+        (
+            snapshot::BusinessProjectionKind::Artifact,
+            "artifact-1",
+            "artifactId",
+        ),
+        (snapshot::BusinessProjectionKind::Task, "task-1", "taskId"),
+        (
+            snapshot::BusinessProjectionKind::Command,
+            "command-1",
+            "commandId",
+        ),
+    ] {
+        let current = serde_json::json!({ id_field: id, "organizationId": "org-a" });
+        let projection = snapshot::BusinessProjection {
+            projection_type,
+            id: id.into(),
+            organization_id: "org-a".into(),
+            run_id: None,
+            state: serde_json::json!({
+                id_field: id,
+                "organizationId": "org-a",
+                "currentState": current,
+            }),
+        };
+        projection.validate().unwrap();
+    }
+}
+
+#[test]
+fn same_projection_id_can_exist_in_separate_organizations() {
+    let store = Store::open_in_memory().unwrap();
+    for organization_id in ["org-a", "org-b"] {
+        let projection = business_projection(
+            snapshot::BusinessProjectionKind::Command,
+            "command-shared-id",
+            organization_id,
+            None,
+            "completed",
+        );
+        store
+            .write(|tx| tx.upsert_business_projection(&projection))
+            .unwrap();
+    }
+    for organization_id in ["org-a", "org-b"] {
+        let captured = store
+            .read(|tx| tx.capture_checkpoint_sources(organization_id, now_ms()))
+            .unwrap();
+        let entries = captured
+            .business_projections
+            .iter()
+            .filter(|entry| entry.id == "command-shared-id")
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].organization_id, organization_id);
+    }
+}
+
+#[test]
 fn business_projections_round_trip_update_tombstone_and_isolate_organizations() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
@@ -154,7 +214,8 @@ fn business_projections_round_trip_update_tombstone_and_isolate_organizations() 
                 .iter()
                 .all(|entry| entry.id != id)
         );
-        let wrong_owner = business_projection(kind, id, "org-b", run_id, "failed");
+        let wrong_owner =
+            business_projection(kind, id, "org-b", Some(run.run.id.as_str()), "failed");
         assert!(
             store
                 .write(|tx| tx.upsert_business_projection(&wrong_owner))

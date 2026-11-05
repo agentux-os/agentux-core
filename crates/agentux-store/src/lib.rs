@@ -550,24 +550,6 @@ impl Tx<'_> {
             }
         }
         let kind = business_projection_type_name(projection.projection_type);
-        let current_owner: Option<String> = self
-            .tx
-            .query_row(
-                "SELECT organization_id FROM snapshot_business_projections
-                 WHERE projection_type = ?1 AND projection_id = ?2",
-                params![kind, projection.id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if current_owner
-            .as_deref()
-            .is_some_and(|owner| owner != projection.organization_id)
-        {
-            return Err(Error::Data(
-                "projection id is already owned by another organization".into(),
-            ));
-        }
-
         self.emit(
             projection.run_id.as_deref(),
             EventBody::SnapshotProjectionChanged {
@@ -582,7 +564,7 @@ impl Tx<'_> {
                  projection_type, projection_id, organization_id, run_id,
                  current_state, updated_sequence, removed_sequence
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
-             ON CONFLICT (projection_type, projection_id) DO UPDATE SET
+             ON CONFLICT (organization_id, projection_type, projection_id) DO UPDATE SET
                  run_id = excluded.run_id,
                  current_state = excluded.current_state,
                  updated_sequence = excluded.updated_sequence,
@@ -614,8 +596,9 @@ impl Tx<'_> {
             .query_row(
                 "SELECT organization_id, run_id, removed_sequence
                  FROM snapshot_business_projections
-                 WHERE projection_type = ?1 AND projection_id = ?2",
-                params![kind, id],
+                 WHERE projection_type = ?1 AND projection_id = ?2
+                   AND organization_id = ?3",
+                params![kind, id, organization_id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
