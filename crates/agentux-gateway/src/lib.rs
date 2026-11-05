@@ -526,14 +526,20 @@ impl Messages {
                 if session.state == SessionState::Ended {
                     self.state.sessions.remove(&session.id);
                 } else {
-                    self.state.sessions.insert(
-                        session.id.clone(),
-                        SessionContext {
+                    // A session event comes with every state or usage change,
+                    // also mid-call: keep the kinds of the calls in flight.
+                    self.state
+                        .sessions
+                        .entry(session.id.clone())
+                        .and_modify(|context| {
+                            context.run_id.clone_from(&session.run_id);
+                            context.role_id.clone_from(&session.role);
+                        })
+                        .or_insert_with(|| SessionContext {
                             run_id: session.run_id.clone(),
                             role_id: session.role.clone(),
                             active_tool_kinds: BTreeMap::new(),
-                        },
-                    );
+                        });
                 }
                 None
             }
@@ -1386,6 +1392,66 @@ mod tests {
         );
         let restored = Messages::new(config(), Some(state_path)).unwrap();
         assert_eq!(restored.pending_outbox().replay_after(0), emitted);
+    }
+
+    #[test]
+    fn a_session_update_mid_call_keeps_the_calls_tool_kind() {
+        let mut messages = Messages::new(config(), None).unwrap();
+        messages
+            .state
+            .accepted_capabilities
+            .push("execution.activity.v1".into());
+        messages.state.run_origins.insert(
+            "local-run".into(),
+            RunOrigin {
+                organization_id: "org-demo".into(),
+                mission_id: "mission-1".into(),
+                command_run_id: "command-run-1".into(),
+                definition_version: None,
+            },
+        );
+        let session = |seq: i64, state: &str| -> Event {
+            serde_json::from_value(json!({
+                "seq": seq, "at": 1_794_000_000_000_i64, "runId": "local-run", "kind": "session",
+                "session": {
+                    "id": "session-1", "runId": "local-run", "projectId": "p", "role": "implementer",
+                    "harness": "codex", "state": state, "cwd": "/w",
+                    "usage": { "usedTokens": seq, "contextTokens": 1000 },
+                    "startedAt": 1, "updatedAt": seq
+                }
+            }))
+            .unwrap()
+        };
+        let tool = |seq: i64, kind: Option<&str>, status: &str| -> Event {
+            let mut call = json!({ "kind": "tool_call", "toolCallId": "tool-9", "status": status });
+            if let Some(kind) = kind {
+                call["tool"] = json!(kind);
+            }
+            serde_json::from_value(json!({
+                "seq": seq, "at": 1_794_000_000_000_i64, "runId": "local-run",
+                "kind": "session_event", "sessionId": "session-1", "event": call
+            }))
+            .unwrap()
+        };
+        assert!(messages.from_event(&session(1, "active")).is_none());
+        let started = messages
+            .from_event(&tool(2, Some("execute"), "running"))
+            .unwrap();
+        assert_eq!(started["params"]["activity"]["toolName"], "execute");
+        // Usage and state changes during the call.
+        assert!(messages.from_event(&session(3, "waiting")).is_none());
+        assert!(messages.from_event(&session(4, "active")).is_none());
+        let done = messages.from_event(&tool(5, None, "ok")).unwrap();
+        assert_eq!(done["params"]["activity"]["type"], "tool_completed");
+        assert_eq!(done["params"]["activity"]["toolName"], "execute");
+        assert!(
+            messages.state.sessions["session-1"]
+                .active_tool_kinds
+                .is_empty()
+        );
+        // An ended session takes its context with it.
+        assert!(messages.from_event(&session(6, "ended")).is_none());
+        assert!(!messages.state.sessions.contains_key("session-1"));
     }
 
     #[test]
