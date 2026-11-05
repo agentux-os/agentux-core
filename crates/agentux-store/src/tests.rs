@@ -455,3 +455,134 @@ fn harness_limits_are_kept_until_their_time_or_cleared() {
         other => panic!("expected the limits in force, got {other:?}"),
     }
 }
+#[test]
+fn snapshot_source_marks_unsupported_projections_unavailable() {
+    use crate::snapshot::{ProjectionKind, SourceKind};
+
+    let sources = ProjectionKind::ALL.map(|kind| kind.source_kind());
+    assert_eq!(
+        sources,
+        [
+            SourceKind::Sourced,
+            SourceKind::Unavailable,
+            SourceKind::Unavailable,
+            SourceKind::Derived,
+            SourceKind::Unavailable,
+            SourceKind::Sourced,
+            SourceKind::Unavailable,
+            SourceKind::Unavailable,
+            SourceKind::Sourced,
+            SourceKind::Sourced,
+            SourceKind::Unavailable,
+        ]
+    );
+    assert!(!crate::snapshot::checkpoint_capability_enabled());
+}
+
+#[test]
+fn snapshot_materialization_is_immutable_scoped_and_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot.db");
+    let store = Store::open(&path).unwrap();
+    let snapshot = snapshot::MaterializedSnapshot {
+        organization_id: "org-a".into(),
+        node_id: "node-a".into(),
+        checkpoint_id: "checkpoint-a".into(),
+        snapshot_id: "snapshot-a".into(),
+        captured_event_head: 4,
+        created_at_ms: 1_000,
+        expires_at_ms: 1_000 + snapshot::MIN_RETENTION.as_millis() as i64,
+        payload: serde_json::json!({"records":[1,2,3]}),
+    };
+    store
+        .write(|tx| tx.materialize_snapshot(&snapshot))
+        .unwrap();
+    assert!(store.write(|tx| tx.materialize_snapshot(&snapshot)).is_ok());
+    let mut changed = snapshot.clone();
+    changed.payload = serde_json::json!({"records":[9]});
+    assert!(store.write(|tx| tx.materialize_snapshot(&changed)).is_err());
+    drop(store);
+
+    let store = Store::open(&path).unwrap();
+    let restored = store
+        .read(|tx| tx.snapshot_materialization("org-a", "node-a", "checkpoint-a", 2_000))
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored, snapshot);
+    let first_page = restored.page("org-a", "node-a", 0, 4, 2_000).unwrap();
+    assert!(first_page.len() <= 4);
+    assert_eq!(
+        first_page,
+        restored.page("org-a", "node-a", 0, 4, 2_000).unwrap()
+    );
+    let mut serialized = first_page;
+    for page_index in 1..serde_json::to_vec(&snapshot.payload)
+        .unwrap()
+        .len()
+        .div_ceil(4)
+    {
+        serialized.extend(
+            restored
+                .page("org-a", "node-a", page_index, 4, 2_000)
+                .unwrap(),
+        );
+    }
+    assert_eq!(serialized, serde_json::to_vec(&snapshot.payload).unwrap());
+    assert_eq!(
+        restored.page("org-b", "node-a", 0, 4, 2_000),
+        Err(snapshot::PageError::ScopeMismatch)
+    );
+    assert_eq!(
+        restored.page("org-a", "node-a", 0, 4, 16 * 60 * 1000),
+        Err(snapshot::PageError::Expired)
+    );
+    assert_eq!(
+        store
+            .read(|tx| tx.snapshot_materialization(
+                "org-a",
+                "node-a",
+                "checkpoint-a",
+                16 * 60 * 1000
+            ))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .write(|tx| tx.prune_snapshot_materializations(16 * 60 * 1000))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn checkpoint_capture_keeps_rows_and_event_head_in_one_sqlite_read_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("concurrent.db");
+    let store = Store::open(&path).unwrap();
+    let external_path = path.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (written_tx, written_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        started_rx.recv().unwrap();
+        let conn = Connection::open(external_path).unwrap();
+        conn.execute(
+            "INSERT INTO events (run_id, at, body) VALUES (NULL, 1, '{}')",
+            [],
+        )
+        .unwrap();
+        written_tx.send(()).unwrap();
+    });
+    let (projects_seen, event_head) = store
+        .read(|tx| {
+            let projects = tx.projects()?;
+            started_tx.send(()).unwrap();
+            written_rx.recv().unwrap();
+            Ok::<_, Error>((projects, tx.last_event_seq()?))
+        })
+        .unwrap();
+    writer.join().unwrap();
+    assert!(projects_seen.is_empty());
+    assert_eq!(event_head, 0);
+    assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 1);
+}

@@ -141,6 +141,21 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE runs ADD COLUMN agent_isolation TEXT;
     ",
+    // 9: immutable, scoped checkpoint materializations. The gateway may only
+    // serve these after all projection sources and its sequence barrier exist.
+    "
+    CREATE TABLE snapshot_materializations (
+        organization_id TEXT NOT NULL,
+        node_id TEXT NOT NULL,
+        checkpoint_id TEXT NOT NULL,
+        snapshot_id TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        body TEXT NOT NULL,
+        PRIMARY KEY (organization_id, node_id, checkpoint_id)
+    );
+    CREATE INDEX snapshot_materializations_expiry ON snapshot_materializations (expires_at_ms);
+    ",
 ];
 
 /// The schema version this build writes.

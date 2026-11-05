@@ -161,6 +161,20 @@ impl Client {
             .await
     }
 
+    /// Captures all durable checkpoint sources and the same-transaction SQLite event head.
+    pub async fn snapshot_source_capture(
+        &mut self,
+        organization_id: &str,
+    ) -> Result<Value, ClientError> {
+        self.call(
+            method::SNAPSHOT_SOURCE_CAPTURE,
+            &rpc::SnapshotSourceCapture {
+                organization_id: organization_id.into(),
+            },
+        )
+        .await
+    }
+
     pub async fn approve(
         &mut self,
         request_id: &str,
