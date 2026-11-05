@@ -312,7 +312,7 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
             }
             to_value(
                 engine
-                    .store
+                    .store()
                     .read(|tx| {
                         tx.capture_checkpoint_sources(
                             &params.organization_id,
