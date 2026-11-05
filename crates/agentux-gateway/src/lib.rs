@@ -526,12 +526,19 @@ impl Messages {
                 if session.state == SessionState::Ended {
                     self.state.sessions.remove(&session.id);
                 } else {
+                    let active_tool_kinds = self
+                        .state
+                        .sessions
+                        .get(&session.id)
+                        .filter(|context| context.run_id == session.run_id)
+                        .map(|context| context.active_tool_kinds.clone())
+                        .unwrap_or_default();
                     self.state.sessions.insert(
                         session.id.clone(),
                         SessionContext {
                             run_id: session.run_id.clone(),
                             role_id: session.role.clone(),
-                            active_tool_kinds: BTreeMap::new(),
+                            active_tool_kinds,
                         },
                     );
                 }
@@ -1364,6 +1371,37 @@ mod tests {
             // A daemon restart between ACP updates must retain the tool kind
             // associated with each still-active call ID.
             messages = Messages::new(config(), Some(state_path.clone())).unwrap();
+            if event.seq == 41 {
+                // Waiting for and returning from a human approval emits
+                // session snapshots; neither update may discard active calls.
+                for (sequence, state) in [(42, SessionState::Waiting), (43, SessionState::Active)] {
+                    let refresh = Event {
+                        seq: sequence,
+                        at: 1_794_000_000_000 + sequence,
+                        run_id: Some("local-run".into()),
+                        body: EventBody::Session {
+                            session: agentux_api::Session {
+                                id: "session-1".into(),
+                                run_id: "local-run".into(),
+                                project_id: "project-1".into(),
+                                role: "implementer".into(),
+                                harness: "fake-acp".into(),
+                                model: None,
+                                state,
+                                cwd: "/work/project".into(),
+                                usage: Default::default(),
+                                started_at: 1_794_000_000_000,
+                                updated_at: 1_794_000_000_000 + sequence,
+                                ended_at: None,
+                                vendor_session_id: None,
+                            },
+                        },
+                    };
+                    assert!(messages.from_event(&refresh).is_none());
+                    messages.commit_local_event(refresh.seq, &outbox).unwrap();
+                    messages = Messages::new(config(), Some(state_path.clone())).unwrap();
+                }
+            }
         }
         assert_eq!(
             emitted

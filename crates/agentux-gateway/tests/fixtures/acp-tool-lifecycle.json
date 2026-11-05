@@ -21,8 +21,8 @@
   },
   {
     "event": {
-      "seq": 42,
-      "at": 1794000000001,
+      "seq": 44,
+      "at": 1794000000003,
       "runId": "local-run",
       "kind": "session_event",
       "sessionId": "session-1",
@@ -40,8 +40,8 @@
   },
   {
     "event": {
-      "seq": 43,
-      "at": 1794000000002,
+      "seq": 45,
+      "at": 1794000000004,
       "runId": "local-run",
       "kind": "session_event",
       "sessionId": "session-1",
@@ -60,8 +60,8 @@
   },
   {
     "event": {
-      "seq": 44,
-      "at": 1794000000003,
+      "seq": 46,
+      "at": 1794000000005,
       "runId": "local-run",
       "kind": "session_event",
       "sessionId": "session-1",
