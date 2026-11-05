@@ -644,6 +644,9 @@ mod node_source_tests {
         let mut invalid = state;
         invalid.capacity = serde_json::json!([]);
         assert!(invalid.validate().is_err());
+
+        invalid.capacity = serde_json::json!({"apiKey": "secret-value"});
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
