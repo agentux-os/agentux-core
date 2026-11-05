@@ -29,6 +29,7 @@ pub mod quota;
 pub mod sandbox;
 pub mod secrets;
 pub mod server;
+pub mod skills;
 mod terminal;
 pub mod tools;
 

@@ -220,6 +220,13 @@ enum Command {
 
 #[derive(Subcommand)]
 enum ToolsCommand {
+    /// Check a skill directory and print its digest, for a catalog entry's
+    /// `digest` (ADR 0026): only regular files and directories, within the
+    /// limits, with a SKILL.md that has a description
+    Digest {
+        /// The skill's directory (the one with SKILL.md)
+        dir: PathBuf,
+    },
     /// Add an MCP server to a catalog file (the user's by default), or
     /// replace the one of the same name
     Add {
@@ -682,6 +689,13 @@ fn tools_command(command: ToolsCommand) -> Result {
                 if replaced { "replaced" } else { "added" },
                 path.display()
             );
+            Ok(())
+        }
+        ToolsCommand::Digest { dir } => {
+            let tree = agentuxd::skills::check(&dir, None)
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
+            println!("{}", tree.digest);
+            eprintln!("{} files, {} bytes", tree.files, tree.bytes);
             Ok(())
         }
         ToolsCommand::Remove { name, file } => {
