@@ -240,7 +240,7 @@ fn harness_capture_matches_the_last_committed_inventory_event_under_concurrency(
                     }
                     _ => None,
                 })
-                .last()
+                .next_back()
                 .unwrap();
             let source = captured
                 .harnesses

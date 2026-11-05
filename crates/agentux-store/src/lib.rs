@@ -296,12 +296,12 @@ fn harness_projection_state(harness: &HarnessInfo) -> Result<serde_json::Value> 
             );
             value.insert(
                 "usedPercent".into(),
-                serde_json::to_value(&quota.used_percent)
+                serde_json::to_value(quota.used_percent)
                     .map_err(|error| Error::Data(error.to_string()))?,
             );
             value.insert(
                 "resetsAt".into(),
-                serde_json::to_value(&quota.resets_at)
+                serde_json::to_value(quota.resets_at)
                     .map_err(|error| Error::Data(error.to_string()))?,
             );
             Ok(serde_json::Value::Object(value))
