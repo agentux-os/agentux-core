@@ -33,6 +33,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `runs.get` | `{ runId }` | `{ run: Run, attempts: StepAttempt[], requests: PermissionRequest[], sessions: Session[] }` |
 | `runs.cancel` | `{ runId }` | `Run` |
 | `runs.events` | `{ runId, sinceSeq?, limit? }` — `limit` defaults to 1000, at most 10000 | `{ events: Event[], more, headSeq }`: the run's stored events with `seq > sinceSeq`, oldest first; see [History](#history) |
+| `snapshots.source_capture` | `{ organizationId }` | Atomic durable Core projection sources and the SQLite event head from one read transaction, plus explicit unavailable projection reasons; this is an internal data-boundary primitive and does not claim complete AUXP checkpoint coverage |
 | `sessions.list` | `{ runId? }` | `Session[]`, oldest first |
 | `sessions.prompt` | `{ sessionId, text, interrupt? }` | `{ session: Session, queued, interrupted }` — the human's message to a live session, optionally interrupting its turn; see [Talking to a session](#talking-to-a-session) |
 | `requests.list` | `{ pending? }` — `true` for the approvals inbox | `PermissionRequest[]`, newest first |

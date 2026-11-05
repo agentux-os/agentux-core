@@ -309,6 +309,18 @@ pub struct State {
     pub sessions: BTreeMap<String, SessionContext>,
     #[serde(default)]
     pub run_origins: BTreeMap<String, RunOrigin>,
+    #[serde(default)]
+    pub snapshot_bindings: BTreeMap<String, SnapshotBinding>,
+}
+
+/// Durable sequence binding for a completed local capture. It is data-layer
+/// groundwork only; no AUXP checkpoint is served while coverage is incomplete.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotBinding {
+    pub snapshot_id: String,
+    pub captured_local_event_head: i64,
+    pub high_water_sequence: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -397,6 +409,43 @@ impl Messages {
 
     pub fn last_sequence(&self) -> i64 {
         self.state.last_sequence
+    }
+
+    /// Bind a captured SQLite head only after the serial gateway event loop
+    /// has sequenced every local event through that head.
+    pub fn bind_snapshot(
+        &mut self,
+        checkpoint_id: &str,
+        snapshot_id: &str,
+        local_event_head: i64,
+    ) -> Result<SnapshotBinding, String> {
+        if checkpoint_id.is_empty() || snapshot_id.is_empty() || local_event_head < 0 {
+            return Err("snapshot binding identifiers and event head are invalid".into());
+        }
+        if let Some(existing) = self.state.snapshot_bindings.get(checkpoint_id) {
+            if existing.snapshot_id == snapshot_id
+                && existing.captured_local_event_head == local_event_head
+            {
+                return Ok(existing.clone());
+            }
+            return Err("checkpoint id already has a different sequence binding".into());
+        }
+        if self.state.last_local_event_sequence != local_event_head {
+            return Err(format!(
+                "snapshot capture head {local_event_head} is not caught up (gateway has {})",
+                self.state.last_local_event_sequence
+            ));
+        }
+        let binding = SnapshotBinding {
+            snapshot_id: snapshot_id.into(),
+            captured_local_event_head: local_event_head,
+            high_water_sequence: self.state.last_sequence,
+        };
+        self.state
+            .snapshot_bindings
+            .insert(checkpoint_id.into(), binding.clone());
+        self.persist()?;
+        Ok(binding)
     }
 
     fn base(&mut self, extra: Value) -> Map<String, Value> {
@@ -1189,6 +1238,28 @@ fn handle_gateway_out(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_checkpoint_is_not_advertised_without_complete_sources() {
+        assert!(!CAPABILITIES.contains(&"node.snapshot_checkpoint.v1"));
+    }
+
+    #[test]
+    fn snapshot_binding_requires_the_local_event_stream_to_reach_the_capture_head() {
+        let mut messages = Messages::new(config(), None).unwrap();
+        assert!(messages.bind_snapshot("cp", "snap", 3).is_err());
+        for seq in 1..=3 {
+            let outbox = messages.pending_outbox();
+            messages.commit_local_event(seq, &outbox).unwrap();
+        }
+        let binding = messages.bind_snapshot("cp", "snap", 3).unwrap();
+        assert_eq!(binding.high_water_sequence, 0);
+        assert_eq!(messages.bind_snapshot("cp", "snap", 3).unwrap(), binding);
+        assert!(messages.bind_snapshot("cp", "other", 3).is_err());
+        let after = messages.custom_event("run.updated", json!({"runId":"r1"}));
+        assert_eq!(after["params"]["sequence"], 1);
+        assert_eq!(messages.bind_snapshot("cp", "snap", 3).unwrap(), binding);
+    }
 
     fn config() -> NodeConfig {
         NodeConfig {

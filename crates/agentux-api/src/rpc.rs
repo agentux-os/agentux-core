@@ -40,6 +40,8 @@ pub mod method {
     pub const RUNS_GET: &str = "runs.get";
     pub const RUNS_CANCEL: &str = "runs.cancel";
     pub const RUNS_EVENTS: &str = "runs.events";
+    /// Atomic durable checkpoint source capture; not a wire snapshot endpoint.
+    pub const SNAPSHOT_SOURCE_CAPTURE: &str = "snapshots.source_capture";
     pub const SESSIONS_LIST: &str = "sessions.list";
     pub const SESSIONS_PROMPT: &str = "sessions.prompt";
     pub const REQUESTS_LIST: &str = "requests.list";
@@ -541,6 +543,13 @@ pub struct ListRequests {
     /// `true` returns only pending requests (the approvals inbox).
     #[serde(default)]
     pub pending: bool,
+}
+
+/// Parameters for an atomic, read-only checkpoint source capture.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotSourceCapture {
+    pub organization_id: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -32,6 +32,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::broadcast;
 
 mod schema;
+pub mod snapshot;
 
 /// Where a run is within its current step. Persisted, so the engine knows
 /// what to do next after a restart.
@@ -246,6 +247,72 @@ const SESSION_COLUMNS: &str = "id, run_id, project_id, role, harness, model, sta
      started_at, updated_at, ended_at, vendor_session_id";
 
 impl Tx<'_> {
+    /// Pins opaque, already captured data under an immutable organization/node/checkpoint key.
+    /// Conflicting retries fail instead of replacing the original capture.
+    pub fn materialize_snapshot(
+        &mut self,
+        snapshot: &snapshot::MaterializedSnapshot,
+    ) -> Result<()> {
+        if snapshot.organization_id.is_empty()
+            || snapshot.node_id.is_empty()
+            || snapshot.checkpoint_id.is_empty()
+            || snapshot.snapshot_id.is_empty()
+            || snapshot.captured_event_head < 0
+            || snapshot
+                .expires_at_ms
+                .saturating_sub(snapshot.created_at_ms)
+                < snapshot::MIN_RETENTION.as_millis() as i64
+        {
+            return Err(Error::Data(
+                "invalid snapshot materialization or retention shorter than 15 minutes".into(),
+            ));
+        }
+        let body = to_json(snapshot)?;
+        if body.len() > snapshot::MAX_SNAPSHOT_BYTES {
+            return Err(Error::Data(
+                "snapshot materialization exceeds 64 MiB".into(),
+            ));
+        }
+        let existing: Option<String> = self.tx.query_row(
+            "SELECT body FROM snapshot_materializations WHERE organization_id=?1 AND node_id=?2 AND checkpoint_id=?3",
+            params![snapshot.organization_id, snapshot.node_id, snapshot.checkpoint_id], |row| row.get(0),
+        ).optional()?;
+        if let Some(existing) = existing {
+            if existing == body {
+                return Ok(());
+            }
+            return Err(Error::Data(
+                "checkpoint id already names a different immutable snapshot".into(),
+            ));
+        }
+        self.tx.execute(
+            "INSERT INTO snapshot_materializations (organization_id,node_id,checkpoint_id,snapshot_id,created_at_ms,expires_at_ms,body) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![snapshot.organization_id, snapshot.node_id, snapshot.checkpoint_id, snapshot.snapshot_id, snapshot.created_at_ms, snapshot.expires_at_ms, body],
+        )?;
+        Ok(())
+    }
+
+    pub fn snapshot_materialization(
+        &self,
+        organization_id: &str,
+        node_id: &str,
+        checkpoint_id: &str,
+        now_ms: i64,
+    ) -> Result<Option<snapshot::MaterializedSnapshot>> {
+        let body: Option<String> = self.tx.query_row(
+            "SELECT body FROM snapshot_materializations WHERE organization_id=?1 AND node_id=?2 AND checkpoint_id=?3 AND expires_at_ms>?4",
+            params![organization_id, node_id, checkpoint_id, now_ms], |row| row.get(0),
+        ).optional()?;
+        body.map(|body| from_json(&body)).transpose()
+    }
+
+    pub fn prune_snapshot_materializations(&mut self, now_ms: i64) -> Result<usize> {
+        Ok(self.tx.execute(
+            "DELETE FROM snapshot_materializations WHERE expires_at_ms<=?1",
+            [now_ms],
+        )?)
+    }
+
     // ---- events ----
 
     /// Records an event; it is broadcast once the transaction commits.
@@ -324,6 +391,60 @@ impl Tx<'_> {
         Ok(self
             .tx
             .query_row("SELECT COALESCE(MAX(seq), 0) FROM events", [], |r| r.get(0))?)
+    }
+
+    /// Captures all currently durable, Command-owned projections and the local
+    /// SQLite event head using this same read transaction.
+    pub fn capture_checkpoint_sources(
+        &self,
+        organization_id: &str,
+        now: i64,
+    ) -> Result<snapshot::DurableCapture> {
+        let owned: Vec<RunRecord> = self
+            .runs(None)?
+            .into_iter()
+            .filter(|record| {
+                record
+                    .run
+                    .origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.organization_id == organization_id)
+            })
+            .collect();
+        let run_ids: std::collections::HashSet<&str> =
+            owned.iter().map(|record| record.run.id.as_str()).collect();
+        let runs = owned.iter().map(|record| record.run.clone()).collect();
+        let gates = owned
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "runId": record.run.id,
+                    "checks": record.run.checks,
+                    "gateAttempt": record.run.gate_attempt,
+                    "gateMaxAttempts": record.run.gate_max_attempts,
+                })
+            })
+            .collect();
+        let approvals = self
+            .requests(None, None)?
+            .into_iter()
+            .filter(|request| run_ids.contains(request.run_id.as_str()))
+            .collect();
+        let sessions = self
+            .sessions(None)?
+            .into_iter()
+            .filter(|session| run_ids.contains(session.run_id.as_str()))
+            .collect();
+        Ok(snapshot::DurableCapture {
+            organization_id: organization_id.into(),
+            captured_event_head: self.last_event_seq()?,
+            runs,
+            approvals,
+            sessions,
+            limits: self.limits(now)?,
+            gates,
+            unavailable: snapshot::unavailable_projections(),
+        })
     }
 
     // ---- projects ----

@@ -302,6 +302,26 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
             )
         }
         method::RUNS_EVENTS => to_value(engine.run_events(parse(params)?)),
+        method::SNAPSHOT_SOURCE_CAPTURE => {
+            let params: rpc::SnapshotSourceCapture = parse(params)?;
+            if params.organization_id.trim().is_empty() {
+                return Err(rpc::Error::new(
+                    code::INVALID_PARAMS,
+                    "organizationId is required",
+                ));
+            }
+            to_value(
+                engine
+                    .store()
+                    .read(|tx| {
+                        tx.capture_checkpoint_sources(
+                            &params.organization_id,
+                            agentux_store::now_ms(),
+                        )
+                    })
+                    .map_err(Error::from),
+            )
+        }
         method::SESSIONS_PROMPT => {
             let params: rpc::PromptSession = parse(params)?;
             if params.interrupt {

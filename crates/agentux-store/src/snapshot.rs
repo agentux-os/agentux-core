@@ -1,0 +1,162 @@
+//! Source inventory and durable storage primitives for node snapshot checkpoints.
+//!
+//! This module deliberately does not expose a wire checkpoint: four projection
+//! kinds (and the runtime owned harness/node inventories) have no durable,
+//! authoritative source yet, so complete checkpoint coverage cannot be claimed.
+
+use std::time::Duration;
+
+use agentux_api::{HarnessLimit, PermissionRequest, Run, Session};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const MIN_RETENTION: Duration = Duration::from_secs(15 * 60);
+pub const MAX_PAGE_BYTES: usize = 1_048_576;
+pub const MAX_PAGES: usize = 10_000;
+pub const MAX_SNAPSHOT_BYTES: usize = 67_108_864;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionKind {
+    Approval,
+    Artifact,
+    Command,
+    Gate,
+    Harness,
+    Limit,
+    Node,
+    NodeAlert,
+    Run,
+    Session,
+    Task,
+}
+
+impl ProjectionKind {
+    pub const ALL: [Self; 11] = [
+        Self::Approval,
+        Self::Artifact,
+        Self::Command,
+        Self::Gate,
+        Self::Harness,
+        Self::Limit,
+        Self::Node,
+        Self::NodeAlert,
+        Self::Run,
+        Self::Session,
+        Self::Task,
+    ];
+
+    pub const fn source_kind(self) -> SourceKind {
+        match self {
+            Self::Approval | Self::Limit | Self::Run | Self::Session => SourceKind::Sourced,
+            Self::Gate => SourceKind::Derived,
+            Self::Artifact
+            | Self::Command
+            | Self::Harness
+            | Self::Node
+            | Self::NodeAlert
+            | Self::Task => SourceKind::Unavailable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceKind {
+    Sourced,
+    Derived,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnavailableProjection {
+    pub kind: ProjectionKind,
+    pub reason: String,
+}
+
+pub const fn checkpoint_capability_enabled() -> bool {
+    false
+}
+
+pub fn unavailable_projections() -> Vec<UnavailableProjection> {
+    ProjectionKind::ALL.into_iter().filter_map(|kind| {
+        let reason = match kind {
+            ProjectionKind::Artifact => Some("Core has no durable artifact projection or ownership ledger"),
+            ProjectionKind::Command => Some("Core has no durable Command projection"),
+            ProjectionKind::Harness => Some("installed harness inventory is runtime-derived and not durably materialized"),
+            ProjectionKind::Node => Some("node identity and heartbeat state are gateway-owned, not in the agentux-store transaction"),
+            ProjectionKind::NodeAlert => Some("Core has no durable node alert projection"),
+            ProjectionKind::Task => Some("Core has no durable task identity or lifecycle projection"),
+            _ => None,
+        }?;
+        Some(UnavailableProjection { kind, reason: reason.into() })
+    }).collect()
+}
+
+/// Opaque immutable JSON bytes. This is intentionally not a protocol page;
+/// callers cannot claim coverage until every projection has a source.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MaterializedSnapshot {
+    pub organization_id: String,
+    pub node_id: String,
+    pub checkpoint_id: String,
+    pub snapshot_id: String,
+    pub captured_event_head: i64,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DurableCapture {
+    pub organization_id: String,
+    pub captured_event_head: i64,
+    pub runs: Vec<Run>,
+    pub approvals: Vec<PermissionRequest>,
+    pub sessions: Vec<Session>,
+    pub limits: Vec<HarnessLimit>,
+    /// Gate state is derived solely from the durable run checks and attempt counters.
+    pub gates: Vec<Value>,
+    /// The complete contract remains unavailable while any entry is present.
+    pub unavailable: Vec<UnavailableProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageError {
+    Missing,
+    Expired,
+    ScopeMismatch,
+    InvalidPageSize,
+}
+
+impl MaterializedSnapshot {
+    pub fn page(
+        &self,
+        organization_id: &str,
+        node_id: &str,
+        page_index: usize,
+        page_size: usize,
+        now_ms: i64,
+    ) -> Result<Vec<u8>, PageError> {
+        if self.organization_id != organization_id || self.node_id != node_id {
+            return Err(PageError::ScopeMismatch);
+        }
+        if now_ms >= self.expires_at_ms {
+            return Err(PageError::Expired);
+        }
+        if page_size == 0 || page_size > MAX_PAGE_BYTES || page_index >= MAX_PAGES {
+            return Err(PageError::InvalidPageSize);
+        }
+        let bytes = serde_json::to_vec(&self.payload).map_err(|_| PageError::Missing)?;
+        if bytes.len().div_ceil(page_size) > MAX_PAGES {
+            return Err(PageError::InvalidPageSize);
+        }
+        let start = page_index
+            .checked_mul(page_size)
+            .ok_or(PageError::InvalidPageSize)?;
+        if start >= bytes.len() && !(start == 0 && bytes.is_empty()) {
+            return Err(PageError::Missing);
+        }
+        Ok(bytes[start..bytes.len().min(start.saturating_add(page_size))].to_vec())
+    }
+}
