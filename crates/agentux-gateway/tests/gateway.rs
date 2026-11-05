@@ -218,6 +218,24 @@ async fn commands_run_wait_for_the_node_or_are_refused() {
     );
     assert!(listed.event.is_none());
 
+    let mut restarted_answers = Answers::default();
+    let replayed = commands::handle(
+        &mut client,
+        &node,
+        &policy,
+        &pending,
+        &mut restarted_answers,
+        &request("c1", "harness.list", json!({})),
+    )
+    .await;
+    assert_eq!(replayed.response["error"]["code"], commands::FAILED);
+    assert!(
+        replayed.response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("reconciliation")
+    );
+
     // For another node, or with a credential: refused.
     let other = commands::handle(
         &mut client,
@@ -304,6 +322,19 @@ async fn commands_run_wait_for_the_node_or_are_refused() {
     assert_eq!(events[0].1["ok"], false);
     assert!(pending.list().is_empty());
     assert!(engine.runs(None).unwrap().is_empty());
+    let capture = engine
+        .store()
+        .read(|tx| tx.capture_checkpoint_sources("org", agentux_store::now_ms()))
+        .unwrap();
+    let command = capture
+        .business_projections
+        .iter()
+        .find(|entry| entry.id == "c5")
+        .unwrap();
+    let state = command.state.as_ref().unwrap();
+    assert_eq!(state["status"], "denied");
+    assert_eq!(state["method"], "run.start");
+    assert!(state.get("params").is_none());
 
     stop_daemon.send(()).unwrap();
     server.await.unwrap().unwrap();

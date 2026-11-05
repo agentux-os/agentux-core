@@ -24,6 +24,8 @@ pub mod method {
     pub const HARNESSES_LIST: &str = "harnesses.list";
     /// Persist a complete harness inventory observed by the trusted gateway.
     pub const HARNESS_INVENTORY_REPLACE: &str = "harnesses.inventory_replace";
+    /// Record safe, organization-scoped lifecycle state for a Command request.
+    pub const COMMAND_PROJECTION_UPDATE: &str = "commands.projection_update";
     /// The harness limits in force ([`crate::HarnessLimit`]).
     pub const LIMITS_LIST: &str = "limits.list";
     /// The tool catalog: the machine's, the user's and, with a project, its
@@ -307,6 +309,50 @@ pub struct HarnessInfo {
 #[serde(rename_all = "camelCase")]
 pub struct HarnessInventory {
     pub harnesses: Vec<HarnessInfo>,
+}
+
+/// Safe lifecycle states for a request received from the authenticated Command server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandLifecycleStatus {
+    Received,
+    AwaitingConfirmation,
+    Confirmed,
+    Denied,
+    Executing,
+    Completed,
+    Failed,
+    Interrupted,
+    ReconciliationRequired,
+}
+
+impl CommandLifecycleStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::AwaitingConfirmation => "awaiting_confirmation",
+            Self::Confirmed => "confirmed",
+            Self::Denied => "denied",
+            Self::Executing => "executing",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+            Self::ReconciliationRequired => "reconciliation_required",
+        }
+    }
+}
+
+/// Lifecycle update accepted from the trusted node gateway. It deliberately
+/// has no field for command parameters, credentials, or arbitrary result data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandProjectionUpdate {
+    pub organization_id: String,
+    pub command_id: String,
+    pub method: String,
+    pub status: CommandLifecycleStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

@@ -84,6 +84,119 @@ fn business_projection(
     }
 }
 
+#[test]
+fn command_run_origin_deduplicates_retries_in_one_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let project = store
+        .write(|tx| tx.register_project("app", dir.path().to_str().unwrap()))
+        .unwrap();
+    let mut first = sample_run("project-1");
+    first.run.project_id = project.id;
+    first.run.origin = Some(agentux_api::RunOrigin {
+        organization_id: "org-a".into(),
+        mission_id: "mission-a".into(),
+        command_run_id: "command-run-a".into(),
+        definition_version: Some("v1".into()),
+    });
+    let (inserted, created) = store.write(|tx| tx.insert_command_run(&first)).unwrap();
+    assert!(created);
+    assert_eq!(inserted.run.id, first.run.id);
+    let first_sequence = store.read(|tx| tx.last_event_seq()).unwrap();
+
+    let mut retry = sample_run("project-1");
+    retry.run.project_id = first.run.project_id.clone();
+    retry.run.origin = first.run.origin.clone();
+    let (returned, created) = store.write(|tx| tx.insert_command_run(&retry)).unwrap();
+
+    assert!(!created);
+    assert_eq!(returned.run.id, first.run.id);
+    assert_eq!(returned.run.prompt, first.run.prompt);
+    assert_eq!(
+        store.read(|tx| tx.last_event_seq()).unwrap(),
+        first_sequence
+    );
+    assert_eq!(store.read(|tx| tx.runs(None).unwrap().len()).unwrap(), 1);
+
+    let mut changed_retry = retry;
+    changed_retry.run.prompt = Some("a different request".into());
+    assert!(
+        store
+            .write(|tx| tx.insert_command_run(&changed_retry))
+            .is_err()
+    );
+    assert_eq!(
+        store.read(|tx| tx.last_event_seq()).unwrap(),
+        first_sequence
+    );
+}
+
+#[test]
+fn command_lifecycle_projection_is_safe_scoped_and_transitioned() {
+    let store = Store::open_in_memory().unwrap();
+    let update = |status| agentux_api::rpc::CommandProjectionUpdate {
+        organization_id: "org-a".into(),
+        command_id: "cmd-1".into(),
+        method: "run.start".into(),
+        status,
+        run_id: None,
+    };
+    let received = update(agentux_api::rpc::CommandLifecycleStatus::Received);
+    assert_eq!(
+        store
+            .write(|tx| tx.update_command_projection(&received))
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        store
+            .write(|tx| tx.update_command_projection(&received))
+            .unwrap(),
+        None
+    );
+    let executing = update(agentux_api::rpc::CommandLifecycleStatus::Executing);
+    assert_eq!(
+        store
+            .write(|tx| tx.update_command_projection(&executing))
+            .unwrap(),
+        Some(2)
+    );
+    assert!(
+        store
+            .write(|tx| tx.update_command_projection(&executing))
+            .is_err()
+    );
+    let completed = update(agentux_api::rpc::CommandLifecycleStatus::Completed);
+    assert_eq!(
+        store
+            .write(|tx| tx.update_command_projection(&completed))
+            .unwrap(),
+        Some(3)
+    );
+
+    let capture = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    let command = capture
+        .business_projections
+        .iter()
+        .find(|p| p.id == "cmd-1")
+        .unwrap();
+    let state = command.state.as_ref().unwrap();
+    assert_eq!(state["status"], "completed");
+    assert_eq!(state["method"], "run.start");
+    assert!(state.get("params").is_none());
+    assert!(state.get("providerToken").is_none());
+
+    let invalid = update(agentux_api::rpc::CommandLifecycleStatus::AwaitingConfirmation);
+    assert!(
+        store
+            .write(|tx| tx.update_command_projection(&invalid))
+            .is_err()
+    );
+    assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 3);
+}
+
 fn harness_info(id: &str, installed: bool) -> agentux_api::rpc::HarnessInfo {
     agentux_api::rpc::HarnessInfo {
         id: id.into(),

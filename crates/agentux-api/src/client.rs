@@ -105,6 +105,15 @@ impl Client {
         .await
     }
 
+    /// Records a safe lifecycle transition from the authenticated gateway.
+    pub async fn update_command_projection(
+        &mut self,
+        update: &rpc::CommandProjectionUpdate,
+    ) -> Result<Option<i64>, ClientError> {
+        self.call(rpc::method::COMMAND_PROJECTION_UPDATE, update)
+            .await
+    }
+
     pub async fn test_harness(
         &mut self,
         params: &rpc::TestHarness,

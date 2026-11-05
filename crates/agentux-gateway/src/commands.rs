@@ -308,6 +308,10 @@ pub struct Held {
     /// `accept` or `reject`, set by `aux node confirm` / `reject`.
     #[serde(default)]
     pub decision: Option<String>,
+    /// A durable claim means a prior gateway process may have started the
+    /// effect. It is retained separately from the human decision.
+    #[serde(default)]
+    pub claimed: bool,
 }
 
 /// Commands waiting for confirmation, in `~/.local/state/agentux/gateway-pending.json`.
@@ -343,8 +347,11 @@ impl Pending {
     /// Holds a command, once per commandId.
     pub fn hold(&self, command_id: &str, method: &str, params: &Value) -> Result<(), String> {
         let mut held = self.list();
-        if held.iter().any(|h| h.command_id == command_id) {
-            return Ok(());
+        if let Some(existing) = held.iter().find(|h| h.command_id == command_id) {
+            if existing.method == method && existing.params == *params {
+                return Ok(());
+            }
+            return Err("commandId was reused with different command content".into());
         }
         held.push(Held {
             command_id: command_id.into(),
@@ -352,6 +359,7 @@ impl Pending {
             params: params.clone(),
             received_at: jiff::Timestamp::now().to_string(),
             decision: None,
+            claimed: false,
         });
         self.save(&held)
     }
@@ -363,21 +371,42 @@ impl Pending {
             .iter_mut()
             .find(|h| h.command_id == command_id)
             .ok_or_else(|| format!("no command {command_id} is waiting"))?;
+        if entry.decision.is_some() {
+            return Err(format!(
+                "command {command_id} already has a decision; reconcile its local state"
+            ));
+        }
         entry.decision = Some(if accept { "accept" } else { "reject" }.into());
         let decided = entry.clone();
         self.save(&held)?;
         Ok(decided)
     }
 
-    /// Takes the decided commands out of the list.
+    /// Claims decided commands durably before execution. A claim left behind
+    /// by a crash is not replayed automatically.
     pub fn take_decided(&self) -> Vec<Held> {
-        let held = self.list();
-        let (decided, waiting): (Vec<Held>, Vec<Held>) =
-            held.into_iter().partition(|h| h.decision.is_some());
-        if !decided.is_empty() {
-            let _ = self.save(&waiting);
+        let mut held = self.list();
+        let mut decided = Vec::new();
+        for item in &mut held {
+            if matches!(item.decision.as_deref(), Some("accept" | "reject")) {
+                item.claimed = true;
+                decided.push(item.clone());
+            }
+        }
+        if decided.is_empty() {
+            return decided;
+        }
+        if self.save(&held).is_err() {
+            return Vec::new();
         }
         decided
+    }
+
+    /// Removes a claimed command after its local outcome has been recorded.
+    pub fn complete(&self, command_id: &str) -> Result<(), String> {
+        let mut held = self.list();
+        held.retain(|item| item.command_id != command_id);
+        self.save(&held)
     }
 }
 
@@ -397,6 +426,43 @@ pub struct Handled {
 pub enum GatewayCommand {
     Resume { after: i64 },
     Acknowledge { through: i64 },
+}
+
+async fn record_lifecycle(
+    client: &mut Client,
+    organization_id: &str,
+    command_id: &str,
+    method: &str,
+    status: agentux_api::rpc::CommandLifecycleStatus,
+    run_id: Option<String>,
+) -> Result<(), Failure> {
+    client
+        .update_command_projection(&rpc::CommandProjectionUpdate {
+            organization_id: organization_id.into(),
+            command_id: command_id.into(),
+            method: method.into(),
+            status,
+            run_id,
+        })
+        .await
+        .map(|_| ())
+        .map_err(failed)
+}
+
+fn command_owned_run_id(result: &Value, organization_id: &str) -> Option<String> {
+    let run = result.get("run")?;
+    if run
+        .get("origin")
+        .and_then(|origin| origin.get("organizationId"))
+        .and_then(Value::as_str)
+        != Some(organization_id)
+    {
+        return None;
+    }
+    result
+        .get("localRunId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Recent answers by commandId: a command sent again gets the same answer.
@@ -526,6 +592,18 @@ pub async fn handle(
             gateway_command: Some(gateway_command),
         };
     }
+    if let Err((code, message)) = record_lifecycle(
+        client,
+        &node.organization_id,
+        &command_id,
+        method,
+        agentux_api::rpc::CommandLifecycleStatus::Received,
+        None,
+    )
+    .await
+    {
+        return none(error(&id, code, &message));
+    }
     let denied = |reason: &str| {
         Some((
             "command.denied".to_string(),
@@ -533,22 +611,84 @@ pub async fn handle(
         ))
     };
     let handled = match policy.decide(method) {
-        Decision::Deny => Handled {
-            response: error(&id, DENIED, REASON_DENIED_BY_POLICY),
-            event: denied(REASON_DENIED_BY_POLICY),
-            gateway_command: None,
-        },
-        Decision::Confirm => match pending.hold(&command_id, method, &params) {
+        Decision::Deny => match record_lifecycle(
+            client,
+            &node.organization_id,
+            &command_id,
+            method,
+            agentux_api::rpc::CommandLifecycleStatus::Denied,
+            None,
+        )
+        .await
+        {
             Ok(()) => Handled {
-                response: error(&id, HELD, REASON_AWAITING_CONFIRMATION),
-                event: denied(REASON_AWAITING_CONFIRMATION),
+                response: error(&id, DENIED, REASON_DENIED_BY_POLICY),
+                event: denied(REASON_DENIED_BY_POLICY),
                 gateway_command: None,
             },
-            Err(e) => none(error(&id, FAILED, &format!("cannot hold the command: {e}"))),
-        },
-        Decision::Allow => match execute(client, method, &params).await {
-            Ok(result) => none(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
             Err((code, message)) => none(error(&id, code, &message)),
+        },
+        Decision::Confirm => match record_lifecycle(
+            client,
+            &node.organization_id,
+            &command_id,
+            method,
+            agentux_api::rpc::CommandLifecycleStatus::AwaitingConfirmation,
+            None,
+        )
+        .await
+        {
+            Ok(()) => match pending.hold(&command_id, method, &params) {
+                Ok(()) => Handled {
+                    response: error(&id, HELD, REASON_AWAITING_CONFIRMATION),
+                    event: denied(REASON_AWAITING_CONFIRMATION),
+                    gateway_command: None,
+                },
+                Err(e) => none(error(&id, FAILED, &format!("cannot hold the command: {e}"))),
+            },
+            Err((code, message)) => none(error(&id, code, &message)),
+        },
+        Decision::Allow => match record_lifecycle(
+            client,
+            &node.organization_id,
+            &command_id,
+            method,
+            agentux_api::rpc::CommandLifecycleStatus::Executing,
+            None,
+        )
+        .await
+        {
+            Err((code, message)) => none(error(&id, code, &message)),
+            Ok(()) => match execute(client, method, &params).await {
+                Ok(result) => {
+                    let run_id = command_owned_run_id(&result, &node.organization_id);
+                    match record_lifecycle(
+                        client,
+                        &node.organization_id,
+                        &command_id,
+                        method,
+                        agentux_api::rpc::CommandLifecycleStatus::Completed,
+                        run_id,
+                    )
+                    .await
+                    {
+                        Ok(()) => none(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
+                        Err((code, message)) => none(error(&id, code, &message)),
+                    }
+                }
+                Err((code, message)) => {
+                    let _ = record_lifecycle(
+                        client,
+                        &node.organization_id,
+                        &command_id,
+                        method,
+                        agentux_api::rpc::CommandLifecycleStatus::Failed,
+                        None,
+                    )
+                    .await;
+                    none(error(&id, code, &message))
+                }
+            },
         },
     };
     answers.put(&command_id, handled.response.clone());
@@ -561,10 +701,95 @@ pub async fn run_decided(client: &mut Client, pending: &Pending) -> Vec<(String,
     let mut events = Vec::new();
     for held in pending.take_decided() {
         let accepted = held.decision.as_deref() == Some("accept");
+        let mut terminal_status = None;
+        let organization_id = held
+            .params
+            .get("organizationId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
         let outcome = if accepted {
-            execute(client, &held.method, &held.params).await
+            let confirmed = record_lifecycle(
+                client,
+                organization_id,
+                &held.command_id,
+                &held.method,
+                agentux_api::rpc::CommandLifecycleStatus::Confirmed,
+                None,
+            )
+            .await;
+            if let Err(confirmation_error) = confirmed {
+                let interrupted = record_lifecycle(
+                    client,
+                    organization_id,
+                    &held.command_id,
+                    &held.method,
+                    agentux_api::rpc::CommandLifecycleStatus::Interrupted,
+                    None,
+                )
+                .await;
+                let message = if interrupted.is_ok() {
+                    "command effect may have run; local reconciliation is required".to_string()
+                } else {
+                    confirmation_error.1
+                };
+                Err((FAILED, message))
+            } else {
+                match record_lifecycle(
+                    client,
+                    organization_id,
+                    &held.command_id,
+                    &held.method,
+                    agentux_api::rpc::CommandLifecycleStatus::Executing,
+                    None,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let outcome = execute(client, &held.method, &held.params).await;
+                        terminal_status = Some(if outcome.is_ok() {
+                            agentux_api::rpc::CommandLifecycleStatus::Completed
+                        } else {
+                            agentux_api::rpc::CommandLifecycleStatus::Failed
+                        });
+                        outcome
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         } else {
-            Err((DENIED, "rejected at the node".into()))
+            match record_lifecycle(
+                client,
+                organization_id,
+                &held.command_id,
+                &held.method,
+                agentux_api::rpc::CommandLifecycleStatus::Denied,
+                None,
+            )
+            .await
+            {
+                Ok(()) => {
+                    terminal_status = Some(agentux_api::rpc::CommandLifecycleStatus::Denied);
+                    Err((DENIED, "rejected at the node".into()))
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let run_id = outcome
+            .as_ref()
+            .ok()
+            .and_then(|result| command_owned_run_id(result, organization_id));
+        let lifecycle = if let Some(status) = terminal_status {
+            record_lifecycle(
+                client,
+                organization_id,
+                &held.command_id,
+                &held.method,
+                status,
+                run_id,
+            )
+            .await
+        } else {
+            Ok(())
         };
         let mut payload = json!({
             "commandId": held.command_id,
@@ -576,7 +801,12 @@ pub async fn run_decided(client: &mut Client, pending: &Pending) -> Vec<(String,
             Ok(result) => payload["result"] = result,
             Err((code, message)) => payload["error"] = json!({ "code": code, "message": message }),
         }
+        if let Err((code, message)) = lifecycle {
+            payload["ok"] = false.into();
+            payload["error"] = json!({ "code": code, "message": message });
+        }
         events.push(("command.completed".to_string(), payload));
+        let _ = pending.complete(&held.command_id);
     }
     events
 }
@@ -637,7 +867,7 @@ mod tests {
     }
 
     #[test]
-    fn held_commands_wait_once_and_leave_when_decided() {
+    fn decided_commands_are_claimed_before_execution_and_removed_after_completion() {
         let dir = tempfile::tempdir().unwrap();
         let pending = Pending::new(dir.path().join("pending.json"));
         pending
@@ -654,6 +884,12 @@ mod tests {
         let decided = pending.take_decided();
         assert_eq!(decided.len(), 1);
         assert_eq!(decided[0].decision.as_deref(), Some("reject"));
+        assert!(decided[0].claimed);
+        assert_eq!(pending.list().len(), 2);
+        let restarted = Pending::new(pending.path.clone());
+        assert_eq!(restarted.take_decided().len(), 1);
+        pending.complete("c2").unwrap();
+        assert_eq!(pending.take_decided().len(), 0);
         assert_eq!(pending.list().len(), 1);
     }
 }

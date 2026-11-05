@@ -276,6 +276,15 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
                     .map_err(Error::from),
             )
         }
+        method::COMMAND_PROJECTION_UPDATE => {
+            let update: rpc::CommandProjectionUpdate = parse(params)?;
+            to_value(
+                engine
+                    .store()
+                    .write(|tx| tx.update_command_projection(&update))
+                    .map_err(Error::from),
+            )
+        }
         method::HARNESSES_TEST => to_value(engine.test_harness(parse(params)?).await),
         method::PREFERENCES_GET => to_value(engine.get_prefs()),
         method::PREFERENCES_SET => {
