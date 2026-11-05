@@ -7,6 +7,10 @@ AgentUX installation. This applies to standalone installations and to nodes
 enrolled with AgentUX Command. The Cockpit can therefore show the local source
 of truth without requiring a gateway or a Command connection.
 
+The node-alert contract assigns enrolled alert relay and authenticated
+organization/node scoping to the gateway. Runtime implementation remains
+tracked in Core #102.
+
 When enrolled, the gateway relays sequenced Core-owned alert events and binds
 exported state to the authenticated organization and node identity. Command
 projects the received state; it does not create, resolve, or rewrite Core alert
@@ -97,8 +101,11 @@ from the local record; the gateway supplies authenticated scope on export.
 }
 ```
 
-These examples describe the domain record and tombstone; the AUXP snapshot
-envelope and projection schema remain authoritative for transport.
+These examples remain local domain records and tombstones. Future export must
+follow the authoritative AUXP [node snapshot schema](https://github.com/agentux-os/agentux-protocol/blob/main/schemas/v1/node-snapshot.schema.json)
+and [node snapshot fixture](https://github.com/agentux-os/agentux-protocol/blob/main/fixtures/v1/node-snapshot.json)
+wire shapes, including `state.currentState`, `kind: removed`, and
+`removedAtSequence`.
 
 ## Producers and snapshot gate
 

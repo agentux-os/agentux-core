@@ -32,7 +32,7 @@ Messages are POSTed to `<command>/v1/protocol/messages` with `Authorization: Bea
 
 `execution.activity.v1` is offered in `node.hello` and used only when Command returns it in `acceptedCapabilities`. The current Core emits `tool_started`, `tool_completed` and `tool_failed` when the ACP adapter reports the corresponding status. It does not infer task trees, delegation, progress percentages or artifacts from provider-specific data. `node.event_replay.v1` is negotiated the same way.
 
-When enrolled, the gateway relays sequenced Core-owned local alerts and binds exported state to the authenticated organization and node identity. See the [node alert contract](node-alerts.md). The gateway does not derive alerts from heartbeat or harness polling; Command derives fleet presence separately.
+The node-alert contract assigns enrolled alert relay and authenticated organization/node scoping to the gateway. Runtime implementation remains tracked in Core #102. See the [node alert contract](node-alerts.md). The gateway does not derive alerts from heartbeat or harness polling; Command derives fleet presence separately.
 
 ## Commands from Command
 
