@@ -63,6 +63,9 @@ pub struct LaunchSpec<'a> {
     /// `session/load`: the tool catalog's skills (ADR 0026).
     pub additional_directories: &'a [PathBuf],
     pub meta: Option<&'a serde_json::Map<String, serde_json::Value>>,
+    /// Variables to start the harness with (OpenCode's skills
+    /// configuration).
+    pub env: &'a [(String, String)],
 }
 
 /// Starts harness sessions. The daemon uses [`HarnessLauncher`]; tests plug in
@@ -99,6 +102,7 @@ impl Launcher for HarnessLauncher {
                 .await
                 .unwrap_or_default();
             harness.env.extend(keys);
+            harness.env.extend(spec.env.iter().cloned());
             if let Some(profile) = spec.sandbox {
                 let (program, args) = profile.command(&harness.command, &harness.args);
                 harness.command = program;
@@ -134,6 +138,7 @@ struct Slot {
     /// Its skills (ADR 0026), to reload it with them.
     additional_directories: Vec<PathBuf>,
     meta: Option<serde_json::Map<String, serde_json::Value>>,
+    env: Vec<(String, String)>,
     /// The agent can reopen the session with `session/load`.
     can_load: bool,
     /// Handed over to the harness's TUI: turns wait (see
@@ -381,6 +386,7 @@ impl AcpExecutor {
             sandbox: opened.sandbox.as_ref(),
             additional_directories: &opened.additional_directories,
             meta: opened.meta.as_ref(),
+            env: &opened.env,
         };
         match self.launcher.launch(spec, handler).await {
             Ok((session, events)) => {
@@ -418,6 +424,7 @@ impl AcpExecutor {
                     sandbox: opened.sandbox,
                     additional_directories: opened.additional_directories,
                     meta: opened.meta,
+                    env: opened.env,
                     can_load: session.can_load(),
                     attached: AtomicBool::new(false),
                     host: host_slot,
@@ -509,6 +516,7 @@ impl AcpExecutor {
             sandbox: None,
             additional_directories: &[],
             meta: None,
+            env: &[],
         };
         let (session, mut events) = self
             .launcher
@@ -752,6 +760,7 @@ impl StepExecutor for AcpExecutor {
                 sandbox: slot.sandbox.as_ref(),
                 additional_directories: &slot.additional_directories,
                 meta: slot.meta.as_ref(),
+                env: &slot.env,
             };
             let launched = self.launcher.launch(spec, handler).await;
             slot.attached.store(false, Ordering::SeqCst);

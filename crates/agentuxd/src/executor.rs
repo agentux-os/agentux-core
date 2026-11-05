@@ -97,6 +97,9 @@ pub struct OpenedSession {
     pub additional_directories: Vec<std::path::PathBuf>,
     /// `_meta` for `session/new`: Claude Code's `agentux` skills plugin.
     pub meta: Option<serde_json::Map<String, serde_json::Value>>,
+    /// Variables to start the harness with: OpenCode's skills
+    /// configuration.
+    pub env: Vec<(String, String)>,
 }
 
 /// A wake from the agent bus: prompt a session so it reads its new mail, or

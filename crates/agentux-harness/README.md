@@ -50,6 +50,17 @@ Antigravity stays experimental: the `agy` CLI's headless mode hangs without a TT
 
 Each harness uses the login the user set up for it (ADR 0002); nothing here handles credentials.
 
+### Catalog skills
+
+How each harness gets the tool catalog's skills ([ADR 0026](https://github.com/agentux-os/agentux/blob/main/docs/adr/0026-tool-catalog-skills.md)). `agentuxd`'s `skills` module builds the session's directory and picks the route; this crate passes `additionalDirectories`, `_meta` and the environment on.
+
+| id | Route | Pinned behavior |
+|---|---|---|
+| `claude-code` | An `agentux` plugin in `_meta.claudeCode.options.plugins` | `claude-agent-acp` 0.85.1 spreads `_meta.claudeCode.options` into the Agent SDK's options |
+| `codex` | `<dir>` in `additionalDirectories` | `codex-acp` 2.1.1 takes `<dir>/.agents/skills` as a skills root |
+| `opencode` | `skills.paths` in `OPENCODE_CONFIG_CONTENT` | OpenCode 1.18.34 merges this variable after the global and project configuration with remeda's `mergeDeep`, which replaces arrays (`src/config/config.ts`). So `agentuxd` reads the `skills.paths` OpenCode would use without it (the variable's own, else the last of the global files, `OPENCODE_CONFIG`, the worktree's `opencode.json(c)`, `.opencode/`, `~/.opencode/` and `OPENCODE_CONFIG_DIR`) and adds the session's directory. The managed configuration (`/etc/opencode`) and an account's organization configuration come later and can still replace the list. A value it can't read moves the session to the skill index |
+| `antigravity` | The skill index in the session prompt | No documented way to add a skills directory |
+
 ## Tests
 
 `tests/acp.rs` runs the scriptable fake ACP agent from [`agentux-fake-agent`](../agentux-fake-agent) (built with the SDK's agent side; `agentuxd`'s tests use it too) in-process over a byte pipe. It covers initialize, session creation in the given directory, a prompt that streams every event kind, allowed and denied permission requests, and cancellation while a permission request is pending. A Unix-only test checks that the subprocess gets the working directory and environment, and that a harness exiting during startup is an error rather than a hang. No vendor CLI or network is needed.

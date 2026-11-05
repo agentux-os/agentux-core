@@ -2490,28 +2490,35 @@ impl StepHost for RunHost {
         for note in notes {
             self.record("a tool catalog note", |tx| Ok(tx.log(&self.run_id, note)?));
         }
-        // The catalog's instructions, after the bus's own prompt.
-        let system_prompt = match (system_prompt, instructions) {
-            (prompt, None) => prompt,
-            (prompt, Some(text)) => Some(
-                prompt
-                    .into_iter()
-                    .chain(std::iter::once(format!(
-                        "## Instructions from the AgentUX tool catalog\n\n{text}"
-                    )))
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            ),
-        };
         // The catalog's skills, in a directory of this session's own (ADR
         // 0026), read-only in the sandbox at the same path.
-        let skills = crate::skills::deliver(&catalog, harness, &session.id, Path::new(&self.cwd));
+        let harness_env = sandbox
+            .as_ref()
+            .map(crate::sandbox::Profile::harness_env)
+            .unwrap_or_default();
+        let skills = crate::skills::deliver(
+            &catalog,
+            harness,
+            &session.id,
+            Path::new(&self.cwd),
+            &harness_env,
+        );
         for note in skills.notes {
             self.record("a skills note", |tx| Ok(tx.log(&self.run_id, note)?));
         }
         if let (Some(profile), Some(dir)) = (&mut sandbox, &skills.dir) {
             profile.extra_read_only.push(dir.clone());
         }
+        // The catalog's instructions, then the skill index of a harness
+        // without a native route, after the bus's own prompt.
+        let system_prompt = system_prompt
+            .into_iter()
+            .chain(
+                instructions
+                    .map(|text| format!("## Instructions from the AgentUX tool catalog\n\n{text}")),
+            )
+            .chain(skills.prompt)
+            .reduce(|prompt, part| format!("{prompt}\n\n{part}"));
         Ok(OpenedSession {
             id: session.id,
             mcp_servers,
@@ -2519,6 +2526,7 @@ impl StepHost for RunHost {
             sandbox,
             additional_directories: skills.additional_directories,
             meta: skills.meta,
+            env: skills.env,
         })
     }
 
