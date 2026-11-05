@@ -206,7 +206,7 @@ scripts/sandbox-real-harnesses.sh --harness codex --harness antigravity --keep
 
 Harnesses that aren't installed or signed in are skipped. It prints a PASS/FAIL/SKIP table per harness and check and exits non-zero on a FAIL. It runs the agents unattended (`--auto-approve-permissions`, inside the sandbox) and spends a little of your plan or API credit. It prints nothing from your environment or the CLIs' files. The logs go to a directory it names at the end; they hold the agents' replies and stderr, so review them before sharing. Your `~/.config/agentux` (preferences, tool catalog, `sandbox.yaml`) is left out unless you pass `--user-config`. CI runs the same script with `--fake`: scripted ACP agents and a throwaway home, through the real Bubblewrap and pasta.
 
-## Tool catalog (MCP servers and instructions)
+## Tool catalog (MCP servers, instructions and skills)
 
 Declare an MCP server once and every harness's sessions get it: Claude Code, Codex, OpenCode and Antigravity alike. agentuxd hands the servers to each session in ACP's `session/new`, next to the `agentux` bus, so there's no per-CLI configuration file to keep in sync. A run that falls back to another harness keeps its tools.
 
@@ -241,7 +241,29 @@ instructions:             # in agentux.yaml, under `tools:`
     harnesses: [codex]    # optional: every harness when left out
 ```
 
-agentuxd adds them to the session prompt that comes before a session's first turn, under "Instructions from the AgentUX tool catalog", each under its name. Nothing is written into the vendors' own files, so a project's `CLAUDE.md` and `AGENTS.md` stay as the project wrote them, and a run that falls back to another harness gets the same instructions. A text is at most 16 KiB. `aux tools` and the cockpit's Tools section list the instructions with their size. Skills, which each vendor reads from its own directory, aren't in the catalog yet.
+agentuxd adds them to the session prompt that comes before a session's first turn, under "Instructions from the AgentUX tool catalog", each under its name. Nothing is written into the vendors' own files, so a project's `CLAUDE.md` and `AGENTS.md` stay as the project wrote them, and a run that falls back to another harness gets the same instructions. A text is at most 16 KiB. `aux tools` and the cockpit's Tools section list the instructions with their size.
+
+**Skills** ([ADR 0026](https://github.com/agentux-os/agentux/blob/main/docs/adr/0026-tool-catalog-skills.md)) are Agent Skills directories (`SKILL.md` and its files), from a local `path` or a `git` repository pinned to a full commit (`rev`, optionally `subdir` and a `digest`):
+
+```yaml
+skills:
+  - name: pdf
+    git: https://github.com/anthropics/skills
+    rev: 0123456789abcdef0123456789abcdef01234567
+    subdir: skills/pdf
+    harnesses: [claude-code, codex]   # optional
+```
+
+The catalog validates them as the ADR says:
+- an Agent Skills name;
+- exactly one source;
+- no branch or tag names;
+- no password or token in a Git URL;
+- in a project's `agentux.yaml`, only relative paths inside the repository.
+
+Delivering skills to sessions comes next; for now `aux tools` lists them.
+
+**Locked entries.** In the machine catalog (`/etc/agentux/tools.yaml`), any entry (MCP server, instruction or skill) can carry `locked: true`. A user's or project's entry of the same name is then left out, and the run's log says so. `locked` anywhere else is a validation error, and `aux tools add` refuses a locked name.
 
 ## Crates
 

@@ -37,8 +37,10 @@ pub use isolation::{
 };
 pub use permissions::{Access, CATEGORIES as PERMISSION_CATEGORIES, Decided, Permissions, Rules};
 pub use tools::{
-    EnvValue, MACHINE_FILE as TOOLS_MACHINE_FILE, McpTool, RESERVED_NAME as TOOLS_RESERVED_NAME,
-    Source as ToolSource, ToolCatalog, user_file as tools_user_file,
+    EnvValue, Instruction, MACHINE_FILE as TOOLS_MACHINE_FILE, MAX_SESSION_SKILL_BYTES,
+    MAX_SESSION_SKILLS, MAX_SKILL_BYTES, MAX_SKILL_FILES, MAX_SKILL_MD_BYTES, McpTool,
+    RESERVED_NAME as TOOLS_RESERVED_NAME, Skill, SkillFallback, Source as ToolSource, ToolCatalog,
+    user_file as tools_user_file,
 };
 
 /// Name of the pipeline file at the root of a project.

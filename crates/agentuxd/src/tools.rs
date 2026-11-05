@@ -28,7 +28,12 @@ pub fn catalog(project: ToolCatalog) -> (ToolCatalog, Vec<String>) {
         ToolSource::Machine,
     );
     let user = layer(agentux_config::tools_user_file(), ToolSource::User);
-    (machine.merge(user).merge(project), notes)
+    // Locked machine entries stay; what tried to replace one is a note.
+    let (merged, refused) = machine.merge_layer(user);
+    notes.extend(refused);
+    let (merged, refused) = merged.merge_layer(project);
+    notes.extend(refused);
+    (merged, notes)
 }
 
 /// The servers `harness`'s session gets, with their secrets from `secret`.
@@ -98,6 +103,7 @@ pub fn listing(
                 env: tool.env.keys().cloned().collect(),
                 headers: tool.headers.keys().cloned().collect(),
                 secrets,
+                locked: tool.locked,
             }
         })
         .collect();
@@ -109,11 +115,26 @@ pub fn listing(
             source: i.source.to_string(),
             harnesses: i.harnesses.clone(),
             chars: i.text.chars().count(),
+            locked: i.locked,
+        })
+        .collect();
+    let skills = catalog
+        .skills
+        .values()
+        .map(|s| agentux_api::rpc::SkillInfo {
+            name: s.name.clone(),
+            source: s.source.to_string(),
+            harnesses: s.harnesses.clone(),
+            origin: if s.git.is_some() { "git" } else { "path" }.to_string(),
+            rev: s.rev.clone(),
+            digest: s.digest.clone(),
+            locked: s.locked,
         })
         .collect();
     agentux_api::rpc::ToolsListing {
         mcp,
         instructions,
+        skills,
         notes,
     }
 }

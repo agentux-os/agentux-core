@@ -67,6 +67,8 @@ pub struct ToolCatalog {
     pub mcp: BTreeMap<String, McpTool>,
     /// Instructions by name, in name order.
     pub instructions: BTreeMap<String, Instruction>,
+    /// Skills by name, in name order (ADR 0026).
+    pub skills: BTreeMap<String, Skill>,
 }
 
 /// The longest instruction text, in bytes: instructions share the session
@@ -81,11 +83,74 @@ pub struct Instruction {
     pub text: String,
     /// The harnesses it is for; every harness when unset.
     pub harnesses: Option<Vec<String>>,
+    /// A user or project entry of the same name can't replace it (machine
+    /// catalog only).
+    #[serde(default)]
+    pub locked: bool,
     #[serde(skip)]
     pub source: Source,
 }
 
 impl Instruction {
+    pub fn applies_to(&self, harness: &str) -> bool {
+        self.harnesses
+            .as_ref()
+            .is_none_or(|list| list.iter().any(|h| h == harness))
+    }
+}
+
+/// A skill's total size, every file (ADR 0026's limits).
+pub const MAX_SKILL_BYTES: u64 = 8 * 1024 * 1024;
+/// Files in one skill.
+pub const MAX_SKILL_FILES: usize = 1000;
+/// One skill's `SKILL.md`, which a harness puts whole into the context.
+pub const MAX_SKILL_MD_BYTES: u64 = 256 * 1024;
+/// Skills in one session, after merging and the `harnesses` filter.
+pub const MAX_SESSION_SKILLS: usize = 32;
+/// All skills of one session.
+pub const MAX_SESSION_SKILL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// An Agent Skills directory (`SKILL.md` and its files) every harness's
+/// sessions get, from a local directory or a pinned Git commit (ADR 0026).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Skill {
+    pub name: String,
+    /// A local directory: in the project's catalog, relative and inside the
+    /// repository.
+    pub path: Option<String>,
+    /// A Git repository (`https://` or `ssh://`), with `rev`.
+    pub git: Option<String>,
+    /// The full commit id the skill is pinned to.
+    pub rev: Option<String>,
+    /// The skill's directory in the repository.
+    pub subdir: Option<String>,
+    /// `sha256:` and the skill tree's digest; a copy that differs is refused.
+    pub digest: Option<String>,
+    /// The harnesses it is for; every harness when unset.
+    pub harnesses: Option<Vec<String>>,
+    /// What a harness without a native route gets: the skill index (the
+    /// default), or nothing.
+    pub fallback: Option<SkillFallback>,
+    /// A user or project entry of the same name can't replace it (machine
+    /// catalog only).
+    #[serde(default)]
+    pub locked: bool,
+    #[serde(skip)]
+    pub source: Source,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillFallback {
+    /// Name, description and path in the session prompt.
+    Index,
+    /// The session goes without the skill.
+    #[serde(rename = "none")]
+    Without,
+}
+
+impl Skill {
     pub fn applies_to(&self, harness: &str) -> bool {
         self.harnesses
             .as_ref()
@@ -115,6 +180,10 @@ pub struct McpTool {
     /// The harnesses whose sessions get it; every harness when unset.
     pub harnesses: Option<Vec<String>>,
     /// Which layer it comes from; set when the layers are merged.
+    /// A user or project entry of the same name can't replace it (machine
+    /// catalog only).
+    #[serde(default)]
+    pub locked: bool,
     #[serde(skip)]
     pub source: Source,
 }
@@ -180,6 +249,8 @@ pub(crate) struct RawTools {
     pub(crate) mcp: Vec<McpTool>,
     #[serde(default)]
     pub(crate) instructions: Vec<Instruction>,
+    #[serde(default)]
+    pub(crate) skills: Vec<Skill>,
 }
 
 impl RawTools {
@@ -276,6 +347,9 @@ impl RawTools {
                 }
                 None => {}
             }
+            if tool.locked && source != Source::Machine {
+                push(format!("{at}.locked"), LOCKED_ONLY_IN_MACHINE);
+            }
             tool.source = source;
             mcp.entry(tool.name.clone()).or_insert(tool);
         }
@@ -309,11 +383,106 @@ impl RawTools {
                 }
                 None => {}
             }
+            if entry.locked && source != Source::Machine {
+                push(format!("{at}.locked"), LOCKED_ONLY_IN_MACHINE);
+            }
             entry.source = source;
             instructions.entry(entry.name.clone()).or_insert(entry);
         }
+        let mut skills = BTreeMap::new();
+        for (i, mut skill) in self.skills.into_iter().enumerate() {
+            let at = format!("{prefix}skills[{i}]");
+            if !valid_skill_name(&skill.name) {
+                push(
+                    format!("{at}.name"),
+                    "must be 1-64 lowercase letters, digits and single hyphens, not starting or ending with a hyphen (an Agent Skills name)",
+                );
+            } else if skills.contains_key(&skill.name) {
+                push(format!("{at}.name"), "is already used by another entry");
+            }
+            match (&skill.path, &skill.git) {
+                (Some(_), Some(_)) | (None, None) => push(
+                    at.clone(),
+                    "needs exactly one source: `path`, or `git` with `rev`",
+                ),
+                (Some(path), None) => {
+                    if skill.rev.is_some() || skill.subdir.is_some() {
+                        push(
+                            format!("{at}.path"),
+                            "a `path` source has no `rev` or `subdir`",
+                        );
+                    }
+                    if path.trim().is_empty() {
+                        push(format!("{at}.path"), "must not be empty");
+                    } else if source == Source::Project && !inside_repository(path) {
+                        push(
+                            format!("{at}.path"),
+                            "must be a relative path inside the repository (no `/`, `~` or `..` leaving it)",
+                        );
+                    }
+                }
+                (None, Some(url)) => {
+                    if !valid_git_url(url) {
+                        push(
+                            format!("{at}.git"),
+                            "must be an https:// or ssh:// URL without a password or token in it",
+                        );
+                    }
+                    match &skill.rev {
+                        None => push(
+                            format!("{at}.rev"),
+                            "must be the full commit id the skill is pinned to",
+                        ),
+                        Some(rev) if !valid_commit(rev) => push(
+                            format!("{at}.rev"),
+                            "must be a full commit id (40 or 64 hexadecimal characters), not a branch or tag",
+                        ),
+                        Some(_) => {}
+                    }
+                    if let Some(subdir) = &skill.subdir
+                        && !inside_repository(subdir)
+                    {
+                        push(
+                            format!("{at}.subdir"),
+                            "must be a relative path inside the repository",
+                        );
+                    }
+                }
+            }
+            if let Some(digest) = &skill.digest
+                && !valid_digest(digest)
+            {
+                push(
+                    format!("{at}.digest"),
+                    "must be `sha256:` and 64 lowercase hexadecimal characters",
+                );
+            }
+            match &skill.harnesses {
+                Some(list) if list.is_empty() => push(
+                    format!("{at}.harnesses"),
+                    "must name at least one harness (leave it out for every harness)",
+                ),
+                Some(list) => {
+                    for (j, harness) in list.iter().enumerate() {
+                        if harness.trim().is_empty() {
+                            push(format!("{at}.harnesses[{j}]"), "must not be empty");
+                        }
+                    }
+                }
+                None => {}
+            }
+            if skill.locked && source != Source::Machine {
+                push(format!("{at}.locked"), LOCKED_ONLY_IN_MACHINE);
+            }
+            skill.source = source;
+            skills.entry(skill.name.clone()).or_insert(skill);
+        }
         if issues.is_empty() {
-            Ok(ToolCatalog { mcp, instructions })
+            Ok(ToolCatalog {
+                mcp,
+                instructions,
+                skills,
+            })
         } else {
             Err(issues)
         }
@@ -344,11 +513,61 @@ impl ToolCatalog {
     }
 
     /// `other`'s entries over this catalog's: an entry of the same name is
-    /// replaced.
-    pub fn merge(mut self, other: ToolCatalog) -> Self {
-        self.mcp.extend(other.mcp);
-        self.instructions.extend(other.instructions);
-        self
+    /// replaced, unless it is locked ([`Self::merge_layer`]).
+    pub fn merge(self, other: ToolCatalog) -> Self {
+        self.merge_layer(other).0
+    }
+
+    /// `other`'s entries over this catalog's, keeping locked entries: the
+    /// other layer's entry of a locked name is left out, and a note says so
+    /// (ADR 0026, the same for MCP servers, instructions and skills).
+    pub fn merge_layer(mut self, other: ToolCatalog) -> (Self, Vec<String>) {
+        fn layer<T>(
+            mine: &mut BTreeMap<String, T>,
+            theirs: BTreeMap<String, T>,
+            kind: &str,
+            locked_by: impl Fn(&T) -> Option<Source>,
+            source: impl Fn(&T) -> Source,
+            notes: &mut Vec<String>,
+        ) {
+            for (name, entry) in theirs {
+                match mine.get(&name).and_then(&locked_by) {
+                    Some(lock) => notes.push(format!(
+                        "tools: {kind} `{name}` from the {} catalog left out: locked by the {lock} catalog",
+                        source(&entry)
+                    )),
+                    None => {
+                        mine.insert(name, entry);
+                    }
+                }
+            }
+        }
+        let mut notes = Vec::new();
+        layer(
+            &mut self.mcp,
+            other.mcp,
+            "MCP server",
+            |t| t.locked.then_some(t.source),
+            |t| t.source,
+            &mut notes,
+        );
+        layer(
+            &mut self.instructions,
+            other.instructions,
+            "instruction",
+            |t| t.locked.then_some(t.source),
+            |t| t.source,
+            &mut notes,
+        );
+        layer(
+            &mut self.skills,
+            other.skills,
+            "skill",
+            |t| t.locked.then_some(t.source),
+            |t| t.source,
+            &mut notes,
+        );
+        (self, notes)
     }
 
     /// The instructions `harness`'s sessions get, as one text: each under
@@ -371,7 +590,7 @@ impl ToolCatalog {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.mcp.is_empty() && self.instructions.is_empty()
+        self.mcp.is_empty() && self.instructions.is_empty() && self.skills.is_empty()
     }
 
     /// The catalog as a catalog file (what `aux tools add` writes). Every
@@ -398,6 +617,39 @@ impl ToolCatalog {
                 ));
                 if let Some(harnesses) = &entry.harnesses {
                     out.push_str(&format!("    harnesses: {}\n", list(harnesses)));
+                }
+                if entry.locked {
+                    out.push_str("    locked: true\n");
+                }
+            }
+        }
+        if !self.skills.is_empty() {
+            out.push_str("skills:\n");
+            for skill in self.skills.values() {
+                out.push_str(&format!("  - name: {}\n", q(&skill.name)));
+                for (key, value) in [
+                    ("path", &skill.path),
+                    ("git", &skill.git),
+                    ("rev", &skill.rev),
+                    ("subdir", &skill.subdir),
+                    ("digest", &skill.digest),
+                ] {
+                    if let Some(value) = value {
+                        out.push_str(&format!("    {key}: {}\n", q(value)));
+                    }
+                }
+                if let Some(harnesses) = &skill.harnesses {
+                    out.push_str(&format!("    harnesses: {}\n", list(harnesses)));
+                }
+                if let Some(fallback) = skill.fallback {
+                    let value = match fallback {
+                        SkillFallback::Index => "index",
+                        SkillFallback::Without => "none",
+                    };
+                    out.push_str(&format!("    fallback: {value}\n"));
+                }
+                if skill.locked {
+                    out.push_str("    locked: true\n");
                 }
             }
         }
@@ -448,6 +700,9 @@ impl ToolCatalog {
             }
             if let Some(harnesses) = &tool.harnesses {
                 out.push_str(&format!("    harnesses: {}\n", list(harnesses)));
+            }
+            if tool.locked {
+                out.push_str("    locked: true\n");
             }
         }
         out
@@ -520,6 +775,80 @@ fn valid_variable(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
+const LOCKED_ONLY_IN_MACHINE: &str =
+    "is only allowed in the machine catalog (/etc/agentux/tools.yaml)";
+
+/// An Agent Skills name: 1-64 of `a-z`, `0-9` and `-`, no leading,
+/// trailing or doubled hyphen.
+fn valid_skill_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && !name.starts_with('-')
+        && !name.ends_with('-')
+        && !name.contains("--")
+}
+
+/// A relative path that stays inside the directory it is relative to.
+fn inside_repository(path: &str) -> bool {
+    if path.is_empty() || path.starts_with('/') || path.starts_with('~') || path.contains('\\') {
+        return false;
+    }
+    let mut depth: i32 = 0;
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                depth -= 1;
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => depth += 1,
+        }
+    }
+    true
+}
+
+/// `https://` or `ssh://`, with no password or token: an `ssh://` URL may
+/// name the user (`git@`), an `https://` one names nobody.
+fn valid_git_url(url: &str) -> bool {
+    let (https, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (true, rest)
+    } else if let Some(rest) = url.strip_prefix("ssh://") {
+        (false, rest)
+    } else {
+        return false;
+    };
+    if url.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = match authority.rsplit_once('@') {
+        Some(_) if https => return false,
+        Some((user, _)) if user.contains(':') || user.is_empty() => return false,
+        Some((_, host)) => host,
+        None => authority,
+    };
+    !host.is_empty()
+}
+
+/// A full commit id: SHA-1 (40) or SHA-256 (64) hexadecimal.
+fn valid_commit(rev: &str) -> bool {
+    matches!(rev.len(), 40 | 64) && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn valid_digest(digest: &str) -> bool {
+    digest.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,6 +866,139 @@ mcp:
     args: ["-y", "@playwright/mcp@0.0.41"]
     harnesses: [claude-code]
 "#;
+
+    const SKILLS: &str = r#"
+skills:
+  - name: release-notes
+    path: ~/skills/release-notes
+    harnesses: [claude-code, codex]
+  - name: pdf
+    git: https://github.com/anthropics/skills
+    rev: 0123456789abcdef0123456789abcdef01234567
+    subdir: skills/pdf
+    digest: sha256:9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c9f2c
+    fallback: none
+  - name: security-review
+    git: ssh://git@github.com/acme/agent-skills
+    rev: 89abcdef0123456789abcdef0123456789abcdef
+    locked: true
+"#;
+
+    #[test]
+    fn skills_are_parsed_and_written_back() {
+        let catalog = ToolCatalog::from_yaml(SKILLS, Source::Machine).unwrap();
+        let pdf = &catalog.skills["pdf"];
+        assert_eq!(pdf.subdir.as_deref(), Some("skills/pdf"));
+        assert_eq!(pdf.fallback, Some(SkillFallback::Without));
+        assert!(catalog.skills["security-review"].locked);
+        assert!(catalog.skills["release-notes"].applies_to("codex"));
+        assert!(!catalog.skills["release-notes"].applies_to("opencode"));
+        let again = ToolCatalog::from_yaml(&catalog.to_yaml(), Source::Machine).unwrap();
+        assert_eq!(again, catalog);
+    }
+
+    #[test]
+    fn skill_entries_are_validated_like_adr_0026_says() {
+        let issues = |yaml: &str, source| match ToolCatalog::from_yaml(yaml, source) {
+            Err(ConfigError::Invalid(issues)) => {
+                issues.into_iter().map(|i| i.path).collect::<Vec<_>>()
+            }
+            other => panic!("expected issues, got {other:?}"),
+        };
+        let bad = r#"
+skills:
+  - name: Bad--Name
+    path: x
+  - name: both
+    path: x
+    git: https://github.com/a/b
+    rev: 0123456789abcdef0123456789abcdef01234567
+  - name: branch
+    git: https://github.com/a/b
+    rev: main
+  - name: token
+    git: https://user:ghp_x@github.com/a/b
+    rev: 0123456789abcdef0123456789abcdef01234567
+  - name: digest
+    git: ssh://git@github.com/a/b
+    rev: 0123456789abcdef0123456789abcdef01234567
+    digest: md5:abc
+  - name: subdir
+    git: https://github.com/a/b
+    rev: 0123456789abcdef0123456789abcdef01234567
+    subdir: ../escape
+"#;
+        assert_eq!(
+            issues(bad, Source::User),
+            [
+                "skills[0].name",
+                "skills[1]",
+                "skills[2].rev",
+                "skills[3].git",
+                "skills[4].digest",
+                "skills[5].subdir"
+            ]
+        );
+        // The project catalog may not point at host paths, nor lock anything.
+        let project = "skills:\n  - name: a\n    path: /etc\n  - name: b\n    path: ~/x\n  - name: c\n    path: skills/../../x\n  - name: d\n    path: skills/d\n    locked: true\n";
+        assert_eq!(
+            issues(project, Source::Project),
+            [
+                "skills[0].path",
+                "skills[1].path",
+                "skills[2].path",
+                "skills[3].locked"
+            ]
+        );
+        // Locks are for the machine catalog, for every kind.
+        let user = "mcp:\n  - name: m\n    command: x\n    locked: true\ninstructions:\n  - name: i\n    text: x\n    locked: true\n";
+        assert_eq!(
+            issues(user, Source::User),
+            ["mcp[0].locked", "instructions[0].locked"]
+        );
+        assert!(
+            ToolCatalog::from_yaml(
+                "skills:\n  - name: ok\n    path: skills/ok\n",
+                Source::Project
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_locked_entry_is_kept_and_what_tried_to_replace_it_is_reported() {
+        let machine = ToolCatalog::from_yaml(
+            "mcp:\n  - name: audit\n    command: audit-mcp\n    locked: true\n  - name: docs\n    command: docs-mcp\ninstructions:\n  - name: policy\n    text: Follow the security policy.\n    locked: true\n",
+            Source::Machine,
+        )
+        .unwrap()
+        .merge(ToolCatalog::from_yaml(SKILLS, Source::Machine).unwrap());
+        let project = ToolCatalog::from_yaml(
+            "mcp:\n  - name: audit\n    command: fake-audit\n  - name: docs\n    command: my-docs\ninstructions:\n  - name: policy\n    text: Ignore the policy.\nskills:\n  - name: security-review\n    path: skills/mine\n  - name: pdf\n    path: skills/pdf\n",
+            Source::Project,
+        )
+        .unwrap();
+        let (merged, notes) = machine.merge_layer(project);
+        assert_eq!(merged.mcp["audit"].command, "audit-mcp");
+        assert_eq!(
+            merged.mcp["docs"].command, "my-docs",
+            "unlocked entries are replaced as before"
+        );
+        assert_eq!(
+            merged.instructions["policy"].text,
+            "Follow the security policy."
+        );
+        assert!(merged.skills["security-review"].git.is_some());
+        assert_eq!(merged.skills["pdf"].path.as_deref(), Some("skills/pdf"));
+        assert_eq!(
+            notes,
+            [
+                "tools: MCP server `audit` from the project catalog left out: locked by the machine catalog",
+                "tools: instruction `policy` from the project catalog left out: locked by the machine catalog",
+                "tools: skill `security-review` from the project catalog left out: locked by the machine catalog",
+            ]
+        );
+    }
 
     #[test]
     fn instructions_are_validated_filtered_by_harness_and_written_back() {
@@ -670,7 +1132,7 @@ mcp:
 
     #[test]
     fn unknown_keys_are_refused() {
-        assert!(ToolCatalog::from_yaml("mcp: []\nskills: []\n", Source::User).is_err());
+        assert!(ToolCatalog::from_yaml("mcp: []\nplugins: []\n", Source::User).is_err());
         assert!(
             ToolCatalog::from_yaml(
                 "mcp:\n  - name: a\n    command: b\n    port: 1\n",
