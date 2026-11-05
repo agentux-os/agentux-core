@@ -489,21 +489,89 @@ pub fn deliver(
             ..Delivery::default()
         };
     };
-    let var = |name: &str| {
-        harness_env
-            .iter()
-            .find(|(var, _)| var == name)
-            .map(|(_, value)| value.clone())
-            .or_else(|| std::env::var(name).ok())
-    };
     deliver_with(
         &store,
         &home.join(SESSIONS_DIR).join(session_id),
         harness,
         skills,
         project,
-        &var,
+        &harness_var(harness_env),
     )
+}
+
+/// A variable of the harness's environment: `harness_env`'s, else agentuxd's.
+fn harness_var(harness_env: &[(String, String)]) -> impl Fn(&str) -> Option<String> + '_ {
+    move |name: &str| {
+        harness_env
+            .iter()
+            .find(|(var, _)| var == name)
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var(name).ok())
+    }
+}
+
+/// What a harness's TUI is started with to get the skills of session
+/// `session_id` when the session is handed over to it (ADRs 0007 and 0026).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tui {
+    /// Arguments after the TUI's resume command.
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    /// The session's skills directory, to mount read-only in a sandbox.
+    pub dir: Option<PathBuf>,
+    /// Why the TUI goes without the skills, to show in the terminal.
+    pub note: Option<String>,
+}
+
+/// [`Tui`] for `harness`'s session `session_id` in `cwd`, while its skills
+/// directory lasts (it goes when the session ends); `harness_env` as for
+/// [`deliver`].
+pub fn tui(harness: &str, session_id: &str, cwd: &Path, harness_env: &[(String, String)]) -> Tui {
+    match data_home() {
+        Some(home) => tui_with(
+            &home.join(SESSIONS_DIR).join(session_id),
+            harness,
+            cwd,
+            &harness_var(harness_env),
+        ),
+        None => Tui::default(),
+    }
+}
+
+/// [`tui`] with a given session directory.
+fn tui_with(dir: &Path, harness: &str, cwd: &Path, var: &dyn Fn(&str) -> Option<String>) -> Tui {
+    if !dir.is_dir() {
+        return Tui::default();
+    }
+    let without = |why: String| Tui {
+        note: Some(format!(
+            "{harness}'s TUI goes without the catalog's skills: {why}."
+        )),
+        ..Tui::default()
+    };
+    match route(harness) {
+        // The same plugin as the ACP session's.
+        Route::Plugin if dir.join("agentux").is_dir() => Tui {
+            args: vec![
+                "--plugin-dir".into(),
+                dir.join("agentux").to_string_lossy().into_owned(),
+            ],
+            dir: Some(dir.to_path_buf()),
+            ..Tui::default()
+        },
+        Route::OpenCodePaths => match opencode_config(&dir.join(".agents/skills"), cwd, var) {
+            Ok(content) => Tui {
+                env: vec![("OPENCODE_CONFIG_CONTENT".into(), content)],
+                dir: Some(dir.to_path_buf()),
+                ..Tui::default()
+            },
+            Err(e) => without(e),
+        },
+        Route::AgentsDir => {
+            without("`codex resume` has no verified way to add a skills directory".into())
+        }
+        Route::Plugin | Route::Index => Tui::default(),
+    }
 }
 
 /// [`deliver`] with a given store and session directory, and `var` for the
@@ -1355,6 +1423,49 @@ mod tests {
         native.fallback = Some(agentux_config::SkillFallback::Without);
         let (_, dir) = delivered_entries(tmp.path(), "codex", &[native], &no_vars);
         assert!(dir.join(".agents/skills/secret/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn a_handed_over_tui_gets_the_sessions_skills() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+
+        let (_, dir) = delivered(tmp.path(), "claude-code", &["notes"]);
+        let claude = tui_with(&dir, "claude-code", &repo, &no_vars);
+        assert_eq!(
+            claude.args,
+            [
+                "--plugin-dir".to_string(),
+                dir.join("agentux").to_string_lossy().into_owned()
+            ]
+        );
+        assert_eq!(claude.dir.as_deref(), Some(dir.as_path()));
+        assert!(claude.env.is_empty() && claude.note.is_none());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let (_, dir) = delivered(tmp.path(), "opencode", &["notes"]);
+        let opencode = tui_with(&dir, "opencode", &repo, &no_vars);
+        assert!(opencode.args.is_empty());
+        let [(var, value)] = opencode.env.as_slice() else {
+            panic!("{:?}", opencode.env);
+        };
+        assert_eq!(var, "OPENCODE_CONFIG_CONTENT");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(value).unwrap(),
+            serde_json::json!({"skills": {"paths": [dir.join(".agents/skills")]}})
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let (_, dir) = delivered(tmp.path(), "codex", &["notes"]);
+        let codex = tui_with(&dir, "codex", &repo, &no_vars);
+        assert!(codex.args.is_empty() && codex.env.is_empty() && codex.dir.is_none());
+        assert!(codex.note.unwrap().contains("codex resume"));
+
+        // An ended session has no directory, and its TUI nothing to add.
+        remove_tree(&dir).unwrap();
+        assert_eq!(tui_with(&dir, "opencode", &repo, &no_vars), Tui::default());
     }
 
     #[test]

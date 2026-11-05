@@ -378,7 +378,7 @@ impl Engine {
         });
         self.inner.terminals.insert(Arc::clone(&term));
 
-        let env = target.env();
+        let mut env = target.env();
         match (command, &target.session) {
             (TerminalCommand::HarnessTui, Some(session)) => {
                 let argv = session
@@ -386,14 +386,35 @@ impl Engine {
                     .as_deref()
                     .and_then(|id| self.inner.settings.tui.resume(&session.harness, id));
                 // A sandboxed run's TUI opens in the same sandbox, never
-                // unconfined (ADR 0023).
+                // unconfined (ADR 0023), with the session's catalog skills
+                // (ADR 0026).
                 let argv = match argv {
-                    Some(argv) => {
+                    Some(mut argv) => {
                         match self.sandbox_profile(&target.run_id, &session.harness, &target.cwd) {
-                            Ok(None) => Ok(Some(argv)),
-                            Ok(Some(profile)) => {
-                                let (program, args) = profile.command(&argv[0], &argv[1..]);
-                                Ok(Some(std::iter::once(program).chain(args).collect()))
+                            Ok(profile) => {
+                                let harness_env = profile
+                                    .as_ref()
+                                    .map(crate::sandbox::Profile::harness_env)
+                                    .unwrap_or_default();
+                                let skills = crate::skills::tui(
+                                    &session.harness,
+                                    &session.id,
+                                    &target.cwd,
+                                    &harness_env,
+                                );
+                                argv.extend(skills.args);
+                                env.extend(skills.env);
+                                if let Some(note) = skills.note {
+                                    term.output(format!("[agentux] {note}\r\n").as_bytes());
+                                }
+                                match profile {
+                                    None => Ok(Some(argv)),
+                                    Some(mut profile) => {
+                                        profile.extra_read_only.extend(skills.dir);
+                                        let (program, args) = profile.command(&argv[0], &argv[1..]);
+                                        Ok(Some(std::iter::once(program).chain(args).collect()))
+                                    }
+                                }
                             }
                             Err(e) => Err(e),
                         }
