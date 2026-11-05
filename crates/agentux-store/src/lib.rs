@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agentux_api::{
     AttemptStatus, BusMessage, CheckResult, Event, EventBody, HarnessLimit, PermissionRequest,
     Project, PullRequest, RequestKind, RequestStatus, Run, RunStatus, Session, SessionState,
-    SessionUsage, StepAttempt, StepKind,
+    SessionUsage, SnapshotProjectionType, StepAttempt, StepKind,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
@@ -246,6 +246,25 @@ const REQUEST_COLUMNS: &str = "id, kind, run_id, project_id, step_index, step, t
 const SESSION_COLUMNS: &str = "id, run_id, project_id, role, harness, model, state, cwd, usage, \
      started_at, updated_at, ended_at, vendor_session_id";
 
+fn business_projection_type_name(kind: SnapshotProjectionType) -> &'static str {
+    match kind {
+        SnapshotProjectionType::Artifact => "artifact",
+        SnapshotProjectionType::Task => "task",
+        SnapshotProjectionType::Command => "command",
+    }
+}
+
+fn parse_business_projection_type(value: &str) -> Result<SnapshotProjectionType> {
+    match value {
+        "artifact" => Ok(SnapshotProjectionType::Artifact),
+        "task" => Ok(SnapshotProjectionType::Task),
+        "command" => Ok(SnapshotProjectionType::Command),
+        _ => Err(Error::Data(format!(
+            "unsupported business projection type {value:?}"
+        ))),
+    }
+}
+
 impl Tx<'_> {
     /// Pins opaque, already captured data under an immutable organization/node/checkpoint key.
     /// Conflicting retries fail instead of replacing the original capture.
@@ -443,8 +462,185 @@ impl Tx<'_> {
             sessions,
             limits: self.limits(now)?,
             gates,
+            business_projections: self.business_projections(organization_id)?,
             unavailable: snapshot::unavailable_projections(),
         })
+    }
+
+    /// Returns complete business projection records and retained tombstones
+    /// for one organization. Artifact/task rows remain tied to Command-owned
+    /// runs, so local-only work can never enter this inventory.
+    pub fn business_projections(
+        &self,
+        organization_id: &str,
+    ) -> Result<Vec<snapshot::BusinessProjectionEntry>> {
+        let mut stmt = self.tx.prepare(
+            "SELECT p.projection_type, p.projection_id, p.organization_id, p.run_id,
+                    p.current_state, p.updated_sequence, p.removed_sequence
+             FROM snapshot_business_projections p
+             WHERE p.organization_id = ?1
+               AND (p.run_id IS NULL OR EXISTS (
+                    SELECT 1 FROM runs r
+                    WHERE r.id = p.run_id
+                      AND json_extract(r.origin, '$.organizationId') = p.organization_id
+               ))
+             ORDER BY p.projection_type, p.projection_id",
+        )?;
+        let rows = stmt.query_map([organization_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (kind, id, organization_id, run_id, state, updated_sequence, removed_at_sequence) =
+                row?;
+            let projection_type = parse_business_projection_type(&kind)?;
+            Ok(snapshot::BusinessProjectionEntry {
+                projection_type,
+                id,
+                organization_id,
+                run_id,
+                state: state.map(|state| from_json(&state)).transpose()?,
+                updated_sequence,
+                removed_at_sequence,
+            })
+        })
+        .collect()
+    }
+
+    /// Persists a complete organization-owned state record and publishes the
+    /// change in the same transaction as its event sequence.
+    pub fn upsert_business_projection(
+        &mut self,
+        projection: &snapshot::BusinessProjection,
+    ) -> Result<i64> {
+        projection.validate().map_err(Error::Data)?;
+        if matches!(
+            projection.projection_type,
+            SnapshotProjectionType::Artifact | SnapshotProjectionType::Task
+        ) && projection.run_id.is_none()
+        {
+            return Err(Error::Data(
+                "artifact and task projections must belong to a Command-owned run".into(),
+            ));
+        }
+        if let Some(run_id) = projection.run_id.as_deref() {
+            let origin: Option<String> = self
+                .tx
+                .query_row("SELECT origin FROM runs WHERE id = ?1", [run_id], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .flatten();
+            let owner = origin
+                .as_deref()
+                .map(from_json::<agentux_api::RunOrigin>)
+                .transpose()?
+                .map(|origin| origin.organization_id);
+            if owner.as_deref() != Some(projection.organization_id.as_str()) {
+                return Err(Error::Data(
+                    "projection run is missing or outside its organization ownership".into(),
+                ));
+            }
+        }
+        let kind = business_projection_type_name(projection.projection_type);
+        let current_owner: Option<String> = self
+            .tx
+            .query_row(
+                "SELECT organization_id FROM snapshot_business_projections
+                 WHERE projection_type = ?1 AND projection_id = ?2",
+                params![kind, projection.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_owner
+            .as_deref()
+            .is_some_and(|owner| owner != projection.organization_id)
+        {
+            return Err(Error::Data(
+                "projection id is already owned by another organization".into(),
+            ));
+        }
+
+        self.emit(
+            projection.run_id.as_deref(),
+            EventBody::SnapshotProjectionChanged {
+                projection_type: projection.projection_type,
+                id: projection.id.clone(),
+                removed: false,
+            },
+        )?;
+        let sequence = self.events.last().expect("emit appends an event").seq;
+        self.tx.execute(
+            "INSERT INTO snapshot_business_projections (
+                 projection_type, projection_id, organization_id, run_id,
+                 current_state, updated_sequence, removed_sequence
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)
+             ON CONFLICT (projection_type, projection_id) DO UPDATE SET
+                 run_id = excluded.run_id,
+                 current_state = excluded.current_state,
+                 updated_sequence = excluded.updated_sequence,
+                 removed_sequence = NULL",
+            params![
+                kind,
+                projection.id,
+                projection.organization_id,
+                projection.run_id,
+                to_json(&projection.state)?,
+                sequence
+            ],
+        )?;
+        Ok(sequence)
+    }
+
+    /// Marks a projection removed without losing its organization, identity,
+    /// run association, or sequence attribution. Wrong-owner and repeated
+    /// removals are no-ops and cannot disclose another organization's row.
+    pub fn remove_business_projection(
+        &mut self,
+        projection_type: SnapshotProjectionType,
+        id: &str,
+        organization_id: &str,
+    ) -> Result<Option<i64>> {
+        let kind = business_projection_type_name(projection_type);
+        let existing: Option<(String, Option<String>, Option<i64>)> = self
+            .tx
+            .query_row(
+                "SELECT organization_id, run_id, removed_sequence
+                 FROM snapshot_business_projections
+                 WHERE projection_type = ?1 AND projection_id = ?2",
+                params![kind, id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((owner, run_id, removed_sequence)) = existing else {
+            return Ok(None);
+        };
+        if owner != organization_id || removed_sequence.is_some() {
+            return Ok(None);
+        }
+        self.emit(
+            run_id.as_deref(),
+            EventBody::SnapshotProjectionChanged {
+                projection_type,
+                id: id.into(),
+                removed: true,
+            },
+        )?;
+        let sequence = self.events.last().expect("emit appends an event").seq;
+        self.tx.execute(
+            "UPDATE snapshot_business_projections
+             SET current_state = NULL, updated_sequence = ?3, removed_sequence = ?3
+             WHERE projection_type = ?1 AND projection_id = ?2 AND organization_id = ?4",
+            params![kind, id, sequence, organization_id],
+        )?;
+        Ok(Some(sequence))
     }
 
     // ---- projects ----

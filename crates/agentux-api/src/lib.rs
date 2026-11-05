@@ -526,6 +526,15 @@ pub struct Event {
     pub body: EventBody,
 }
 
+/// A durable business projection whose lifecycle is owned by the node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotProjectionType {
+    Artifact,
+    Task,
+    Command,
+}
+
 /// Snapshot events carry the whole object, so a client can keep a store keyed
 /// by id up to date by replacing entries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -567,6 +576,13 @@ pub enum EventBody {
     /// The harness limits in force changed: every limit still in force.
     Limits {
         limits: Vec<HarnessLimit>,
+    },
+    /// A typed durable projection changed. The projection body lives in the
+    /// store; this marker gives the change a position in the event sequence.
+    SnapshotProjectionChanged {
+        projection_type: SnapshotProjectionType,
+        id: String,
+        removed: bool,
     },
 }
 

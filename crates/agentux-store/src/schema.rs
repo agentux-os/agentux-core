@@ -156,6 +156,22 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX snapshot_materializations_expiry ON snapshot_materializations (expires_at_ms);
     ",
+    // 10: authoritative organization-scoped business projection sources.
+    "
+    CREATE TABLE snapshot_business_projections (
+        projection_type  TEXT NOT NULL CHECK (projection_type IN ('artifact', 'task', 'command')),
+        projection_id    TEXT NOT NULL,
+        organization_id  TEXT NOT NULL,
+        run_id           TEXT,
+        current_state    TEXT,
+        updated_sequence INTEGER NOT NULL,
+        removed_sequence INTEGER,
+        PRIMARY KEY (projection_type, projection_id),
+        CHECK ((current_state IS NULL) = (removed_sequence IS NOT NULL))
+    );
+    CREATE INDEX snapshot_business_projections_by_org
+        ON snapshot_business_projections (organization_id, projection_type, projection_id);
+    ",
 ];
 
 /// The schema version this build writes.
