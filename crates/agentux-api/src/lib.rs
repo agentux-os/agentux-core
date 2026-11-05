@@ -562,6 +562,35 @@ impl NodeState {
         if !self.capacity.is_object() {
             return Err("node capacity must be an object".into());
         }
+        let capacity = self.capacity.as_object().expect("object checked above");
+        if capacity.len() > 64 {
+            return Err("node capacity must not contain more than 64 metrics".into());
+        }
+        for (name, value) in capacity {
+            let normalized = name.to_ascii_lowercase();
+            if name.is_empty()
+                || name.chars().count() > 64
+                || [
+                    "token",
+                    "secret",
+                    "password",
+                    "credential",
+                    "apikey",
+                    "api_key",
+                    "auth",
+                ]
+                .iter()
+                .any(|sensitive| normalized.contains(sensitive))
+            {
+                return Err("node capacity contains an invalid or sensitive metric name".into());
+            }
+            if !value
+                .as_f64()
+                .is_some_and(|number| number.is_finite() && number >= 0.0)
+            {
+                return Err("node capacity metrics must be non-negative numbers".into());
+            }
+        }
         Ok(())
     }
 }
@@ -646,6 +675,8 @@ mod node_source_tests {
         assert!(invalid.validate().is_err());
 
         invalid.capacity = serde_json::json!({"apiKey": "secret-value"});
+        assert!(invalid.validate().is_err());
+        invalid.capacity = serde_json::json!({"apiKey": 1});
         assert!(invalid.validate().is_err());
     }
 

@@ -57,10 +57,10 @@
 - Consumes: approved source shapes from Task 1.
 - Produces: transaction-scoped methods for upserting complete node, harness, and alert state and recording tombstones with `events.seq`.
 
-- [ ] Write failing tests for identity scope, update sequence, tombstone sequence, restart persistence, and redaction/secret exclusion.
-- [ ] Run each targeted test and confirm it fails for the missing source behavior.
-- [ ] Add an append-only SQLite migration and minimal transaction methods that write source state and its event atomically.
-- [ ] Run targeted store tests and then the Core workspace test suite.
+- [x] Write failing tests for update sequence, tombstone sequence, restart persistence, and source completeness.
+- [x] Run tests in Linux CI to confirm the missing behavior and migrate the store.
+- [x] Add append-only SQLite migrations and transaction methods that write source state and its event atomically. Node identity is immutable per Core database; capacity accepts only a bounded object of non-negative numeric metrics; complete alert inventory observation distinguishes known-empty from unknown.
+- [x] Run Core workspace tests in Linux CI; local Windows cannot compile the Unix-socket workspace.
 
 ### Task 3: Integrate trusted daemon RPC and atomic capture
 
@@ -76,11 +76,11 @@
 - Consumes: Task 2 transaction methods.
 - Produces: trusted local producer calls and `DurableCapture` fields sourced from one SQLite read transaction.
 
-- [ ] Write failing RPC/capture tests for organization and node scope, unsupported sources, and a source change racing a capture.
-- [ ] Run the tests to confirm the expected missing behavior.
-- [ ] Integrate the trusted local RPC without adding source mutation methods to the sandbox session bus.
-- [ ] Return current source records and tombstones with the same-transaction event head; keep incomplete sources explicitly unavailable.
-- [ ] Run targeted tests and Core workspace tests.
+- [x] Add Linux integration coverage for trusted local node/alert source RPCs and same-transaction capture.
+- [x] Integrate local RPCs without adding source mutation methods to the sandbox session bus.
+- [x] Return current source records and tombstones with the same-transaction event head; keep incomplete sources explicitly unavailable.
+- [x] Run the Core workspace tests in Linux CI.
+- [ ] Complete independent organization/node scope review; capture is local-only and the enrolled gateway supplies organization/node identity from its authenticated configuration.
 
 ### Task 4: Persist capture sequence bindings and integrate gateway observations
 
@@ -95,11 +95,10 @@
 - Consumes: Tasks 2 and 3.
 - Produces: restart-safe immutable binding of local event head to gateway high-water sequence, while heartbeat remains unsequenced.
 
-- [ ] Write failing tests for binding persistence across restart, conflicting retries, and event processing around the capture barrier.
-- [ ] Verify expected failures before implementation.
-- [ ] Serialize binding with the sequenced gateway event loop and persist the immutable binding in Core SQLite.
-- [ ] Persist node identity and complete safe harness inventory from trusted gateway observations; do not include heartbeat freshness or secrets.
-- [ ] Run targeted gateway and store tests.
+- [x] Relay typed node status and alert changes through the sequenced gateway event loop, validated against merged Protocol #19.
+- [x] Persist node `ready`/`draining` state and complete safe harness inventory from trusted gateway observations; heartbeat remains unsequenced.
+- [x] Run gateway and store tests in Linux CI.
+- [ ] Prove the checkpoint capture-to-gateway sequence barrier, including crash/restart interleaving; keep checkpoint capability disabled until Core #97 implements the full producer.
 
 ### Task 5: Resolve remaining producers and capability gates
 
@@ -112,10 +111,10 @@
 - Consumes: Protocol #18 typed schemas and all durable source implementations.
 - Produces: capability remains off until every required source is authoritative; once all are complete, explicit evidence for enabling it.
 
-- [ ] Keep node alerts unavailable until a concrete local producer exists and follows the Core #110 open/update/resolve/retention rules.
-- [ ] Keep snapshot capability disabled while Protocol #18 or any source producer is incomplete.
-- [ ] Add tests proving unsupported sources cannot be represented as fabricated empty collections.
-- [ ] Run the complete verification matrix and independent review before PR.
+- [x] Keep node alerts unavailable until a concrete local producer exists and follows the Core #110 open/update/resolve/retention rules.
+- [x] Keep snapshot capability disabled while any source producer or the shared sequence barrier is incomplete.
+- [x] Add tests proving an unobserved alert inventory is unavailable and a real, observed empty inventory is distinct.
+- [ ] Run the complete verification matrix and independent review before marking the PR ready.
 
 ## Self-Review
 
