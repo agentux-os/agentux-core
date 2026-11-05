@@ -316,6 +316,8 @@ pub struct State {
 pub struct SessionContext {
     pub run_id: String,
     pub role_id: String,
+    #[serde(default)]
+    pub active_tool_kinds: BTreeMap<String, agentux_api::ToolKind>,
 }
 
 impl State {
@@ -529,6 +531,7 @@ impl Messages {
                         SessionContext {
                             run_id: session.run_id.clone(),
                             role_id: session.role.clone(),
+                            active_tool_kinds: BTreeMap::new(),
                         },
                     );
                 }
@@ -556,51 +559,54 @@ impl Messages {
         {
             return None;
         }
-        let context = self.state.sessions.get(session_id)?;
-        let origin = self.state.run_origins.get(&context.run_id)?;
-        let (tool_call_id, kind) = match event {
-            SessionEvent::ToolCall {
-                tool_call_id,
-                tool,
-                status: Some(status),
-                ..
-            } => {
-                let tool_name = tool
-                    .as_ref()
-                    .map(|tool| match tool {
-                        agentux_api::ToolKind::Read => "read",
-                        agentux_api::ToolKind::Edit => "edit",
-                        agentux_api::ToolKind::Delete => "delete",
-                        agentux_api::ToolKind::Move => "move",
-                        agentux_api::ToolKind::Search => "search",
-                        agentux_api::ToolKind::Execute => "execute",
-                        agentux_api::ToolKind::Fetch => "fetch",
-                        agentux_api::ToolKind::Think | agentux_api::ToolKind::Other => "other",
-                    })
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "other".into());
-                let summary = match status {
-                    ToolStatus::Running => format!("Agent started a {tool_name} operation"),
-                    ToolStatus::Ok => format!("Agent completed a {tool_name} operation"),
-                    ToolStatus::Error => format!("Agent failed a {tool_name} operation"),
-                };
-                let kind = match status {
-                    ToolStatus::Running => ActivityKind::ToolStarted {
-                        tool_name: tool_name.clone(),
-                        summary: summary.clone(),
-                    },
-                    ToolStatus::Ok => ActivityKind::ToolCompleted {
-                        tool_name: tool_name.clone(),
-                        summary: summary.clone(),
-                    },
-                    ToolStatus::Error => ActivityKind::ToolFailed {
-                        tool_name: tool_name.clone(),
-                        summary: summary.clone(),
-                    },
-                };
-                (tool_call_id.clone(), kind)
-            }
-            _ => return None,
+        let (run_id, role_id) = {
+            let context = self.state.sessions.get(session_id)?;
+            (context.run_id.clone(), context.role_id.clone())
+        };
+        let origin = self.state.run_origins.get(&run_id)?;
+        let SessionEvent::ToolCall {
+            tool_call_id,
+            tool,
+            status,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        let context = self.state.sessions.get_mut(session_id)?;
+        if let Some(tool) = tool {
+            context
+                .active_tool_kinds
+                .insert(tool_call_id.clone(), *tool);
+        }
+        let status = status.as_ref()?;
+        let tool_kind = context
+            .active_tool_kinds
+            .get(tool_call_id)
+            .copied()
+            .unwrap_or(agentux_api::ToolKind::Other);
+        if matches!(status, ToolStatus::Ok | ToolStatus::Error) {
+            context.active_tool_kinds.remove(tool_call_id);
+        }
+        let tool_name = tool_kind.as_str().to_string();
+        let summary = match status {
+            ToolStatus::Running => format!("Agent started a {tool_name} operation"),
+            ToolStatus::Ok => format!("Agent completed a {tool_name} operation"),
+            ToolStatus::Error => format!("Agent failed a {tool_name} operation"),
+        };
+        let kind = match status {
+            ToolStatus::Running => ActivityKind::ToolStarted {
+                tool_name: tool_name.clone(),
+                summary: summary.clone(),
+            },
+            ToolStatus::Ok => ActivityKind::ToolCompleted {
+                tool_name: tool_name.clone(),
+                summary: summary.clone(),
+            },
+            ToolStatus::Error => ActivityKind::ToolFailed {
+                tool_name: tool_name.clone(),
+                summary: summary.clone(),
+            },
         };
         let activity = Activity {
             schema_version: ACTIVITY_SCHEMA_VERSION.into(),
@@ -615,7 +621,7 @@ impl Messages {
             attempt: None,
             causation_id: None,
             delegation_id: None,
-            tool_call_id: Some(tool_call_id),
+            tool_call_id: Some(tool_call_id.clone()),
             kind,
         };
         if activity.validate().is_err() {
@@ -1315,6 +1321,7 @@ mod tests {
             SessionContext {
                 run_id: "local-run".into(),
                 role_id: "implementer".into(),
+                active_tool_kinds: BTreeMap::new(),
             },
         );
         messages.state.run_origins.insert(
@@ -1330,6 +1337,7 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/acp-tool-lifecycle.json"))
                 .unwrap();
         let mut emitted = Vec::new();
+        let mut outbox = Outbox::default();
         for fixture in fixtures {
             let event: Event = serde_json::from_value(fixture["event"].clone()).unwrap();
             let message = messages.from_event(&event).unwrap();
@@ -1345,33 +1353,37 @@ mod tests {
             assert_eq!(activity["runId"], "command-run-1");
             assert_eq!(activity["roleId"], "implementer");
             assert_eq!(activity["type"], fixture["expectedType"]);
-            assert_eq!(activity["toolName"], "execute");
-            assert_eq!(activity["toolCallId"], "tool-9");
+            assert_eq!(activity["toolName"], fixture["expectedToolName"]);
+            assert_eq!(activity["toolCallId"], fixture["expectedToolCallId"]);
             assert!(!message.to_string().contains("PRIVATE"));
             assert!(!message.to_string().contains("fixture-secret"));
             auxp::validate(&message).unwrap();
-            emitted.push(message);
+            emitted.push(message.clone());
+            outbox.push(message);
+            messages.commit_local_event(event.seq, &outbox).unwrap();
+            // A daemon restart between ACP updates must retain the tool kind
+            // associated with each still-active call ID.
+            messages = Messages::new(config(), Some(state_path.clone())).unwrap();
         }
         assert_eq!(
             emitted
                 .iter()
                 .map(|message| message["params"]["activity"]["type"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["tool_started", "tool_completed", "tool_failed"]
+            [
+                "tool_started",
+                "tool_completed",
+                "tool_started",
+                "tool_failed"
+            ]
         );
         assert_eq!(
             emitted
                 .iter()
                 .map(|message| message["params"]["sequence"].as_i64().unwrap())
                 .collect::<Vec<_>>(),
-            [1, 2, 3]
+            [1, 2, 3, 4]
         );
-
-        let mut outbox = Outbox::default();
-        for message in emitted.iter().cloned() {
-            outbox.push(message);
-        }
-        messages.commit_outbox(&outbox).unwrap();
         let restored = Messages::new(config(), Some(state_path)).unwrap();
         assert_eq!(restored.pending_outbox().replay_after(0), emitted);
     }
@@ -1400,6 +1412,7 @@ mod tests {
             SessionContext {
                 run_id: "local-run".into(),
                 role_id: "implementer".into(),
+                active_tool_kinds: BTreeMap::new(),
             },
         );
         messages.state.run_origins.insert(
