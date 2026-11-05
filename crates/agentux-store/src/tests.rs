@@ -85,6 +85,120 @@ fn business_projection(
 }
 
 #[test]
+fn business_projection_validation_accepts_protocol_minimum_state() {
+    for (projection_type, id, id_field, run_id, status) in [
+        (
+            snapshot::BusinessProjectionKind::Artifact,
+            "artifact-1",
+            "artifactId",
+            None,
+            None,
+        ),
+        (
+            snapshot::BusinessProjectionKind::Task,
+            "task-1",
+            "taskId",
+            Some("run-1"),
+            Some("running"),
+        ),
+        (
+            snapshot::BusinessProjectionKind::Command,
+            "command-1",
+            "commandId",
+            None,
+            Some("completed"),
+        ),
+    ] {
+        let mut state = serde_json::json!({
+            id_field: id,
+            "organizationId": "org-a",
+            "currentState": { "opaqueCurrentValue": true },
+        });
+        if let Some(run_id) = run_id {
+            state["runId"] = run_id.into();
+        }
+        if let Some(status) = status {
+            state["status"] = status.into();
+        }
+        let projection = snapshot::BusinessProjection {
+            projection_type,
+            id: id.into(),
+            organization_id: "org-a".into(),
+            run_id: run_id.map(str::to_string),
+            state,
+        };
+        projection.validate().unwrap();
+        if matches!(
+            projection_type,
+            snapshot::BusinessProjectionKind::Task | snapshot::BusinessProjectionKind::Command
+        ) {
+            let mut missing_status = projection.clone();
+            missing_status
+                .state
+                .as_object_mut()
+                .unwrap()
+                .remove("status");
+            assert!(missing_status.validate().is_err());
+        }
+    }
+}
+
+#[test]
+fn same_projection_id_can_exist_in_separate_organizations() {
+    let store = Store::open_in_memory().unwrap();
+    for organization_id in ["org-a", "org-b"] {
+        let projection = business_projection(
+            snapshot::BusinessProjectionKind::Command,
+            "command-shared-id",
+            organization_id,
+            None,
+            "completed",
+        );
+        store
+            .write(|tx| tx.upsert_business_projection(&projection))
+            .unwrap();
+    }
+    for organization_id in ["org-a", "org-b"] {
+        let captured = store
+            .read(|tx| tx.capture_checkpoint_sources(organization_id, now_ms()))
+            .unwrap();
+        let entries = captured
+            .business_projections
+            .iter()
+            .filter(|entry| entry.id == "command-shared-id")
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].organization_id, organization_id);
+    }
+}
+
+#[test]
+fn artifact_projection_does_not_require_optional_fields_or_run_link() {
+    let store = Store::open_in_memory().unwrap();
+    let projection = snapshot::BusinessProjection {
+        projection_type: snapshot::BusinessProjectionKind::Artifact,
+        id: "artifact-minimal".into(),
+        organization_id: "org-a".into(),
+        run_id: None,
+        state: serde_json::json!({
+            "artifactId": "artifact-minimal",
+            "organizationId": "org-a",
+            "currentState": { "opaque": true },
+        }),
+    };
+    store
+        .write(|tx| tx.upsert_business_projection(&projection))
+        .unwrap();
+    let captured = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    assert!(captured.business_projections.iter().any(|entry| {
+        entry.projection_type == snapshot::BusinessProjectionKind::Artifact
+            && entry.id == "artifact-minimal"
+    }));
+}
+
+#[test]
 fn business_projections_round_trip_update_tombstone_and_isolate_organizations() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("state.db");
@@ -154,7 +268,8 @@ fn business_projections_round_trip_update_tombstone_and_isolate_organizations() 
                 .iter()
                 .all(|entry| entry.id != id)
         );
-        let wrong_owner = business_projection(kind, id, "org-b", run_id, "failed");
+        let wrong_owner =
+            business_projection(kind, id, "org-b", Some(run.run.id.as_str()), "failed");
         assert!(
             store
                 .write(|tx| tx.upsert_business_projection(&wrong_owner))
@@ -269,6 +384,61 @@ fn migrations_apply_once_and_survive_reopen() {
         .unwrap();
     assert_eq!(version, schema::VERSION as i64);
     assert_eq!(store.read(|tx| tx.projects()).unwrap(), [project]);
+}
+
+#[test]
+fn migration_11_preserves_version_10_rows_and_scopes_projection_ids_by_org() {
+    let store = Store::open_in_memory().unwrap();
+    {
+        let mut conn = store.lock();
+        conn.execute_batch(
+            "DROP TABLE snapshot_business_projections;
+             CREATE TABLE snapshot_business_projections (
+                 projection_type TEXT NOT NULL CHECK (projection_type IN ('artifact', 'task', 'command')),
+                 projection_id TEXT NOT NULL,
+                 organization_id TEXT NOT NULL,
+                 run_id TEXT,
+                 current_state TEXT,
+                 updated_sequence INTEGER NOT NULL,
+                 removed_sequence INTEGER,
+                 PRIMARY KEY (projection_type, projection_id),
+                 CHECK ((current_state IS NULL) = (removed_sequence IS NOT NULL))
+             );
+             CREATE INDEX snapshot_business_projections_by_org
+                 ON snapshot_business_projections (organization_id, projection_type, projection_id);
+             INSERT INTO snapshot_business_projections VALUES (
+                 'command', 'command-shared-id', 'org-a', NULL,
+                 '{\"commandId\":\"command-shared-id\",\"organizationId\":\"org-a\",\"status\":\"completed\",\"currentState\":{\"saved\":true}}',
+                 42, NULL
+             );
+             PRAGMA user_version = 10;",
+        )
+        .unwrap();
+        schema::migrate(&mut conn).unwrap();
+    }
+
+    let org_a = store.read(|tx| tx.business_projections("org-a")).unwrap();
+    assert_eq!(org_a.len(), 1);
+    assert_eq!(org_a[0].id, "command-shared-id");
+    assert_eq!(org_a[0].updated_sequence, 42);
+
+    let org_b = business_projection(
+        snapshot::BusinessProjectionKind::Command,
+        "command-shared-id",
+        "org-b",
+        None,
+        "completed",
+    );
+    store
+        .write(|tx| tx.upsert_business_projection(&org_b))
+        .unwrap();
+    assert_eq!(
+        store
+            .read(|tx| tx.business_projections("org-b"))
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]

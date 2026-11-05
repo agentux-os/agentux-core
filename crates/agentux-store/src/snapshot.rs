@@ -151,54 +151,28 @@ impl BusinessProjection {
         {
             return Err("projection state organizationId does not match its owner".into());
         }
-        let current = self
-            .state
+        self.state
             .get("currentState")
             .and_then(Value::as_object)
             .filter(|current| !current.is_empty())
             .ok_or("projection state requires a complete currentState object")?;
-        if current.get(field).and_then(Value::as_str) != Some(self.id.as_str())
-            || current.get("organizationId").and_then(Value::as_str)
-                != Some(self.organization_id.as_str())
+        if matches!(
+            self.projection_type,
+            BusinessProjectionKind::Task | BusinessProjectionKind::Command
+        ) && self
+            .state
+            .get("status")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
         {
-            return Err("currentState identity and organization must match the projection".into());
+            return Err(format!("{family} state requires a non-empty status"));
         }
-        let required_fields: &[&str] = match self.projection_type {
-            BusinessProjectionKind::Artifact => &["uri", "mediaType", "sha256"],
-            BusinessProjectionKind::Task => &["status"],
-            BusinessProjectionKind::Command => &["status", "method"],
-        };
-        if required_fields.iter().any(|field| {
-            self.state
-                .get(*field)
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-                || current
-                    .get(*field)
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
-        }) {
-            return Err(format!(
-                "{family} projection is missing complete current state"
-            ));
+        let state_run_id = self.state.get("runId").and_then(Value::as_str);
+        if state_run_id != self.run_id.as_deref() {
+            return Err(format!("{family} state and indexed runId must agree"));
         }
-        match self.projection_type {
-            BusinessProjectionKind::Artifact | BusinessProjectionKind::Task => {
-                if self.run_id.as_deref().is_none_or(str::is_empty)
-                    || self.state.get("runId").and_then(Value::as_str) != self.run_id.as_deref()
-                    || current.get("runId").and_then(Value::as_str) != self.run_id.as_deref()
-                {
-                    return Err(format!("{family} projection requires its matching runId"));
-                }
-            }
-            BusinessProjectionKind::Command => {
-                if self.run_id.is_some()
-                    && (self.state.get("runId").and_then(Value::as_str) != self.run_id.as_deref()
-                        || current.get("runId").and_then(Value::as_str) != self.run_id.as_deref())
-                {
-                    return Err("command state runId does not match its projection".into());
-                }
-            }
+        if self.projection_type == BusinessProjectionKind::Task && state_run_id.is_none() {
+            return Err("task state requires runId".into());
         }
         Ok(())
     }

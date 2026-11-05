@@ -172,6 +172,33 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX snapshot_business_projections_by_org
         ON snapshot_business_projections (organization_id, projection_type, projection_id);
     ",
+    // 11: allow projection IDs to be scoped independently by organization.
+    // Version 10 may already exist in released databases, so rebuild instead
+    // of editing its migration in place.
+    "
+    ALTER TABLE snapshot_business_projections RENAME TO snapshot_business_projections_v10;
+    CREATE TABLE snapshot_business_projections (
+        projection_type  TEXT NOT NULL CHECK (projection_type IN ('artifact', 'task', 'command')),
+        projection_id    TEXT NOT NULL,
+        organization_id  TEXT NOT NULL,
+        run_id           TEXT,
+        current_state    TEXT,
+        updated_sequence INTEGER NOT NULL,
+        removed_sequence INTEGER,
+        PRIMARY KEY (organization_id, projection_type, projection_id),
+        CHECK ((current_state IS NULL) = (removed_sequence IS NOT NULL))
+    );
+    INSERT INTO snapshot_business_projections (
+        projection_type, projection_id, organization_id, run_id,
+        current_state, updated_sequence, removed_sequence
+    )
+    SELECT projection_type, projection_id, organization_id, run_id,
+           current_state, updated_sequence, removed_sequence
+    FROM snapshot_business_projections_v10;
+    DROP TABLE snapshot_business_projections_v10;
+    CREATE INDEX snapshot_business_projections_by_org
+        ON snapshot_business_projections (organization_id, projection_type, projection_id);
+    ",
 ];
 
 /// The schema version this build writes.
