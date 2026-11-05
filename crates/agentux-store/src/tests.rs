@@ -87,7 +87,7 @@ fn business_projection(
 #[test]
 fn command_run_origin_deduplicates_retries_in_one_transaction() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let store = Store::open(&dir.path().join("state.db")).unwrap();
     let project = store
         .write(|tx| tx.register_project("app", dir.path().to_str().unwrap()))
         .unwrap();
@@ -116,7 +116,7 @@ fn command_run_origin_deduplicates_retries_in_one_transaction() {
         store.read(|tx| tx.last_event_seq()).unwrap(),
         first_sequence
     );
-    assert_eq!(store.read(|tx| tx.runs(None).unwrap().len()).unwrap(), 1);
+    assert_eq!(store.read(|tx| Ok(tx.runs(None)?.len())).unwrap(), 1);
 
     let mut changed_retry = retry;
     changed_retry.run.prompt = Some("a different request".into());
