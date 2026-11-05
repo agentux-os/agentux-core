@@ -111,6 +111,7 @@ dependencies = [
  "agent-client-protocol",
  "agentux-fake-agent",
  "rustix",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",

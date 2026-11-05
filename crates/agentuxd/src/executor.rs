@@ -92,6 +92,11 @@ pub struct OpenedSession {
     /// The sandbox the session runs in, if its run asks for one (ADRs 0023
     /// and 0024).
     pub sandbox: Option<crate::sandbox::Profile>,
+    /// More workspace roots for `session/new`: the session's skills
+    /// directory (ADR 0026).
+    pub additional_directories: Vec<std::path::PathBuf>,
+    /// `_meta` for `session/new`: Claude Code's `agentux` skills plugin.
+    pub meta: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A wake from the agent bus: prompt a session so it reads its new mail, or
