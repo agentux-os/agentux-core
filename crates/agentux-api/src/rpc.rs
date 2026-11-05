@@ -581,6 +581,7 @@ pub struct ListRequests {
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotSourceCapture {
     pub organization_id: String,
+    pub node_id: String,
 }
 
 /// Immutable checkpoint payload and the matching Core/gateway sequence boundary.

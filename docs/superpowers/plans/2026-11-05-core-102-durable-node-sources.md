@@ -76,7 +76,7 @@
 - Consumes: Task 2 transaction methods.
 - Produces: trusted local producer calls and `DurableCapture` fields sourced from one SQLite read transaction.
 
-- [x] Add Linux integration coverage for trusted local node/alert source RPCs and same-transaction capture.
+- [x] Add Linux integration coverage for trusted local node/alert source RPCs, node-identity-matched capture, and the same-transaction event head.
 - [x] Integrate local RPCs without adding source mutation methods to the sandbox session bus.
 - [x] Return current source records and tombstones with the same-transaction event head; keep incomplete sources explicitly unavailable.
 - [x] Run the Core workspace tests in Linux CI.

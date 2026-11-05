@@ -934,6 +934,22 @@ impl Tx<'_> {
         organization_id: &str,
         now: i64,
     ) -> Result<snapshot::DurableCapture> {
+        self.capture_checkpoint_sources_for_node(organization_id, None, now)
+    }
+
+    /// Captures local sources only when their persisted node identity matches
+    /// the authenticated gateway scope requesting the checkpoint.
+    pub fn capture_checkpoint_sources_for_node(
+        &self,
+        organization_id: &str,
+        expected_node_id: Option<&str>,
+        now: i64,
+    ) -> Result<snapshot::DurableCapture> {
+        if let Some(expected) = expected_node_id
+            && expected.trim().is_empty()
+        {
+            return Err(Error::Data("nodeId is required for scoped capture".into()));
+        }
         let owned: Vec<RunRecord> = self
             .runs(None)?
             .into_iter()
@@ -971,6 +987,13 @@ impl Tx<'_> {
             .collect();
         let mut unavailable = snapshot::unavailable_projections();
         let node = self.node_projection()?;
+        if let (Some(expected), Some(node)) = (expected_node_id, node.as_ref())
+            && node.state.node_id != expected
+        {
+            return Err(Error::Data(
+                "checkpoint nodeId does not match the persisted Core node identity".into(),
+            ));
+        }
         if node.is_none() {
             unavailable.push(snapshot::UnavailableProjection {
                 kind: snapshot::ProjectionKind::Node,

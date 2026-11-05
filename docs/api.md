@@ -34,7 +34,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `runs.get` | `{ runId }` | `{ run: Run, attempts: StepAttempt[], requests: PermissionRequest[], sessions: Session[] }` |
 | `runs.cancel` | `{ runId }` | `Run` |
 | `runs.events` | `{ runId, sinceSeq?, limit? }` — `limit` defaults to 1000, at most 10000 | `{ events: Event[], more, headSeq }`: the run's stored events with `seq > sinceSeq`, oldest first; see [History](#history) |
-| `snapshots.source_capture` | `{ organizationId }` | Atomic durable Core projection sources and the SQLite event head from one read transaction, plus explicit unavailable projection reasons; this is an internal data-boundary primitive and does not claim complete AUXP checkpoint coverage |
+| `snapshots.source_capture` | `{ organizationId, nodeId }` | Atomic durable Core projection sources and the SQLite event head from one read transaction, plus explicit unavailable projection reasons; rejects a node ID that differs from persisted Core identity; this is an internal data-boundary primitive and does not claim complete AUXP checkpoint coverage |
 | `snapshots.materialize` | `{ organizationId, nodeId, checkpointId, snapshotId, capturedEventHead, createdAtMs, expiresAtMs, highWaterSequence, payload }` | Atomically persists immutable snapshot pages and their sequence binding; identical retries succeed and conflicting retries fail |
 | `snapshots.binding_get` | `{ organizationId, nodeId, checkpointId }` | Reads the immutable binding for restart recovery, or `null` if no checkpoint exists |
 | `sessions.list` | `{ runId? }` | `Session[]`, oldest first |
