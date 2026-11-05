@@ -151,8 +151,7 @@ impl BusinessProjection {
         {
             return Err("projection state organizationId does not match its owner".into());
         }
-        let current = self
-            .state
+        self.state
             .get("currentState")
             .and_then(Value::as_object)
             .filter(|current| !current.is_empty())
