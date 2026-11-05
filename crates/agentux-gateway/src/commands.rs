@@ -465,6 +465,16 @@ fn command_owned_run_id(result: &Value, organization_id: &str) -> Option<String>
         .map(str::to_string)
 }
 
+fn outcome_status(outcome: &Result<Value, Failure>) -> agentux_api::rpc::CommandLifecycleStatus {
+    match outcome {
+        Ok(_) => agentux_api::rpc::CommandLifecycleStatus::Completed,
+        Err((INVALID_PARAMS | DENIED | NOT_IMPLEMENTED, _)) => {
+            agentux_api::rpc::CommandLifecycleStatus::Failed
+        }
+        Err(_) => agentux_api::rpc::CommandLifecycleStatus::Interrupted,
+    }
+}
+
 /// Recent answers by commandId: a command sent again gets the same answer.
 #[derive(Default)]
 pub struct Answers {
@@ -682,7 +692,7 @@ pub async fn handle(
                         &node.organization_id,
                         &command_id,
                         method,
-                        agentux_api::rpc::CommandLifecycleStatus::Failed,
+                        outcome_status(&Err((code, message.clone()))),
                         None,
                     )
                     .await;
@@ -746,11 +756,7 @@ pub async fn run_decided(client: &mut Client, pending: &Pending) -> Vec<(String,
                 {
                     Ok(()) => {
                         let outcome = execute(client, &held.method, &held.params).await;
-                        terminal_status = Some(if outcome.is_ok() {
-                            agentux_api::rpc::CommandLifecycleStatus::Completed
-                        } else {
-                            agentux_api::rpc::CommandLifecycleStatus::Failed
-                        });
+                        terminal_status = Some(outcome_status(&outcome));
                         outcome
                     }
                     Err(error) => Err(error),
@@ -863,6 +869,18 @@ mod tests {
         assert_eq!(
             repo_key("ssh://git@github.com/acme/app"),
             "github.com/acme/app"
+        );
+    }
+
+    #[test]
+    fn ambiguous_execution_errors_require_reconciliation() {
+        assert_eq!(
+            outcome_status(&Err((FAILED, "connection closed".into()))),
+            agentux_api::rpc::CommandLifecycleStatus::Interrupted
+        );
+        assert_eq!(
+            outcome_status(&Err((INVALID_PARAMS, "invalid input".into()))),
+            agentux_api::rpc::CommandLifecycleStatus::Failed
         );
     }
 
