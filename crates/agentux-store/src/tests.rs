@@ -42,6 +42,216 @@ fn sample_run(project_id: &str) -> RunRecord {
     }
 }
 
+fn business_projection(
+    projection_type: snapshot::BusinessProjectionKind,
+    id: &str,
+    organization_id: &str,
+    run_id: Option<&str>,
+    status: &str,
+) -> snapshot::BusinessProjection {
+    let id_field = match projection_type {
+        snapshot::BusinessProjectionKind::Artifact => "artifactId",
+        snapshot::BusinessProjectionKind::Task => "taskId",
+        snapshot::BusinessProjectionKind::Command => "commandId",
+    };
+    let mut current_state = serde_json::Map::new();
+    current_state.insert(id_field.into(), id.into());
+    current_state.insert("organizationId".into(), organization_id.into());
+    current_state.insert("status".into(), status.into());
+    match projection_type {
+        snapshot::BusinessProjectionKind::Artifact => {
+            current_state.insert("uri".into(), "artifact://artifact".into());
+            current_state.insert("mediaType".into(), "text/plain".into());
+            current_state.insert("sha256".into(), "a".repeat(64).into());
+        }
+        snapshot::BusinessProjectionKind::Command => {
+            current_state.insert("method".into(), "run.start".into());
+        }
+        snapshot::BusinessProjectionKind::Task => {}
+    }
+    if let Some(run_id) = run_id {
+        current_state.insert("runId".into(), run_id.into());
+    }
+    let mut state = current_state.clone();
+    let current_state = serde_json::Value::Object(current_state);
+    state.insert("currentState".into(), current_state);
+    snapshot::BusinessProjection {
+        projection_type,
+        id: id.into(),
+        organization_id: organization_id.into(),
+        run_id: run_id.map(str::to_string),
+        state: serde_json::Value::Object(state),
+    }
+}
+
+#[test]
+fn business_projections_round_trip_update_tombstone_and_isolate_organizations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let store = Store::open(&path).unwrap();
+    let project = store
+        .write(|tx| tx.register_project("app", "/src/app"))
+        .unwrap();
+    let mut run = sample_run(&project.id);
+    run.run.origin = Some(agentux_api::RunOrigin {
+        organization_id: "org-a".into(),
+        mission_id: "mission-a".into(),
+        command_run_id: "command-run-a".into(),
+        definition_version: None,
+    });
+    store.write(|tx| tx.insert_run(&run)).unwrap();
+
+    for (kind, id, run_id) in [
+        (
+            snapshot::BusinessProjectionKind::Artifact,
+            "artifact-1",
+            Some(run.run.id.as_str()),
+        ),
+        (
+            snapshot::BusinessProjectionKind::Task,
+            "task-1",
+            Some(run.run.id.as_str()),
+        ),
+        (snapshot::BusinessProjectionKind::Command, "command-1", None),
+    ] {
+        let created = business_projection(kind, id, "org-a", run_id, "running");
+        store
+            .write(|tx| tx.upsert_business_projection(&created))
+            .unwrap();
+        let updated = business_projection(kind, id, "org-a", run_id, "completed");
+        store
+            .write(|tx| tx.upsert_business_projection(&updated))
+            .unwrap();
+
+        let scoped = store
+            .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+            .unwrap();
+        let entry = scoped
+            .business_projections
+            .iter()
+            .find(|entry| entry.projection_type == kind && entry.id == id)
+            .unwrap();
+        assert_eq!(entry.state.as_ref().unwrap()["status"], "completed");
+        assert!(entry.updated_sequence > 0);
+        let restarted = Store::open(&path).unwrap();
+        assert_eq!(
+            restarted
+                .read(|tx| tx.business_projections("org-a"))
+                .unwrap()
+                .iter()
+                .find(|entry| entry.projection_type == kind && entry.id == id)
+                .unwrap()
+                .state
+                .as_ref()
+                .unwrap()["status"],
+            "completed"
+        );
+        assert!(
+            store
+                .read(|tx| tx.capture_checkpoint_sources("org-b", now_ms()))
+                .unwrap()
+                .business_projections
+                .iter()
+                .all(|entry| entry.id != id)
+        );
+        let wrong_owner = business_projection(kind, id, "org-b", run_id, "failed");
+        assert!(
+            store
+                .write(|tx| tx.upsert_business_projection(&wrong_owner))
+                .is_err()
+        );
+
+        assert!(
+            store
+                .write(|tx| tx.remove_business_projection(kind, id, "org-b"))
+                .unwrap()
+                .is_none()
+        );
+        let removed_sequence = store
+            .write(|tx| tx.remove_business_projection(kind, id, "org-a"))
+            .unwrap()
+            .unwrap();
+        let after_remove = store
+            .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+            .unwrap();
+        assert_eq!(
+            after_remove
+                .business_projections
+                .iter()
+                .find(|entry| entry.projection_type == kind && entry.id == id)
+                .unwrap()
+                .removed_at_sequence,
+            Some(removed_sequence)
+        );
+    }
+
+    drop(store);
+    let reopened = Store::open(&path).unwrap();
+    let captured = reopened
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    for id in ["artifact-1", "task-1", "command-1"] {
+        let tombstone = captured
+            .business_projections
+            .iter()
+            .find(|entry| entry.id == id)
+            .unwrap();
+        assert!(tombstone.state.is_none());
+        assert!(tombstone.removed_at_sequence.unwrap() > 0);
+    }
+    let unavailable = snapshot::unavailable_projections();
+    for kind in [
+        snapshot::ProjectionKind::Artifact,
+        snapshot::ProjectionKind::Task,
+        snapshot::ProjectionKind::Command,
+    ] {
+        assert!(unavailable.iter().any(|entry| entry.kind == kind));
+        assert_eq!(kind.source_kind(), snapshot::SourceKind::Unavailable);
+    }
+}
+
+#[test]
+fn business_projection_capture_and_event_head_share_one_write_boundary() {
+    let store = Store::open_in_memory().unwrap();
+    let project = store
+        .write(|tx| tx.register_project("app", "/src/app"))
+        .unwrap();
+    let mut run = sample_run(&project.id);
+    run.run.origin = Some(agentux_api::RunOrigin {
+        organization_id: "org-a".into(),
+        mission_id: "mission-a".into(),
+        command_run_id: "command-run-a".into(),
+        definition_version: None,
+    });
+    let command = business_projection(
+        snapshot::BusinessProjectionKind::Command,
+        "command-1",
+        "org-a",
+        None,
+        "completed",
+    );
+    // Protocol #17's valid command projection is organization-scoped and
+    // does not require a runId; command-level operations can be origin-less.
+    assert!(command.run_id.is_none());
+    store
+        .write(|tx| {
+            tx.insert_run(&run)?;
+            tx.upsert_business_projection(&command)
+        })
+        .unwrap();
+
+    let captured = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    let command = captured
+        .business_projections
+        .iter()
+        .find(|entry| entry.id == "command-1")
+        .unwrap();
+    assert_eq!(captured.captured_event_head, command.updated_sequence);
+    assert!(captured.runs.iter().any(|entry| entry.id == run.run.id));
+}
+
 #[test]
 fn migrations_apply_once_and_survive_reopen() {
     let dir = tempfile::tempdir().unwrap();

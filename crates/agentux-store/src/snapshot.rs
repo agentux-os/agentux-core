@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use agentux_api::{HarnessLimit, PermissionRequest, Run, Session};
+use agentux_api::{HarnessLimit, PermissionRequest, Run, Session, SnapshotProjectionType};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -81,16 +81,127 @@ pub const fn checkpoint_capability_enabled() -> bool {
 pub fn unavailable_projections() -> Vec<UnavailableProjection> {
     ProjectionKind::ALL.into_iter().filter_map(|kind| {
         let reason = match kind {
-            ProjectionKind::Artifact => Some("Core has no durable artifact projection or ownership ledger"),
-            ProjectionKind::Command => Some("Core has no durable Command projection"),
+            ProjectionKind::Artifact => Some(
+                "durable storage exists, but the authoritative artifact lifecycle producer is not connected",
+            ),
+            ProjectionKind::Command => Some(
+                "durable storage exists, but the authenticated gateway command lifecycle producer is not connected",
+            ),
             ProjectionKind::Harness => Some("installed harness inventory is runtime-derived and not durably materialized"),
             ProjectionKind::Node => Some("node identity and heartbeat state are gateway-owned, not in the agentux-store transaction"),
             ProjectionKind::NodeAlert => Some("Core has no durable node alert projection"),
-            ProjectionKind::Task => Some("Core has no durable task identity or lifecycle projection"),
+            ProjectionKind::Task => Some(
+                "durable storage exists, but the typed task lifecycle producer is not connected",
+            ),
             _ => None,
         }?;
         Some(UnavailableProjection { kind, reason: reason.into() })
     }).collect()
+}
+
+pub type BusinessProjectionKind = SnapshotProjectionType;
+
+/// Explicit, complete state written by the lifecycle owner of a projection.
+/// `state.currentState` is the protocol's complete current-state object.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusinessProjection {
+    pub projection_type: BusinessProjectionKind,
+    pub id: String,
+    pub organization_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub state: Value,
+}
+
+/// Durable current state or removal marker with the event sequence that
+/// publishes the change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusinessProjectionEntry {
+    pub projection_type: BusinessProjectionKind,
+    pub id: String,
+    pub organization_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<Value>,
+    pub updated_sequence: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at_sequence: Option<i64>,
+}
+
+impl BusinessProjection {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() || self.organization_id.trim().is_empty() {
+            return Err("projection id and organizationId are required".into());
+        }
+        let (field, family) = match self.projection_type {
+            BusinessProjectionKind::Artifact => ("artifactId", "artifact"),
+            BusinessProjectionKind::Task => ("taskId", "task"),
+            BusinessProjectionKind::Command => ("commandId", "command"),
+        };
+        if self.state.get(field).and_then(Value::as_str) != Some(self.id.as_str()) {
+            return Err(format!(
+                "{family} state identity does not match projection id"
+            ));
+        }
+        if self.state.get("organizationId").and_then(Value::as_str)
+            != Some(self.organization_id.as_str())
+        {
+            return Err("projection state organizationId does not match its owner".into());
+        }
+        let current = self
+            .state
+            .get("currentState")
+            .and_then(Value::as_object)
+            .filter(|current| !current.is_empty())
+            .ok_or("projection state requires a complete currentState object")?;
+        if current.get(field).and_then(Value::as_str) != Some(self.id.as_str())
+            || current.get("organizationId").and_then(Value::as_str)
+                != Some(self.organization_id.as_str())
+        {
+            return Err("currentState identity and organization must match the projection".into());
+        }
+        let required_fields: &[&str] = match self.projection_type {
+            BusinessProjectionKind::Artifact => &["uri", "mediaType", "sha256"],
+            BusinessProjectionKind::Task => &["status"],
+            BusinessProjectionKind::Command => &["status", "method"],
+        };
+        if required_fields.iter().any(|field| {
+            self.state
+                .get(*field)
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+                || current
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+        }) {
+            return Err(format!(
+                "{family} projection is missing complete current state"
+            ));
+        }
+        match self.projection_type {
+            BusinessProjectionKind::Artifact | BusinessProjectionKind::Task => {
+                if self.run_id.as_deref().is_none_or(str::is_empty)
+                    || self.state.get("runId").and_then(Value::as_str) != self.run_id.as_deref()
+                    || current.get("runId").and_then(Value::as_str) != self.run_id.as_deref()
+                {
+                    return Err(format!("{family} projection requires its matching runId"));
+                }
+            }
+            BusinessProjectionKind::Command => {
+                if self.run_id.is_some()
+                    && (self.state.get("runId").and_then(Value::as_str) != self.run_id.as_deref()
+                        || current.get("runId").and_then(Value::as_str) != self.run_id.as_deref())
+                {
+                    return Err("command state runId does not match its projection".into());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Opaque immutable JSON bytes. This is intentionally not a protocol page;
@@ -117,6 +228,9 @@ pub struct DurableCapture {
     pub limits: Vec<HarnessLimit>,
     /// Gate state is derived solely from the durable run checks and attempt counters.
     pub gates: Vec<Value>,
+    /// Explicitly written business state and retained tombstones for the
+    /// three durable lifecycle owners.
+    pub business_projections: Vec<BusinessProjectionEntry>,
     /// The complete contract remains unavailable while any entry is present.
     pub unavailable: Vec<UnavailableProjection>,
 }
