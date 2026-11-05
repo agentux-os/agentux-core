@@ -163,42 +163,12 @@ impl BusinessProjection {
         {
             return Err("currentState identity and organization must match the projection".into());
         }
-        let required_fields: &[&str] = match self.projection_type {
-            BusinessProjectionKind::Artifact => &["uri", "mediaType", "sha256"],
-            BusinessProjectionKind::Task => &["status"],
-            BusinessProjectionKind::Command => &["status", "method"],
-        };
-        if required_fields.iter().any(|field| {
-            self.state
-                .get(*field)
-                .and_then(Value::as_str)
-                .is_none_or(str::is_empty)
-                || current
-                    .get(*field)
-                    .and_then(Value::as_str)
-                    .is_none_or(str::is_empty)
-        }) {
+        let state_run_id = self.state.get("runId").and_then(Value::as_str);
+        let current_run_id = current.get("runId").and_then(Value::as_str);
+        if state_run_id != current_run_id || state_run_id != self.run_id.as_deref() {
             return Err(format!(
-                "{family} projection is missing complete current state"
+                "{family} state and indexed runId must agree, including when absent"
             ));
-        }
-        match self.projection_type {
-            BusinessProjectionKind::Artifact | BusinessProjectionKind::Task => {
-                if self.run_id.as_deref().is_none_or(str::is_empty)
-                    || self.state.get("runId").and_then(Value::as_str) != self.run_id.as_deref()
-                    || current.get("runId").and_then(Value::as_str) != self.run_id.as_deref()
-                {
-                    return Err(format!("{family} projection requires its matching runId"));
-                }
-            }
-            BusinessProjectionKind::Command => {
-                if self.run_id.is_some()
-                    && (self.state.get("runId").and_then(Value::as_str) != self.run_id.as_deref()
-                        || current.get("runId").and_then(Value::as_str) != self.run_id.as_deref())
-                {
-                    return Err("command state runId does not match its projection".into());
-                }
-            }
         }
         Ok(())
     }
