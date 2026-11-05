@@ -12,6 +12,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 mod client;
 pub mod rpc;
@@ -535,6 +536,163 @@ pub enum SnapshotProjectionType {
     Command,
 }
 
+/// Operational node state. Fleet presence is derived from heartbeat freshness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeOperationalStatus {
+    Ready,
+    Draining,
+    Error,
+}
+
+/// Complete current node state published by a sequenced node event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeState {
+    pub node_id: String,
+    pub status: NodeOperationalStatus,
+    pub capacity: Value,
+}
+
+impl NodeState {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.node_id.trim().is_empty() || self.node_id.chars().count() > 128 {
+            return Err("nodeId must be non-empty and at most 128 Unicode characters".into());
+        }
+        if !self.capacity.is_object() {
+            return Err("node capacity must be an object".into());
+        }
+        Ok(())
+    }
+}
+
+/// Lifecycle status of an actionable alert observed by this Core instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeAlertStatus {
+    Active,
+    Resolved,
+}
+
+/// Complete safe alert state stored by Core and exported by the gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeAlertState {
+    pub alert_id: String,
+    pub producer: String,
+    pub code: String,
+    pub condition_key: String,
+    pub summary: String,
+    pub first_observed_at: String,
+    pub last_observed_at: String,
+    pub status: NodeAlertStatus,
+}
+
+impl NodeAlertState {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("alertId", self.alert_id.as_str()),
+            ("producer", self.producer.as_str()),
+            ("code", self.code.as_str()),
+            ("conditionKey", self.condition_key.as_str()),
+        ] {
+            if value.trim().is_empty() || value.chars().count() > 256 {
+                return Err(format!("alert {field} must be non-empty and bounded"));
+            }
+        }
+        if self.summary.trim().is_empty() || self.summary.chars().count() > 2_000 {
+            return Err(
+                "alert summary must be non-empty and at most 2000 Unicode characters".into(),
+            );
+        }
+        let first: jiff::Timestamp = self
+            .first_observed_at
+            .parse()
+            .map_err(|error| format!("firstObservedAt must be RFC3339: {error}"))?;
+        let last: jiff::Timestamp = self
+            .last_observed_at
+            .parse()
+            .map_err(|error| format!("lastObservedAt must be RFC3339: {error}"))?;
+        if last < first {
+            return Err("lastObservedAt must not precede firstObservedAt".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod node_source_tests {
+    use super::*;
+
+    #[test]
+    fn node_state_uses_operational_statuses_and_object_capacity() {
+        let state: NodeState = serde_json::from_value(serde_json::json!({
+            "nodeId": "node-a",
+            "status": "ready",
+            "capacity": {"activeRuns": 1}
+        }))
+        .unwrap();
+        state.validate().unwrap();
+        assert!(
+            serde_json::from_value::<NodeState>(serde_json::json!({
+                "nodeId": "node-a",
+                "status": "offline",
+                "capacity": {}
+            }))
+            .is_err()
+        );
+        let mut invalid = state;
+        invalid.capacity = serde_json::json!([]);
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn alert_changes_keep_state_and_removal_as_distinct_wire_variants() {
+        let state = NodeAlertState {
+            alert_id: "alert-1".into(),
+            producer: "harness-monitor".into(),
+            code: "harness_unavailable".into(),
+            condition_key: "harness:claude".into(),
+            summary: "Claude is unavailable.".into(),
+            first_observed_at: "2026-11-05T12:00:00Z".into(),
+            last_observed_at: "2026-11-05T12:01:00Z".into(),
+            status: NodeAlertStatus::Active,
+        };
+        state.validate().unwrap();
+        let state_json = serde_json::to_value(NodeAlertChange::State {
+            alert: state.clone(),
+        })
+        .unwrap();
+        assert_eq!(state_json["kind"], "state");
+        assert_eq!(state_json["alert"]["alertId"], "alert-1");
+        let removed = serde_json::to_value(NodeAlertChange::Removed {
+            alert_id: "alert-1".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            removed,
+            serde_json::json!({"kind":"removed","alertId":"alert-1"})
+        );
+
+        let mut reversed = state;
+        reversed.last_observed_at = "2026-11-05T11:59:00Z".into();
+        assert!(reversed.validate().is_err());
+    }
+}
+
+/// Full alert replacement or a sequence-bound removal tombstone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
+pub enum NodeAlertChange {
+    State { alert: NodeAlertState },
+    Removed { alert_id: String },
+}
+
 /// Snapshot events carry the whole object, so a client can keep a store keyed
 /// by id up to date by replacing entries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -580,6 +738,14 @@ pub enum EventBody {
     /// Complete harness inventory captured by Core at one local event sequence.
     HarnessStatus {
         harnesses: Vec<rpc::HarnessInfo>,
+    },
+    /// Complete operational node state changed; heartbeat presence is separate.
+    NodeStatusChanged {
+        node: NodeState,
+    },
+    /// Complete local alert state changed or a retained alert was removed.
+    NodeAlertChanged {
+        alert: NodeAlertChange,
     },
     /// A typed durable projection changed. The projection body lives in the
     /// store; this marker gives the change a position in the event sequence.

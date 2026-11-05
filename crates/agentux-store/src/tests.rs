@@ -98,21 +98,27 @@ fn harness_info(id: &str, installed: bool) -> agentux_api::rpc::HarnessInfo {
     }
 }
 
-fn node_state(status: &str, active_runs: u64) -> agentux_api::NodeState {
+fn node_state(
+    status: agentux_api::NodeOperationalStatus,
+    active_runs: u64,
+) -> agentux_api::NodeState {
     agentux_api::NodeState {
         node_id: "node-a".into(),
-        status: status.into(),
+        status,
         capacity: serde_json::json!({"activeRuns": active_runs, "waitingForHuman": 0}),
     }
 }
 
-fn node_alert(status: &str, last_observed_at: &str) -> agentux_api::NodeAlertState {
+fn node_alert(
+    status: agentux_api::NodeAlertStatus,
+    last_observed_at: &str,
+) -> agentux_api::NodeAlertState {
     agentux_api::NodeAlertState {
         alert_id: "harness-claude-unavailable".into(),
         producer: "harness-monitor".into(),
         code: "harness_unavailable".into(),
         condition_key: "harness:claude".into(),
-        summary: if status == "resolved" {
+        summary: if status == agentux_api::NodeAlertStatus::Resolved {
             "Claude harness is available again."
         } else {
             "Claude harness is unavailable."
@@ -120,7 +126,7 @@ fn node_alert(status: &str, last_observed_at: &str) -> agentux_api::NodeAlertSta
         .into(),
         first_observed_at: "2026-11-05T12:00:00Z".into(),
         last_observed_at: last_observed_at.into(),
-        status: status.into(),
+        status,
     }
 }
 
@@ -130,7 +136,7 @@ fn node_and_alert_sources_are_sequenced_durable_and_captured_atomically() {
     let path = dir.path().join("state.db");
     let store = Store::open(&path).unwrap();
 
-    let first_node = node_state("ready", 0);
+    let first_node = node_state(agentux_api::NodeOperationalStatus::Ready, 0);
     assert_eq!(
         store
             .write(|tx| tx.replace_node_state(&first_node))
@@ -143,7 +149,7 @@ fn node_and_alert_sources_are_sequenced_durable_and_captured_atomically() {
             .unwrap(),
         None
     );
-    let changed_node = node_state("draining", 1);
+    let changed_node = node_state(agentux_api::NodeOperationalStatus::Draining, 1);
     assert_eq!(
         store
             .write(|tx| tx.replace_node_state(&changed_node))
@@ -152,13 +158,23 @@ fn node_and_alert_sources_are_sequenced_durable_and_captured_atomically() {
     );
     assert_eq!(
         store
-            .write(|tx| tx.upsert_node_alert(&node_alert("active", "2026-11-05T12:00:00Z")))
+            .write(|tx| {
+                tx.upsert_node_alert(&node_alert(
+                    agentux_api::NodeAlertStatus::Active,
+                    "2026-11-05T12:00:00Z",
+                ))
+            })
             .unwrap(),
         Some(3)
     );
     assert_eq!(
         store
-            .write(|tx| tx.upsert_node_alert(&node_alert("resolved", "2026-11-05T12:05:00Z")))
+            .write(|tx| {
+                tx.upsert_node_alert(&node_alert(
+                    agentux_api::NodeAlertStatus::Resolved,
+                    "2026-11-05T12:05:00Z",
+                ))
+            })
             .unwrap(),
         Some(4)
     );
@@ -176,7 +192,10 @@ fn node_and_alert_sources_are_sequenced_durable_and_captured_atomically() {
         .unwrap();
     assert_eq!(captured.captured_event_head, 5);
     assert_eq!(captured.node.as_ref().unwrap().updated_sequence, 2);
-    assert_eq!(captured.node.as_ref().unwrap().state["status"], "draining");
+    assert_eq!(
+        captured.node.as_ref().unwrap().state.status,
+        agentux_api::NodeOperationalStatus::Draining
+    );
     assert_eq!(captured.node_alerts.len(), 1);
     assert_eq!(captured.node_alerts[0].removed_at_sequence, Some(5));
     assert_eq!(captured.node_alerts[0].updated_sequence, 5);
@@ -208,32 +227,76 @@ fn node_and_alert_sources_are_sequenced_durable_and_captured_atomically() {
 #[test]
 fn node_source_rejects_invalid_status_and_cross_identity_updates() {
     let store = Store::open_in_memory().unwrap();
-    let mut offline = node_state("offline", 0);
-    assert!(store.write(|tx| tx.replace_node_state(&offline)).is_err());
+    let offline = serde_json::from_value::<agentux_api::NodeState>(serde_json::json!({
+        "nodeId": "node-a",
+        "status": "offline",
+        "capacity": {"activeRuns": 0}
+    }));
+    assert!(offline.is_err());
     assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 0);
-    offline = node_state("ready", 0);
-    offline.capacity = serde_json::json!([]);
-    assert!(store.write(|tx| tx.replace_node_state(&offline)).is_err());
+    let mut invalid = node_state(agentux_api::NodeOperationalStatus::Ready, 0);
+    invalid.capacity = serde_json::json!([]);
+    assert!(store.write(|tx| tx.replace_node_state(&invalid)).is_err());
     assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 0);
 
     store
-        .write(|tx| tx.replace_node_state(&node_state("ready", 0)))
+        .write(|tx| {
+            tx.replace_node_state(&node_state(agentux_api::NodeOperationalStatus::Ready, 0))
+        })
         .unwrap();
-    offline = node_state("ready", 1);
-    offline.node_id = "node-b".into();
-    assert!(store.write(|tx| tx.replace_node_state(&offline)).is_err());
+    invalid = node_state(agentux_api::NodeOperationalStatus::Ready, 1);
+    invalid.node_id = "node-b".into();
+    assert!(store.write(|tx| tx.replace_node_state(&invalid)).is_err());
     assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 1);
 }
 
 #[test]
 fn node_alert_source_rejects_blank_or_unordered_state() {
     let store = Store::open_in_memory().unwrap();
-    let mut blank = node_alert("active", "2026-11-05T12:00:00Z");
+    let mut blank = node_alert(agentux_api::NodeAlertStatus::Active, "2026-11-05T12:00:00Z");
     blank.summary = "  ".into();
     assert!(store.write(|tx| tx.upsert_node_alert(&blank)).is_err());
-    let reversed = node_alert("active", "2026-11-05T11:59:59Z");
+    let reversed = node_alert(agentux_api::NodeAlertStatus::Active, "2026-11-05T11:59:59Z");
     assert!(store.write(|tx| tx.upsert_node_alert(&reversed)).is_err());
     assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 0);
+}
+
+#[test]
+fn empty_node_alert_inventory_is_distinguished_from_never_observed() {
+    let store = Store::open_in_memory().unwrap();
+    let before = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    assert!(before.node.is_none());
+    assert!(before.node_alerts.is_empty());
+    assert!(
+        before
+            .unavailable
+            .iter()
+            .any(|entry| entry.kind == snapshot::ProjectionKind::Node)
+    );
+    assert!(
+        before
+            .unavailable
+            .iter()
+            .any(|entry| entry.kind == snapshot::ProjectionKind::NodeAlert)
+    );
+
+    store
+        .write(|tx| {
+            tx.replace_node_state(&node_state(agentux_api::NodeOperationalStatus::Ready, 0))?;
+            tx.replace_node_alert_inventory(&[])
+        })
+        .unwrap();
+    let after = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    assert!(after.node.is_some());
+    assert!(after.node_alerts.is_empty());
+    assert!(!after.unavailable.iter().any(|entry| matches!(
+        entry.kind,
+        snapshot::ProjectionKind::Node | snapshot::ProjectionKind::NodeAlert
+    )));
 }
 
 #[test]
@@ -1211,8 +1274,8 @@ fn snapshot_source_marks_unsupported_projections_unavailable() {
             SourceKind::Derived,
             SourceKind::Sourced,
             SourceKind::Sourced,
-            SourceKind::Unavailable,
-            SourceKind::Unavailable,
+            SourceKind::Sourced,
+            SourceKind::Sourced,
             SourceKind::Sourced,
             SourceKind::Sourced,
             SourceKind::Unavailable,

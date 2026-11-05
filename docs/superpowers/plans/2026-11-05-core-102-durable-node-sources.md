@@ -47,6 +47,7 @@
 ### Task 2: Add durable typed projection records and mutations
 
 **Files:**
+- Modify: `crates/agentux-api/src/lib.rs` (typed local node/alert state and event bodies)
 - Modify: `crates/agentux-store/src/schema.rs`
 - Modify: `crates/agentux-store/src/snapshot.rs`
 - Modify: `crates/agentux-store/src/lib.rs`
@@ -66,6 +67,7 @@
 **Files:**
 - Modify: `crates/agentux-api/src/rpc.rs`
 - Modify: `crates/agentux-api/src/client.rs`
+- Modify: `crates/agentux-api/src/lib.rs` (internal RPC method constants)
 - Modify: `crates/agentuxd/src/server.rs`
 - Modify: `crates/agentux-store/src/lib.rs`
 - Test: relevant API/store/daemon tests.
