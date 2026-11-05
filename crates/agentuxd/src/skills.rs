@@ -108,11 +108,17 @@ impl Store {
         }
         let dir = self.dir_of(&tree.digest);
         if !dir.exists() {
-            read_only(&copy).map_err(|e| format!("cannot seal the copy: {e}"))?;
-            if let Err(e) = fs::rename(&copy, &dir)
-                && !dir.exists()
-            {
-                return Err(format!("cannot store it in {}: {e}", dir.display()));
+            // Everything read-only but the top directory: renaming a
+            // directory needs write access to it (its `..` entry changes).
+            read_only(&copy)
+                .and_then(|()| fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)))
+                .map_err(|e| format!("cannot seal the copy: {e}"))?;
+            match fs::rename(&copy, &dir) {
+                Ok(()) => fs::set_permissions(&dir, fs::Permissions::from_mode(0o555))
+                    .map_err(|e| format!("cannot seal {}: {e}", dir.display()))?,
+                // An identical copy got there first.
+                Err(_) if dir.exists() => {}
+                Err(e) => return Err(format!("cannot store it in {}: {e}", dir.display())),
             }
         }
         // `work` and anything left in it are removed here; a sealed copy that
