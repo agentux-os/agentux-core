@@ -585,6 +585,16 @@ impl Messages {
             }
             EventBody::Limits { limits } => Some(self.limits_changed(limits)),
             EventBody::HarnessStatus { harnesses } => Some(self.harness_status(harnesses)),
+            EventBody::NodeStatusChanged { node } => {
+                let message = self.event("node.status_changed", json!({ "node": node }));
+                auxp::validate(&message).ok()?;
+                Some(message)
+            }
+            EventBody::NodeAlertChanged { alert } => {
+                let message = self.event("node.alert", json!({ "alert": alert }));
+                auxp::validate(&message).ok()?;
+                Some(message)
+            }
             EventBody::Session { session } => {
                 if session.state == SessionState::Ended {
                     self.state.sessions.remove(&session.id);
