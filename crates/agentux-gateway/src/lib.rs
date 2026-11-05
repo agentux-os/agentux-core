@@ -559,9 +559,9 @@ impl Messages {
         {
             return None;
         }
-        let (run_id, role_id) = {
+        let run_id = {
             let context = self.state.sessions.get(session_id)?;
-            (context.run_id.clone(), context.role_id.clone())
+            context.run_id.clone()
         };
         let origin = self.state.run_origins.get(&run_id)?;
         let SessionEvent::ToolCall {
