@@ -271,10 +271,10 @@ async fn gateway_harness_inventory_is_durable_and_captured_with_its_event_head()
         node_id: "node-a".into(),
         checkpoint_id: "checkpoint-1".into(),
         snapshot_id: "snapshot-1".into(),
-        captured_event_head: 1,
+        captured_event_head: 3,
         created_at_ms: now,
         expires_at_ms: now + agentux_store::snapshot::MIN_RETENTION.as_millis() as i64,
-        high_water_sequence: 1,
+        high_water_sequence: 3,
         payload: serde_json::json!({"entries": []}),
     };
     let binding = rpc::SnapshotBinding {
@@ -282,8 +282,8 @@ async fn gateway_harness_inventory_is_durable_and_captured_with_its_event_head()
         node_id: "node-a".into(),
         checkpoint_id: "checkpoint-1".into(),
         snapshot_id: "snapshot-1".into(),
-        captured_event_head: 1,
-        high_water_sequence: 1,
+        captured_event_head: 3,
+        high_water_sequence: 3,
     };
     assert_eq!(
         client.materialize_snapshot(&materialization).await.unwrap(),

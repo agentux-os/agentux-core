@@ -276,6 +276,24 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
                     .map_err(Error::from),
             )
         }
+        method::NODE_STATE_REPLACE => {
+            let params: rpc::NodeStateReplace = parse(params)?;
+            to_value(
+                engine
+                    .store()
+                    .write(|tx| tx.replace_node_state(&params.node))
+                    .map_err(Error::from),
+            )
+        }
+        method::NODE_ALERT_INVENTORY_REPLACE => {
+            let params: rpc::NodeAlertInventory = parse(params)?;
+            to_value(
+                engine
+                    .store()
+                    .write(|tx| tx.replace_node_alert_inventory(&params.alerts))
+                    .map_err(Error::from),
+            )
+        }
         method::HARNESSES_TEST => to_value(engine.test_harness(parse(params)?).await),
         method::PREFERENCES_GET => to_value(engine.get_prefs()),
         method::PREFERENCES_SET => {

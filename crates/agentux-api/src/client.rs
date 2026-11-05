@@ -105,6 +105,32 @@ impl Client {
         .await
     }
 
+    /// Replaces the local node's durable operational state.
+    pub async fn replace_node_state(
+        &mut self,
+        node: &crate::NodeState,
+    ) -> Result<Option<i64>, ClientError> {
+        self.call(
+            method::NODE_STATE_REPLACE,
+            &rpc::NodeStateReplace { node: node.clone() },
+        )
+        .await
+    }
+
+    /// Replaces the complete durable alert inventory from a trusted local producer.
+    pub async fn replace_node_alert_inventory(
+        &mut self,
+        alerts: &[crate::NodeAlertState],
+    ) -> Result<Option<i64>, ClientError> {
+        self.call(
+            method::NODE_ALERT_INVENTORY_REPLACE,
+            &rpc::NodeAlertInventory {
+                alerts: alerts.to_vec(),
+            },
+        )
+        .await
+    }
+
     pub async fn test_harness(
         &mut self,
         params: &rpc::TestHarness,
