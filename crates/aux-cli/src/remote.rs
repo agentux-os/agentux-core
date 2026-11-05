@@ -651,7 +651,9 @@ impl Printer {
                 self.session_event(session_id, &role, event);
             }
             EventBody::BusMessage { message } => println!("  {}", bus_line(message)),
-            EventBody::Project { .. } | EventBody::Limits { .. } => {}
+            EventBody::Project { .. }
+            | EventBody::Limits { .. }
+            | EventBody::SnapshotProjectionChanged { .. } => {}
         }
         None
     }
