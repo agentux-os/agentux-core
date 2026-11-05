@@ -885,6 +885,83 @@ impl Tx<'_> {
         Ok(sequence)
     }
 
+    fn sync_command_pull_request_artifact(&mut self, record: &RunRecord) -> Result<()> {
+        let Some(origin) = record.run.origin.as_ref() else {
+            return Ok(());
+        };
+        let organization_id = &origin.organization_id;
+        let existing_ids = {
+            let mut stmt = self.tx.prepare(
+                "SELECT projection_id FROM snapshot_business_projections
+                 WHERE projection_type = 'artifact' AND organization_id = ?1
+                   AND run_id = ?2 AND removed_sequence IS NULL",
+            )?;
+            let rows = stmt.query_map(params![organization_id, record.run.id], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let next_id = record
+            .run
+            .pull_request
+            .as_ref()
+            .map(|pull_request| format!("pr-{}-{}", record.run.id, pull_request.number));
+
+        for id in existing_ids {
+            if Some(id.as_str()) != next_id.as_deref() {
+                self.remove_business_projection(
+                    SnapshotProjectionType::Artifact,
+                    &id,
+                    organization_id,
+                )?;
+            }
+        }
+
+        let (Some(pull_request), Some(id)) = (record.run.pull_request.as_ref(), next_id) else {
+            return Ok(());
+        };
+        let url = pull_request.url.trim();
+        let host = url
+            .strip_prefix("https://")
+            .and_then(|rest| rest.split(['/', '?', '#']).next())
+            .unwrap_or_default();
+        if host.is_empty()
+            || host.contains('@')
+            || host.contains(':')
+            || url.chars().any(char::is_control)
+            || url.chars().any(char::is_whitespace)
+        {
+            return Err(Error::Data(
+                "pull request artifact URL must be a safe HTTPS URL".into(),
+            ));
+        }
+        let current_state = serde_json::json!({
+            "artifactId": id,
+            "organizationId": organization_id,
+            "runId": record.run.id,
+            "kind": "pull_request",
+            "status": "available",
+            "name": format!("Pull request #{}", pull_request.number),
+            "uri": url,
+            "number": pull_request.number,
+        });
+        let state = serde_json::json!({
+            "artifactId": id,
+            "organizationId": organization_id,
+            "runId": record.run.id,
+            "status": "available",
+            "currentState": current_state,
+        });
+        self.upsert_business_projection(&snapshot::BusinessProjection {
+            projection_type: SnapshotProjectionType::Artifact,
+            id,
+            organization_id: organization_id.clone(),
+            run_id: Some(record.run.id.clone()),
+            state,
+        })?;
+        Ok(())
+    }
+
     /// Applies a safe lifecycle transition from the trusted node gateway.
     /// Parameters and arbitrary operation results cannot enter this record.
     pub fn update_command_projection(
@@ -1120,7 +1197,8 @@ impl Tx<'_> {
             EventBody::Run {
                 run: record.run.clone(),
             },
-        )
+        )?;
+        self.sync_command_pull_request_artifact(record)
     }
 
     /// Returns the existing Command-owned run for a retry, or inserts it.
@@ -1170,7 +1248,8 @@ impl Tx<'_> {
             EventBody::Run {
                 run: record.run.clone(),
             },
-        )
+        )?;
+        self.sync_command_pull_request_artifact(record)
     }
 
     pub fn run(&self, id: &str) -> Result<Option<RunRecord>> {

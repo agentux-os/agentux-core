@@ -32,6 +32,7 @@
 
 - Update `docs/api.md` and `docs/gateway.md` with ownership, stored fields, retry/reconciliation behavior, and retention.
 - Keep all three business projection families unavailable and checkpoint capability disabled.
+- Project typed pull requests from Command-owned runs as run-scoped artifacts; keep the artifact family unavailable until generic artifact lifecycle events have an authoritative producer.
 - Run CI on Linux, review the full diff for sensitive-field leaks and crash windows, add PR description and AGENTS.md-style independent-review request.
 
 **Verification:** Focused Rust tests and full Core CI matrix on Linux (`x86_64` and `aarch64`), plus fmt, Clippy, and cargo-deny.

@@ -839,6 +839,55 @@ fn runs_round_trip_with_their_private_state() {
 }
 
 #[test]
+fn command_owned_pull_request_is_projected_and_removed_with_run_state() {
+    let store = Store::open_in_memory().unwrap();
+    let project = store
+        .write(|tx| tx.register_project("app", "/src/artifact-app"))
+        .unwrap();
+    let mut record = sample_run(&project.id);
+    record.run.origin = Some(agentux_api::RunOrigin {
+        organization_id: "org-a".into(),
+        mission_id: "mission-a".into(),
+        command_run_id: "command-run-a".into(),
+        definition_version: Some("v1".into()),
+    });
+    record.run.pull_request = Some(PullRequest {
+        number: 42,
+        url: "https://github.com/acme/app/pull/42".into(),
+    });
+
+    store.write(|tx| tx.insert_run(&record)).unwrap();
+
+    let capture = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    let artifact = capture
+        .business_projections
+        .iter()
+        .find(|entry| entry.projection_type == SnapshotProjectionType::Artifact)
+        .expect("Command-owned pull request is an artifact");
+    assert_eq!(artifact.organization_id, "org-a");
+    assert_eq!(artifact.run_id.as_deref(), Some(record.run.id.as_str()));
+    let state = artifact.state.as_ref().unwrap();
+    assert_eq!(state["kind"], "pull_request");
+    assert_eq!(state["uri"], "https://github.com/acme/app/pull/42");
+    assert_eq!(state["currentState"]["number"], 42);
+
+    record.run.pull_request = None;
+    store.write(|tx| tx.save_run(&mut record)).unwrap();
+    let capture = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    let artifact = capture
+        .business_projections
+        .iter()
+        .find(|entry| entry.projection_type == SnapshotProjectionType::Artifact)
+        .unwrap();
+    assert!(artifact.state.is_none());
+    assert!(artifact.removed_at_sequence.is_some());
+}
+
+#[test]
 fn a_failed_transaction_leaves_no_trace() {
     let store = Store::open_in_memory().unwrap();
     let mut events = store.subscribe();

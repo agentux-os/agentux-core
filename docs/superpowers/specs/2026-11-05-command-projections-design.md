@@ -17,7 +17,7 @@ Connect the authenticated node gateway to Core's organization-scoped SQLite Comm
 - Persist raw command parameters, provider credentials, or arbitrary operation responses.
 - Claim exactly-once behavior for external effects that Core cannot commit atomically.
 - Enable Protocol snapshot checkpoints or change the existing snapshot capability gate.
-- Implement task or artifact producers in this slice.
+- Implement generic AUXP artifact lifecycle events or task producers in this slice; only typed Command-owned pull requests are projected as artifacts.
 
 ## Approaches
 
@@ -32,6 +32,7 @@ Connect the authenticated node gateway to Core's organization-scoped SQLite Comm
 - A retry of a completed idempotent operation returns its recorded safe outcome. A retry of an interrupted unsupported operation is rejected with a reconciliation-required result and does not execute again.
 - Human-confirmed commands retain the existing local pending-command mechanism for the data needed to execute after confirmation; projection state itself does not copy that payload.
 - Snapshot `unavailable_projections()` remains unchanged in this partial delivery.
+- Command-owned runs with a typed pull request publish a stable run-scoped artifact projection in the same SQLite transaction as the run event; clearing or replacing the pull request tombstones the prior artifact. This does not make the generic artifact source complete.
 
 ## Implementation left to the builder
 

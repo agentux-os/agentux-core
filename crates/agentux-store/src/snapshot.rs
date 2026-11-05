@@ -79,11 +79,11 @@ pub const fn checkpoint_capability_enabled() -> bool {
 pub fn unavailable_projections() -> Vec<UnavailableProjection> {
     ProjectionKind::ALL.into_iter().filter_map(|kind| {
         let reason = match kind {
-            ProjectionKind::Artifact => Some(
-                "durable storage exists, but the authoritative artifact lifecycle producer is not connected",
-            ),
             ProjectionKind::Command => Some(
                 "durable storage exists, but the authenticated gateway command lifecycle producer is not connected",
+            ),
+            ProjectionKind::Artifact => Some(
+                "typed pull request artifacts are projected, but the generic artifact lifecycle producer is not connected",
             ),
             ProjectionKind::Node => Some("authoritative node state and its sequence are not yet persisted in the Core SQLite transaction"),
             ProjectionKind::NodeAlert => Some("Core has no durable node alert projection"),
