@@ -1435,6 +1435,69 @@ mod tests {
     }
 
     #[test]
+    fn node_state_and_alert_events_are_relayed_as_typed_auxp_events() {
+        let mut messages = Messages::new(config(), None).unwrap();
+        let status = Event {
+            seq: 41,
+            at: 1_794_000_000_000,
+            run_id: None,
+            body: EventBody::NodeStatusChanged {
+                node: agentux_api::NodeState {
+                    node_id: "node-01".into(),
+                    status: agentux_api::NodeOperationalStatus::Ready,
+                    capacity: json!({"slots": 2}),
+                },
+            },
+        };
+        let status_message = messages.from_event(&status).unwrap();
+        assert_eq!(status_message["method"], "node.status_changed");
+        assert_eq!(status_message["params"]["sequence"], 1);
+        assert_eq!(status_message["params"]["node"]["nodeId"], "node-01");
+        auxp::validate(&status_message).unwrap();
+
+        let alert = agentux_api::NodeAlertState {
+            alert_id: "disk-low".into(),
+            producer: "system-monitor".into(),
+            code: "disk.low".into(),
+            condition_key: "root".into(),
+            summary: "Root filesystem usage is high".into(),
+            first_observed_at: "2026-11-05T12:00:00Z".into(),
+            last_observed_at: "2026-11-05T12:00:00Z".into(),
+            status: agentux_api::NodeAlertStatus::Active,
+        };
+        let state = Event {
+            seq: 42,
+            at: 1_794_000_001_000,
+            run_id: None,
+            body: EventBody::NodeAlertChanged {
+                alert: agentux_api::NodeAlertChange::State {
+                    alert: alert.clone(),
+                },
+            },
+        };
+        let state_message = messages.from_event(&state).unwrap();
+        assert_eq!(state_message["method"], "node.alert");
+        assert_eq!(state_message["params"]["sequence"], 2);
+        assert_eq!(state_message["params"]["alert"]["kind"], "state");
+        auxp::validate(&state_message).unwrap();
+
+        let removed = Event {
+            seq: 43,
+            at: 1_794_000_002_000,
+            run_id: None,
+            body: EventBody::NodeAlertChanged {
+                alert: agentux_api::NodeAlertChange::Removed {
+                    alert_id: alert.alert_id,
+                },
+            },
+        };
+        let removed_message = messages.from_event(&removed).unwrap();
+        assert_eq!(removed_message["params"]["sequence"], 3);
+        assert_eq!(removed_message["params"]["alert"]["kind"], "removed");
+        auxp::validate(&removed_message).unwrap();
+    }
+
+    #[test]
     fn acp_tool_lifecycle_fixtures_emit_ordered_safe_replayable_activity() {
         let temp = tempfile::tempdir().unwrap();
         let state_path = temp.path().join("gateway.json");
