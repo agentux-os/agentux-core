@@ -654,7 +654,11 @@ impl Printer {
             EventBody::Project { .. }
             | EventBody::Limits { .. }
             | EventBody::HarnessStatus { .. }
-            | EventBody::SnapshotProjectionChanged { .. } => {}
+            | EventBody::SnapshotProjectionChanged { .. }
+            // This printer follows a single remote run. Node health and alert
+            // events belong to the node overview, not the run timeline.
+            | EventBody::NodeStatusChanged { .. }
+            | EventBody::NodeAlertChanged { .. } => {}
         }
         None
     }
