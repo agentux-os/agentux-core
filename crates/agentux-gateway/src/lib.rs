@@ -33,8 +33,8 @@ use std::{env, fs, io};
 
 use agentux_api::rpc::HarnessInfo;
 use agentux_api::{
-    Event, EventBody, HarnessLimit, PermissionRequest, RequestStatus, Run, RunOrigin, RunStatus,
-    SessionEvent, SessionState, ToolStatus,
+    Event, EventBody, HarnessLimit, NodeOperationalStatus, NodeState, PermissionRequest,
+    RequestStatus, Run, RunOrigin, RunStatus, SessionEvent, SessionState, ToolStatus,
 };
 use auxp::activity::{ACTIVITY_SCHEMA_VERSION, Activity, ActivityKind};
 use auxp::replay::{ReplayResult, ReplayStatus};
@@ -1135,9 +1135,21 @@ async fn run_loop(
                 .map_err(|e| e.to_string())?,
             Err(e) => return Err(format!("cannot subscribe to agentuxd: {e}")),
         };
+        let mut node_state = NodeState {
+            node_id: messages.config.node_id.clone(),
+            status: NodeOperationalStatus::Ready,
+            capacity: json!({}),
+        };
+        if let Err(error) = client.replace_node_state(&node_state).await {
+            log(&format!("cannot persist node readiness: {error}"));
+        }
         loop {
             tokio::select! {
                 _ = &mut stop => {
+                    node_state.status = NodeOperationalStatus::Draining;
+                    if let Err(error) = client.replace_node_state(&node_state).await {
+                        log(&format!("cannot persist node shutdown state: {error}"));
+                    }
                     let _ = outbox.flush(&sink, messages.replay_enabled()).await;
                     let _ = messages.commit_outbox(&outbox);
                     return Ok(());
