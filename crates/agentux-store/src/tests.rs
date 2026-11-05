@@ -632,6 +632,9 @@ fn migration_11_preserves_version_10_rows_and_scopes_projection_ids_by_org() {
                  '{\"commandId\":\"command-shared-id\",\"organizationId\":\"org-a\",\"status\":\"completed\",\"currentState\":{\"saved\":true}}',
                  42, NULL
              );
+             DROP TABLE snapshot_capture_bindings;
+             DROP TABLE snapshot_harness_inventory_state;
+             DROP TABLE snapshot_harnesses;
              PRAGMA user_version = 10;",
         )
         .unwrap();
