@@ -252,14 +252,13 @@ async fn worker(
                             method,
                             payload,
                             completion_ack: Some((command_id.clone(), acknowledge)),
-                        }).is_ok() {
-                            if matches!(acknowledged.await, Ok(Ok(())))
-                                && let Err(error) = pending.complete(&command_id)
-                            {
-                                let _ = out.send(Out::Log(format!(
-                                    "cannot clear delivered command {command_id}: {error}"
-                                )));
-                            }
+                        }).is_ok()
+                            && matches!(acknowledged.await, Ok(Ok(())))
+                            && let Err(error) = pending.complete(&command_id)
+                        {
+                            let _ = out.send(Out::Log(format!(
+                                "cannot clear delivered command {command_id}: {error}"
+                            )));
                         }
                     },
                     Err(error) => {

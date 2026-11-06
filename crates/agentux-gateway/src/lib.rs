@@ -1208,10 +1208,10 @@ fn handle_gateway_out(
             payload,
             completion_ack,
         } => {
-            let result = (|| {
+            let result = {
                 outbox.push(messages.custom_event(&method, payload));
                 messages.commit_outbox(outbox)
-            })();
+            };
             if let Some((_, acknowledgement)) = completion_ack {
                 let _ = acknowledgement.send(result.clone());
             }
