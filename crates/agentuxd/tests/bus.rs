@@ -957,7 +957,7 @@ pipeline:
 const ARTIFACT_PIPELINE: &str = "version: 1
 roles:
   implementer:
-    harness: fake-coder
+    harness: codex
 bus:
   allow: [publish_artifact, remove_artifact]
 pipeline:
