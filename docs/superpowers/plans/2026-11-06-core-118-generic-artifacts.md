@@ -1,7 +1,7 @@
 # Core #118: Generic Artifact Lifecycle Plan
 
-> **Status:** proposed sequence; implementation begins after the owner accepts
-> the artifact contract and Protocol #20 defines remote dereference.
+> **Status:** implementation in progress; Core #118 and Protocol #20 contracts
+> were accepted by the owner on 2026-11-06.
 
 **Goal:** Connect an authoritative, verifiable artifact lifecycle to Core
 snapshots without advertising incomplete artifact inventories.
@@ -46,7 +46,7 @@ Protocol #20.
 
 ### 1. Finalize protocol and Core contracts
 
-- [ ] Accept the Core #118 proposal and Protocol #20 retrieval/removal contract.
+- [x] Accept the Core #118 proposal and Protocol #20 retrieval/removal contract.
 - [ ] Implement idempotency scope as
   `(organizationId, runId, producerId, producerKey, publicationId)`; validate
   media type and configure storage quota. Retain superseded/removed bytes for

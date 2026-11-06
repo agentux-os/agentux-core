@@ -132,6 +132,142 @@ fn command_run_origin_deduplicates_retries_in_one_transaction() {
 }
 
 #[test]
+fn artifact_publication_is_bound_idempotent_and_tombstoned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("state.db")).unwrap();
+    let project = store
+        .write(|tx| tx.register_project("app", dir.path().to_str().unwrap()))
+        .unwrap();
+    let mut record = sample_run(&project.id);
+    record.run.origin = Some(agentux_api::RunOrigin {
+        organization_id: "org-a".into(),
+        mission_id: "mission-a".into(),
+        command_run_id: "command-run-a".into(),
+        definition_version: Some("v1".into()),
+    });
+    store.write(|tx| tx.insert_run(&record)).unwrap();
+    store
+        .write(|tx| {
+            tx.insert_session(&Session {
+                id: "session-a".into(),
+                run_id: record.run.id.clone(),
+                project_id: project.id.clone(),
+                role: "implementer".into(),
+                harness: "claude-code".into(),
+                model: None,
+                state: SessionState::Active,
+                cwd: dir.path().display().to_string(),
+                usage: SessionUsage::default(),
+                started_at: now_ms(),
+                updated_at: now_ms(),
+                ended_at: None,
+                vendor_session_id: None,
+            })
+        })
+        .unwrap();
+
+    let publication = artifact::Publication {
+        organization_id: "org-a".into(),
+        run_id: record.run.id.clone(),
+        session_id: "session-a".into(),
+        producer_id: "agentux-report".into(),
+        producer_key: "report".into(),
+        publication_id: "publication-a".into(),
+        name: "Report".into(),
+        media_type: "text/markdown".into(),
+    };
+    let content = artifact_store::ContentStore::open(dir.path().join("artifacts"))
+        .unwrap()
+        .put_verified(b"a")
+        .unwrap();
+    let first = store
+        .write(|tx| tx.publish_artifact(&publication, &content))
+        .unwrap();
+    assert!(first.created);
+    assert_eq!(first.agent_id, "session:session-a");
+
+    let event_head = store.read(|tx| tx.last_event_seq()).unwrap();
+    let retry = store
+        .write(|tx| tx.publish_artifact(&publication, &content))
+        .unwrap();
+    assert_eq!(retry.artifact_id, first.artifact_id);
+    assert_eq!(retry.sequence, first.sequence);
+    assert!(!retry.created);
+    assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), event_head);
+
+    let mut conflicting_retry = publication.clone();
+    conflicting_retry.name = "Different report".into();
+    assert!(
+        store
+            .write(|tx| tx.publish_artifact(&conflicting_retry, &content))
+            .is_err()
+    );
+
+    let mut second_publication = publication.clone();
+    second_publication.publication_id = "publication-b".into();
+    second_publication.name = "Updated report".into();
+    let second_content = artifact_store::ContentStore::open(dir.path().join("artifacts"))
+        .unwrap()
+        .put_verified(b"updated")
+        .unwrap();
+    let updated = store
+        .write(|tx| tx.publish_artifact(&second_publication, &second_content))
+        .unwrap();
+    assert_eq!(updated.artifact_id, first.artifact_id);
+    assert!(updated.sequence > first.sequence);
+
+    store
+        .write(|tx| {
+            tx.replace_node_state(&node_state(agentux_api::NodeOperationalStatus::Ready, 1))
+        })
+        .unwrap();
+    let capture = store
+        .read(|tx| tx.capture_checkpoint_sources_for_node("org-a", Some("node-a"), now_ms()))
+        .unwrap();
+    let projection = capture
+        .business_projections
+        .iter()
+        .find(|entry| entry.id == first.artifact_id)
+        .and_then(|entry| entry.state.as_ref())
+        .unwrap();
+    let expected_uri = format!(
+        "artifact://node-a/{}/{}",
+        first.artifact_id, updated.revision
+    );
+    assert_eq!(projection["uri"], expected_uri);
+    assert_eq!(projection["currentState"]["uri"], expected_uri);
+
+    let old_retry = store
+        .write(|tx| tx.publish_artifact(&publication, &content))
+        .unwrap();
+    assert_eq!(old_retry.revision, first.revision);
+    assert_eq!(old_retry.sequence, first.sequence);
+
+    let removed_sequence = store
+        .write(|tx| tx.remove_artifact("org-a", &first.artifact_id, "session-a"))
+        .unwrap()
+        .unwrap();
+    assert!(removed_sequence > first.sequence);
+    assert!(
+        store
+            .write(|tx| tx.publish_artifact(&publication, &content))
+            .is_ok()
+    );
+    assert_eq!(
+        store
+            .write(|tx| tx.remove_artifact("org-a", &first.artifact_id, "session-a"))
+            .unwrap(),
+        Some(removed_sequence)
+    );
+    assert!(
+        store
+            .write(|tx| tx.remove_artifact("org-b", &first.artifact_id, "session-a"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn command_lifecycle_projection_is_safe_scoped_and_transitioned() {
     let store = Store::open_in_memory().unwrap();
     let update = |status| agentux_api::rpc::CommandProjectionUpdate {

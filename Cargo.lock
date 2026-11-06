@@ -123,9 +123,11 @@ name = "agentux-store"
 version = "0.5.5"
 dependencies = [
  "agentux-api",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "url",
@@ -295,7 +297,7 @@ dependencies = [
 [[package]]
 name = "auxp"
 version = "0.1.0"
-source = "git+https://github.com/agentux-os/agentux-protocol?rev=0ca8d7d562d2e5985d5e878ce759b5c2943652d4#0ca8d7d562d2e5985d5e878ce759b5c2943652d4"
+source = "git+https://github.com/agentux-os/agentux-protocol?rev=525d85ef0b4d7441407b3e4ae83da5d948e62661#525d85ef0b4d7441407b3e4ae83da5d948e62661"
 dependencies = [
  "jiff",
  "serde",

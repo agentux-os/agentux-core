@@ -1,6 +1,6 @@
 # Generic artifact lifecycle
 
-**Decision status: Proposed** (Core #118)
+**Decision status: Accepted** (Core #118; 2026-11-06)
 
 ## Decision
 
@@ -144,8 +144,8 @@ artifact `currentState` containing `artifactId`, `organizationId`, `runId`,
 revision URI. Protocol #17's generic artifact projection schema does not
 currently require these content fields, so its permissive schema is not, by
 itself, sufficient evidence that a checkpoint can restore artifact state.
-Protocol #20 must define this stricter profile or a compatible schema
-extension; Core rejects incomplete artifact entries before materialization.
+The accepted Protocol #20 profile defines this strict checkpoint shape; Core
+rejects incomplete artifact entries before materialization.
 
 ## Completeness gate
 

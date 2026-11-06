@@ -23,16 +23,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentux_api::rpc::HarnessInfo;
 use agentux_api::{
-    AttemptStatus, BusMessage, CheckResult, Event, EventBody, HarnessLimit, NodeAlertChange,
-    NodeAlertState, NodeState, PermissionRequest, Project, PullRequest, RequestKind, RequestStatus,
-    Run, RunStatus, Session, SessionState, SessionUsage, SnapshotProjectionType, StepAttempt,
-    StepKind,
+    ArtifactActivity, AttemptStatus, BusMessage, CheckResult, Event, EventBody, HarnessLimit,
+    NodeAlertChange, NodeAlertState, NodeState, PermissionRequest, Project, PullRequest,
+    RequestKind, RequestStatus, Run, RunStatus, Session, SessionState, SessionUsage,
+    SnapshotProjectionType, StepAttempt, StepKind,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::broadcast;
 
+pub mod artifact;
+pub mod artifact_store;
 mod schema;
 pub mod snapshot;
 
@@ -1013,6 +1015,37 @@ impl Tx<'_> {
                 reason: "Core has no complete observed node-alert inventory yet".into(),
             });
         }
+        let mut business_projections = self.business_projections(organization_id)?;
+        for projection in &mut business_projections {
+            if projection.projection_type != SnapshotProjectionType::Artifact
+                || projection.state.is_none()
+            {
+                continue;
+            }
+            let node = node.as_ref().ok_or_else(|| {
+                Error::Data("artifact snapshot requires the persisted node identity".into())
+            })?;
+            let state = projection
+                .state
+                .as_mut()
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| Error::Data("artifact projection state is malformed".into()))?;
+            let artifact_id = state
+                .get("artifactId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::Data("artifact projection is missing artifactId".into()))?;
+            let revision = state
+                .get("revision")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| Error::Data("artifact projection is missing revision".into()))?;
+            let uri = format!("artifact://{}/{artifact_id}/{revision}", node.state.node_id);
+            state.insert("uri".into(), uri.clone().into());
+            let current = state
+                .get_mut("currentState")
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| Error::Data("artifact projection is missing currentState".into()))?;
+            current.insert("uri".into(), uri.into());
+        }
         Ok(snapshot::DurableCapture {
             organization_id: organization_id.into(),
             captured_event_head: self.last_event_seq()?,
@@ -1024,7 +1057,7 @@ impl Tx<'_> {
             node,
             node_alerts: self.node_alert_projections()?,
             gates,
-            business_projections: self.business_projections(organization_id)?,
+            business_projections,
             unavailable,
         })
     }
@@ -1138,6 +1171,387 @@ impl Tx<'_> {
             ],
         )?;
         Ok(sequence)
+    }
+
+    /// Persist an explicit, verified artifact publication and its lifecycle
+    /// event in one SQLite transaction. The content store must have committed
+    /// the digest-addressed blob before this method is called; a failed DB
+    /// transaction can leave only an unreferenced blob for later cleanup.
+    pub fn publish_artifact(
+        &mut self,
+        publication: &artifact::Publication,
+        content: &artifact::VerifiedContent,
+    ) -> Result<artifact::PublishedArtifact> {
+        publication.validate().map_err(Error::Data)?;
+        if content.byte_length > artifact::MAX_ARTIFACT_BYTES
+            || content.sha256.len() != 64
+            || !content
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(Error::Data(
+                "verified artifact content metadata is invalid".into(),
+            ));
+        }
+
+        let ownership: Option<(Option<String>, String, String, Option<i64>)> = self
+            .tx
+            .query_row(
+                "SELECT runs.origin, sessions.role, sessions.state, sessions.ended_at FROM runs
+                 INNER JOIN sessions ON sessions.run_id = runs.id
+                 WHERE runs.id = ?1 AND sessions.id = ?2",
+                params![publication.run_id, publication.session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((origin, role_id, session_state, ended_at)) = ownership else {
+            return Err(Error::Data(
+                "artifact publisher session is not bound to the persisted run".into(),
+            ));
+        };
+        let origin = origin
+            .as_deref()
+            .map(from_json::<agentux_api::RunOrigin>)
+            .transpose()?
+            .ok_or_else(|| {
+                Error::Data("generic remote artifacts require a Command-owned run".into())
+            })?;
+        if origin.organization_id != publication.organization_id {
+            return Err(Error::Data(
+                "artifact run is outside its organization ownership".into(),
+            ));
+        }
+        let agent_id = format!("session:{}", publication.session_id);
+
+        if let Some(existing) = self.tx.query_row(
+            "SELECT p.artifact_id, p.revision, p.sequence, p.byte_length, p.media_type,
+                    p.name, p.session_id, p.agent_id, p.role_id
+             FROM artifact_publications p
+             INNER JOIN artifacts a ON a.organization_id = p.organization_id AND a.artifact_id = p.artifact_id
+             WHERE p.organization_id = ?1 AND p.run_id = ?2 AND p.producer_id = ?3
+               AND p.producer_key = ?4 AND p.publication_id = ?5",
+            params![publication.organization_id, publication.run_id, publication.producer_id, publication.producer_key, publication.publication_id],
+            |row| Ok((
+                row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
+                row.get::<_, u64>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?,
+            )),
+        ).optional()? {
+            let (artifact_id, revision, sequence, byte_length, media_type, name, session_id, stored_agent_id, stored_role_id) = existing;
+            if revision != content.sha256 || byte_length != content.byte_length
+                || media_type != publication.media_type || name != publication.name
+                || session_id != publication.session_id
+            {
+                return Err(Error::Data("artifact publication id was reused with different content or metadata".into()));
+            }
+            return Ok(artifact::PublishedArtifact {
+                artifact_id, organization_id: publication.organization_id.clone(), run_id: publication.run_id.clone(),
+                session_id, agent_id: stored_agent_id, role_id: stored_role_id,
+                producer_id: publication.producer_id.clone(), producer_key: publication.producer_key.clone(),
+                publication_id: publication.publication_id.clone(), revision, media_type, byte_length: content.byte_length,
+                name, sequence, created: false,
+            });
+        }
+
+        if session_state == "ended" || ended_at.is_some() {
+            return Err(Error::Data(
+                "artifact publisher session is not active".into(),
+            ));
+        }
+
+        let active: Option<(String, Option<String>, Option<u64>, i64, String, String, String)> = self
+            .tx
+            .query_row(
+                "SELECT artifact_id, current_revision, byte_length, updated_sequence, name, media_type, session_id FROM artifacts
+             WHERE organization_id = ?1 AND run_id = ?2 AND producer_id = ?3 AND producer_key = ?4
+               AND removed_sequence IS NULL",
+                params![
+                    publication.organization_id,
+                    publication.run_id,
+                    publication.producer_id,
+                    publication.producer_key
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+            )
+            .optional()?;
+        let (
+            artifact_id,
+            created,
+            old_revision,
+            existing_sequence,
+            old_name,
+            old_media_type,
+            old_session_id,
+        ) = match active {
+            Some((id, revision, _, sequence, name, media_type, session_id)) => (
+                id,
+                false,
+                revision,
+                Some(sequence),
+                Some(name),
+                Some(media_type),
+                Some(session_id),
+            ),
+            None => (
+                format!("art-{}", new_id()),
+                true,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        };
+        if old_revision.as_deref() == Some(content.sha256.as_str())
+            && old_media_type
+                .as_deref()
+                .is_some_and(|value| value != publication.media_type)
+        {
+            return Err(Error::Data(
+                "mediaType cannot change for an immutable content revision".into(),
+            ));
+        }
+        let created_at = now_ms();
+        if created {
+            self.tx.execute(
+                "INSERT INTO artifacts (organization_id, artifact_id, run_id, producer_id, producer_key,
+                 session_id, agent_id, role_id, name, media_type, current_revision, byte_length,
+                 created_sequence, updated_sequence, removed_sequence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, 0, NULL)",
+                params![publication.organization_id, artifact_id, publication.run_id, publication.producer_id,
+                    publication.producer_key, publication.session_id, agent_id, role_id, publication.name,
+                    publication.media_type, content.sha256, content.byte_length],
+            )?;
+        }
+        let changed = old_revision.as_deref() != Some(content.sha256.as_str())
+            || old_name.as_deref() != Some(publication.name.as_str())
+            || old_session_id.as_deref() != Some(publication.session_id.as_str());
+        if let Some(old_revision) = old_revision.as_deref().filter(|_| changed) {
+            self.tx.execute(
+                "UPDATE artifact_revisions SET retain_until_ms = MAX(retain_until_ms, ?4)
+                 WHERE organization_id = ?1 AND artifact_id = ?2 AND revision = ?3",
+                params![
+                    publication.organization_id,
+                    artifact_id,
+                    old_revision,
+                    created_at.saturating_add(artifact::MIN_RETENTION_MS)
+                ],
+            )?;
+        }
+        let existing_revision: Option<(String, u64)> = self
+            .tx
+            .query_row(
+                "SELECT media_type, byte_length FROM artifact_revisions
+                 WHERE organization_id = ?1 AND artifact_id = ?2 AND revision = ?3",
+                params![publication.organization_id, artifact_id, content.sha256],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if existing_revision.is_some_and(|(media_type, byte_length)| {
+            media_type != publication.media_type || byte_length != content.byte_length
+        }) {
+            return Err(Error::Data(
+                "artifact revision metadata does not match its immutable content identity".into(),
+            ));
+        }
+        self.tx.execute(
+            "INSERT OR IGNORE INTO artifact_revisions (organization_id, artifact_id, revision, media_type,
+             byte_length, created_at_ms, retain_until_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![publication.organization_id, artifact_id, content.sha256, publication.media_type,
+                content.byte_length, created_at, created_at.saturating_add(artifact::MIN_RETENTION_MS)],
+        )?;
+
+        let sequence = if changed {
+            let activity = ArtifactActivity {
+                activity_id: format!("artifact-{}", new_id()),
+                mission_id: origin.mission_id.clone(),
+                run_id: publication.run_id.clone(),
+                agent_id: agent_id.clone(),
+                role_id: role_id.clone(),
+                session_id: publication.session_id.clone(),
+                artifact_id: artifact_id.clone(),
+                revision: content.sha256.clone(),
+                name: publication.name.clone(),
+                media_type: publication.media_type.clone(),
+                byte_length: content.byte_length,
+                summary: format!("Artifact {} is available", publication.name),
+            };
+            self.emit(
+                Some(&publication.run_id),
+                EventBody::ArtifactAvailable { artifact: activity },
+            )?;
+            self.events.last().expect("artifact event was appended").seq
+        } else {
+            existing_sequence
+                .ok_or_else(|| Error::Data("artifact update has no prior sequence".into()))?
+        };
+
+        if changed {
+            self.tx.execute(
+                "UPDATE artifacts SET session_id = ?3, agent_id = ?4, role_id = ?5, name = ?6,
+                 media_type = ?7, current_revision = ?8, byte_length = ?9, updated_sequence = ?10,
+                 created_sequence = CASE WHEN created_sequence = 0 THEN ?10 ELSE created_sequence END
+                 WHERE organization_id = ?1 AND artifact_id = ?2",
+                params![publication.organization_id, artifact_id, publication.session_id, agent_id, role_id,
+                    publication.name, publication.media_type, content.sha256, content.byte_length, sequence],
+            )?;
+            let state = serde_json::json!({
+                "artifactId": artifact_id,
+                "organizationId": publication.organization_id,
+                "runId": publication.run_id,
+                "revision": content.sha256,
+                "mediaType": publication.media_type,
+                "byteLength": content.byte_length,
+                "currentState": {
+                    "artifactId": artifact_id,
+                    "organizationId": publication.organization_id,
+                    "runId": publication.run_id,
+                    "revision": content.sha256,
+                    "mediaType": publication.media_type,
+                    "byteLength": content.byte_length
+                }
+            });
+            self.tx.execute(
+                "INSERT INTO snapshot_business_projections (projection_type, projection_id, organization_id, run_id, current_state, updated_sequence, removed_sequence)
+                 VALUES ('artifact', ?1, ?2, ?3, ?4, ?5, NULL)
+                 ON CONFLICT (organization_id, projection_type, projection_id) DO UPDATE SET
+                   run_id=excluded.run_id, current_state=excluded.current_state,
+                   updated_sequence=excluded.updated_sequence, removed_sequence=NULL",
+                params![artifact_id, publication.organization_id, publication.run_id, to_json(&state)?, sequence],
+            )?;
+        }
+        self.tx.execute(
+            "INSERT INTO artifact_publications (organization_id, run_id, producer_id, producer_key, publication_id, artifact_id, revision, sequence, byte_length, media_type, name, session_id, agent_id, role_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![publication.organization_id, publication.run_id, publication.producer_id,
+                publication.producer_key, publication.publication_id, artifact_id, content.sha256, sequence,
+                content.byte_length, publication.media_type, publication.name, publication.session_id,
+                agent_id, role_id],
+        )?;
+        Ok(artifact::PublishedArtifact {
+            artifact_id,
+            organization_id: publication.organization_id.clone(),
+            run_id: publication.run_id.clone(),
+            session_id: publication.session_id.clone(),
+            agent_id,
+            role_id,
+            producer_id: publication.producer_id.clone(),
+            producer_key: publication.producer_key.clone(),
+            publication_id: publication.publication_id.clone(),
+            revision: content.sha256.clone(),
+            media_type: publication.media_type.clone(),
+            byte_length: content.byte_length,
+            name: publication.name.clone(),
+            sequence,
+            created,
+        })
+    }
+
+    /// Tombstone an artifact under its original authenticated producer
+    /// session. The old revision remains in retention.
+    pub fn remove_artifact(
+        &mut self,
+        organization_id: &str,
+        artifact_id: &str,
+        session_id: &str,
+    ) -> Result<Option<i64>> {
+        let artifact: Option<(String, String, String, String, String, String, String, String, Option<String>, Option<u64>, Option<i64>)> = self.tx.query_row(
+            "SELECT run_id, session_id, agent_id, role_id, name, producer_id, producer_key, media_type, current_revision, byte_length, removed_sequence
+             FROM artifacts WHERE organization_id = ?1 AND artifact_id = ?2",
+            params![organization_id, artifact_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?, row.get(10)?)),
+        ).optional()?;
+        let Some((
+            run_id,
+            original_session,
+            agent_id,
+            role_id,
+            name,
+            producer_id,
+            producer_key,
+            media_type,
+            revision,
+            byte_length,
+            removed,
+        )) = artifact
+        else {
+            return Ok(None);
+        };
+        if original_session != session_id {
+            return Err(Error::Data(
+                "only the original producer session may remove this artifact".into(),
+            ));
+        }
+        if let Some(sequence) = removed {
+            return Ok(Some(sequence));
+        }
+        let origin_json: Option<String> = self
+            .tx
+            .query_row("SELECT origin FROM runs WHERE id = ?1", [&run_id], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        let origin: agentux_api::RunOrigin = origin_json
+            .as_deref()
+            .map(from_json)
+            .transpose()?
+            .ok_or_else(|| Error::Data("artifact run is no longer Command-owned".into()))?;
+        if origin.organization_id != organization_id {
+            return Err(Error::Data(
+                "artifact is outside the authenticated organization".into(),
+            ));
+        }
+        let revision =
+            revision.ok_or_else(|| Error::Data("live artifact has no current revision".into()))?;
+        let byte_length =
+            byte_length.ok_or_else(|| Error::Data("live artifact has no byte length".into()))?;
+        let activity = ArtifactActivity {
+            activity_id: format!("artifact-{}", new_id()),
+            mission_id: origin.mission_id,
+            run_id: run_id.clone(),
+            agent_id,
+            role_id,
+            session_id: original_session,
+            artifact_id: artifact_id.into(),
+            revision: revision.clone(),
+            name,
+            media_type,
+            byte_length,
+            summary: "Artifact removed".into(),
+        };
+        self.emit(
+            Some(&run_id),
+            EventBody::ArtifactRemoved { artifact: activity },
+        )?;
+        let sequence = self
+            .events
+            .last()
+            .expect("artifact removal event was appended")
+            .seq;
+        self.tx.execute(
+            "UPDATE artifact_revisions SET retain_until_ms = MAX(retain_until_ms, ?4)
+             WHERE organization_id = ?1 AND artifact_id = ?2 AND revision = ?3",
+            params![
+                organization_id,
+                artifact_id,
+                revision,
+                now_ms().saturating_add(artifact::MIN_RETENTION_MS)
+            ],
+        )?;
+        self.tx.execute(
+            "UPDATE artifacts SET current_revision = NULL, byte_length = NULL, removed_sequence = ?3, updated_sequence = ?3
+             WHERE organization_id = ?1 AND artifact_id = ?2",
+            params![organization_id, artifact_id, sequence],
+        )?;
+        self.tx.execute(
+            "UPDATE snapshot_business_projections SET current_state = NULL, updated_sequence = ?3, removed_sequence = ?3
+             WHERE projection_type = 'artifact' AND projection_id = ?1 AND organization_id = ?2",
+            params![artifact_id, organization_id, sequence],
+        )?;
+        let _ = (producer_id, producer_key);
+        Ok(Some(sequence))
     }
 
     fn sync_command_pull_request_artifact(&mut self, record: &RunRecord) -> Result<()> {
