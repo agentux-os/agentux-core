@@ -231,8 +231,10 @@ async fn artifact_publication_is_hidden_by_default_and_requires_explicit_opt_in(
     );
     default_client.cancel().await.unwrap();
 
-    let mut config = BusConfig::default();
-    config.allow = vec![BusTool::PublishArtifact];
+    let config = BusConfig {
+        allow: vec![BusTool::PublishArtifact],
+        ..BusConfig::default()
+    };
     let opted_in_bus = bus(config);
     let opted_in_client = connect(&opted_in_bus, "impl").await;
     let tools = opted_in_client.list_all_tools().await.unwrap();
