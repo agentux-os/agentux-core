@@ -992,7 +992,7 @@ fn publishes_explicit_artifact(ctx: Ctx, turn: Turn) -> BoxFuture<'static, TurnR
 async fn opted_in_agent_publishes_captures_and_removes_its_artifact() {
     let f = fixture(ARTIFACT_PIPELINE);
     let seen = Shared::default();
-    let mut d = daemon(&f, &seen, publishes_explicit_artifact, &[]).await;
+    let d = daemon(&f, &seen, publishes_explicit_artifact, &[]).await;
     let project = d
         .engine
         .register_project(f.repo.to_str().unwrap())
