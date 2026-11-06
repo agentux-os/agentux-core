@@ -304,7 +304,7 @@ mod tests {
         let store = ContentStore::open(&root).unwrap();
         let artifact = store.put(b"secret").unwrap();
         let root_mode = fs::metadata(&root).unwrap().permissions().mode() & 0o777;
-        let blobs_mode = fs::metadata(&root.join("blobs"))
+        let blobs_mode = fs::metadata(root.join("blobs"))
             .unwrap()
             .permissions()
             .mode()

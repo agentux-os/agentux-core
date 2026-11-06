@@ -92,6 +92,29 @@ pub struct RunRecord {
     pub base_commit: Option<String>,
 }
 
+type ActiveArtifactRow = (
+    String,
+    Option<String>,
+    Option<i64>,
+    i64,
+    String,
+    String,
+    String,
+);
+type ArtifactRemovalRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<i64>,
+    Option<i64>,
+);
+
 /// What a new approval request is about.
 #[derive(Debug, Clone)]
 pub struct NewRequest {
@@ -1262,7 +1285,7 @@ impl Tx<'_> {
             ));
         }
 
-        let active: Option<(String, Option<String>, Option<i64>, i64, String, String, String)> = self
+        let active: Option<ActiveArtifactRow> = self
             .tx
             .query_row(
                 "SELECT artifact_id, current_revision, byte_length, updated_sequence, name, media_type, session_id FROM artifacts
@@ -1458,7 +1481,7 @@ impl Tx<'_> {
         artifact_id: &str,
         session_id: &str,
     ) -> Result<Option<i64>> {
-        let artifact: Option<(String, String, String, String, String, String, String, String, Option<String>, Option<i64>, Option<i64>)> = self.tx.query_row(
+        let artifact: Option<ArtifactRemovalRow> = self.tx.query_row(
             "SELECT run_id, session_id, agent_id, role_id, name, producer_id, producer_key, media_type, current_revision, byte_length, removed_sequence
              FROM artifacts WHERE organization_id = ?1 AND artifact_id = ?2",
             params![organization_id, artifact_id],
