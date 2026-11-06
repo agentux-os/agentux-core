@@ -63,8 +63,12 @@ URI identifies the exact SHA-256 revision, never a moving "latest" alias.
 Removal writes a same-transaction tombstone and sequence. Republishing the
 same producer key after removal creates a new `artifactId` incarnation;
 tombstoned IDs are never reused. Idempotency keys make a repeated publication
-recover the recorded result and reject changed content for the same key.
-Older versions remain dereferenceable through replay and snapshot retention.
+recover the recorded result and reject changed content for the same key. Core
+scopes each key by `(organizationId, runId, producerId, producerKey,
+publicationId)`; manifest generation is recorded for reconciliation but is
+not in the idempotency tuple. Updates use a new publication ID. After removal,
+a new publication ID creates a new artifact incarnation. Older versions
+remain dereferenceable through replay and snapshot retention.
 
 For enrolled runs, Core derives organization and mission ownership from the
 persisted `RunOrigin`; it verifies the organization against the authenticated
@@ -74,9 +78,10 @@ the run role, as defined by the task activity contract; a runtime ID must be
 bound to the authenticated producer/session. Missing actor mappings block
 publication instead of causing Core to invent an identity.
 Standalone local artifacts may remain local, but cannot enter an
-organization-scoped snapshot. Organization-owned artifacts without a run
-require a separate authenticated producer and are not covered by this run
-producer.
+organization-scoped snapshot. This contract rejects generic artifacts without
+a persisted run. An organization-owned artifact without a run is outside this
+projection contract; if introduced later, it requires a distinct typed scope
+and source inventory before the artifact family can be complete.
 
 Protocol #12 currently carries the reference, but does not specify how
 `artifact://` is authenticated and resolved or how removal is announced.

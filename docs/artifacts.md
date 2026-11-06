@@ -69,11 +69,13 @@ organization-scoped snapshot and is not sent to Command. A supplied run link
 must resolve to the same organization; callers cannot choose the organization
 or override a run's owner.
 
-This decision covers run artifacts. An organization-owned artifact with no
-run may be valid in the projection model, but it needs its own authenticated
-producer and complete-inventory contract. This run producer does not claim
-that source; the artifact family remains unavailable until every enabled
-organization-level source is also accounted for.
+This contract supports only run-scoped generic artifacts. Core rejects a
+generic publication without a persisted `RunOrigin` and `runId`; an
+organization-owned artifact without a run is outside this projection
+contract. If the product later needs organization-level artifacts, that
+requires a distinct scope variant and producer inventory, and the artifact
+family cannot be marked complete until that source is implemented and
+reconciled.
 
 Core stores only bounded metadata in projection state. It does not include
 host paths, raw tool input/output, credentials, or unbounded logs. Downloads
@@ -105,9 +107,14 @@ content.
   from producer key to incarnation and never reuses a tombstoned ID. Old
   replayed events therefore cannot make the new incarnation appear removed or
   resurrect the old one.
-- **Retry and restart:** The producer supplies a stable publication
-  idempotency key. A retry returns the recorded result for the same key and
-  content digest; reuse with different content is rejected. Startup recovery
+- **Retry and restart:** The producer supplies a stable publication ID. Core
+  scopes idempotency by `(organizationId, runId, producerId, producerKey,
+  publicationId)`. A retry returns the recorded result when this tuple and
+  content digest match; reuse of that tuple with different bytes is rejected.
+  Manifest generation is recorded for reconciliation but is not part of the
+  idempotency key, so a deployment does not duplicate a publication. Updates
+  use a new publication ID while the artifact is active; after removal, a new
+  publication creates a new artifact incarnation and ID. Startup recovery
   reconciles staged/orphaned blobs and verifies that every live projection
   points to a present, digest-matching object.
 

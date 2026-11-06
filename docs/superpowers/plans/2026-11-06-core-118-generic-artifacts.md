@@ -25,7 +25,8 @@ Protocol #20.
 - Verify byte length and SHA-256, enforce the 25 MiB reference limit, and
   preserve immutable content versions.
 - Bind enrolled artifacts to persisted `RunOrigin` and authenticated gateway
-  organization; keep standalone artifacts local.
+  organization; reject generic remote artifacts without a run and keep
+  standalone artifacts local.
 - Persist update/removal sequences and tombstones atomically with projections.
 - Do not advertise remote `artifact://` as retrievable until Protocol #20 and
   authenticated gateway dereference are implemented.
@@ -46,8 +47,9 @@ Protocol #20.
 ### 1. Finalize protocol and Core contracts
 
 - [ ] Accept the Core #118 proposal and Protocol #20 retrieval/removal contract.
-- [ ] Specify idempotency key scope, media-type validation, retention, and
-  garbage-collection rules, plus the default node-level storage quota.
+- [ ] Implement idempotency scope as
+  `(organizationId, runId, producerId, producerKey, publicationId)`; validate
+  media type and define retention/garbage-collection rules and quota default.
 - [ ] Add a typed Core publisher API bound to an authorized run/session/role.
 
 ### 2. Add managed content storage
