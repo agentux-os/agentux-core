@@ -1296,7 +1296,7 @@ mod tests {
         let state_path = dir.path().join("gateway-state.json");
         let mut messages = Messages::new(config(), Some(state_path.clone())).unwrap();
         let mut outbox = Outbox::default();
-        let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+        let (acknowledge, mut acknowledged) = tokio::sync::oneshot::channel();
 
         handle_gateway_out(
             channel::Out::Event {
@@ -1327,7 +1327,7 @@ mod tests {
         let mut messages = Messages::new(config(), None).unwrap();
         messages.state_path = Some(not_a_directory.join("state.json"));
         let mut outbox = Outbox::default();
-        let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
+        let (acknowledge, mut acknowledged) = tokio::sync::oneshot::channel();
 
         assert!(
             handle_gateway_out(
