@@ -48,6 +48,7 @@ name = "agentux-api"
 version = "0.5.5"
 dependencies = [
  "base64 0.23.1",
+ "jiff",
  "serde",
  "serde_json",
  "tokio",
@@ -294,7 +295,7 @@ dependencies = [
 [[package]]
 name = "auxp"
 version = "0.1.0"
-source = "git+https://github.com/agentux-os/agentux-protocol?rev=a44991dfeb5eba0d25e97d87c22c8d21495f521d#a44991dfeb5eba0d25e97d87c22c8d21495f521d"
+source = "git+https://github.com/agentux-os/agentux-protocol?rev=0ca8d7d562d2e5985d5e878ce759b5c2943652d4#0ca8d7d562d2e5985d5e878ce759b5c2943652d4"
 dependencies = [
  "jiff",
  "serde",

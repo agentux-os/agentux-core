@@ -6,7 +6,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{BusEndpoint, Event, PermissionRequest, Run, Session, StepAttempt};
+use crate::{
+    BusEndpoint, Event, NodeAlertState, NodeState, PermissionRequest, Run, Session, StepAttempt,
+};
 
 pub const VERSION: &str = "2.0";
 
@@ -26,6 +28,10 @@ pub mod method {
     pub const HARNESS_INVENTORY_REPLACE: &str = "harnesses.inventory_replace";
     /// Record safe, organization-scoped lifecycle state for a Command request.
     pub const COMMAND_PROJECTION_UPDATE: &str = "commands.projection_update";
+    /// Persist the local node's complete operational state.
+    pub const NODE_STATE_REPLACE: &str = "nodes.state_replace";
+    /// Persist a complete alert inventory observed by the trusted local producer.
+    pub const NODE_ALERT_INVENTORY_REPLACE: &str = "nodes.alert_inventory_replace";
     /// The harness limits in force ([`crate::HarnessLimit`]).
     pub const LIMITS_LIST: &str = "limits.list";
     /// The tool catalog: the machine's, the user's and, with a project, its
@@ -359,6 +365,18 @@ pub struct CommandProjectionUpdate {
     pub operation_idempotency_key: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeStateReplace {
+    pub node: NodeState,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeAlertInventory {
+    pub alerts: Vec<NodeAlertState>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HarnessUsage {
@@ -613,6 +631,7 @@ pub struct ListRequests {
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotSourceCapture {
     pub organization_id: String,
+    pub node_id: String,
 }
 
 /// Immutable checkpoint payload and the matching Core/gateway sequence boundary.

@@ -1,12 +1,16 @@
 //! Source inventory and durable storage primitives for node snapshot checkpoints.
 //!
-//! This module deliberately does not expose a wire checkpoint: four projection
-//! kinds (and the runtime owned harness/node inventories) have no durable,
-//! authoritative source yet, so complete checkpoint coverage cannot be claimed.
+//! This module deliberately does not expose a wire checkpoint: required
+//! lifecycle producers and some gateway-owned inventories still lack an
+//! authoritative durable source, so complete checkpoint coverage cannot be
+//! claimed.
 
 use std::time::Duration;
 
-use agentux_api::{HarnessLimit, PermissionRequest, Run, Session, SnapshotProjectionType};
+use agentux_api::{
+    HarnessLimit, NodeAlertState, NodeState, PermissionRequest, Run, Session,
+    SnapshotProjectionType,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -50,10 +54,8 @@ impl ProjectionKind {
         match self {
             Self::Approval | Self::Limit | Self::Run | Self::Session => SourceKind::Sourced,
             Self::Gate => SourceKind::Derived,
-            Self::Harness => SourceKind::Sourced,
-            Self::Artifact | Self::Command | Self::Node | Self::NodeAlert | Self::Task => {
-                SourceKind::Unavailable
-            }
+            Self::Harness | Self::Node | Self::NodeAlert => SourceKind::Sourced,
+            Self::Artifact | Self::Command | Self::Task => SourceKind::Unavailable,
         }
     }
 }
@@ -85,8 +87,6 @@ pub fn unavailable_projections() -> Vec<UnavailableProjection> {
             ProjectionKind::Artifact => Some(
                 "typed pull request artifacts are projected, but the generic artifact lifecycle producer is not connected",
             ),
-            ProjectionKind::Node => Some("authoritative node state and its sequence are not yet persisted in the Core SQLite transaction"),
-            ProjectionKind::NodeAlert => Some("Core has no durable node alert projection"),
             ProjectionKind::Task => Some(
                 "durable storage exists, but the typed task lifecycle producer is not connected",
             ),
@@ -135,6 +135,26 @@ pub struct HarnessProjectionEntry {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<Value>,
+    pub updated_sequence: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at_sequence: Option<i64>,
+}
+
+/// Complete local node state and the event sequence that published it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeProjectionEntry {
+    pub state: NodeState,
+    pub updated_sequence: i64,
+}
+
+/// Current alert state or retained removal tombstone with its last sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeAlertProjectionEntry {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<NodeAlertState>,
     pub updated_sequence: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub removed_at_sequence: Option<i64>,
@@ -212,6 +232,12 @@ pub struct DurableCapture {
     pub limits: Vec<HarnessLimit>,
     /// Durable local harness inventory and retained removals.
     pub harnesses: Vec<HarnessProjectionEntry>,
+    /// Local operational state of this Core installation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<NodeProjectionEntry>,
+    /// Local Core-owned alerts and retained removals.
+    #[serde(default)]
+    pub node_alerts: Vec<NodeAlertProjectionEntry>,
     /// Gate state is derived solely from the durable run checks and attempt counters.
     pub gates: Vec<Value>,
     /// Explicitly written business state and retained tombstones for the

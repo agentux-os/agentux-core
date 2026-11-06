@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentux_api::rpc::{self, code};
-use agentux_api::{Client, ClientError, EventBody, RequestStatus, RunStatus};
+use agentux_api::{
+    Client, ClientError, EventBody, NodeAlertState, NodeAlertStatus, NodeOperationalStatus,
+    NodeState, RequestStatus, RunStatus,
+};
 use agentuxd::{FakeExecutor, server};
 use common::{fixture, pipeline};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -222,8 +225,46 @@ async fn gateway_harness_inventory_is_durable_and_captured_with_its_event_head()
             .unwrap(),
         Some(1)
     );
-    let capture = client.snapshot_source_capture("org-a").await.unwrap();
-    assert_eq!(capture["capturedEventHead"], 1);
+    assert_eq!(
+        client
+            .replace_node_state(&NodeState {
+                node_id: "node-a".into(),
+                status: NodeOperationalStatus::Ready,
+                capacity: serde_json::json!({"cpu": 8}),
+            })
+            .await
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        client
+            .replace_node_alert_inventory(&[NodeAlertState {
+                alert_id: "disk-low".into(),
+                producer: "systemd".into(),
+                code: "disk.low".into(),
+                condition_key: "root".into(),
+                summary: "Root filesystem usage is high".into(),
+                first_observed_at: "2026-11-05T18:00:00Z".into(),
+                last_observed_at: "2026-11-05T18:00:00Z".into(),
+                status: NodeAlertStatus::Active,
+            }])
+            .await
+            .unwrap(),
+        Some(3)
+    );
+    let capture = client
+        .snapshot_source_capture("org-a", "node-a")
+        .await
+        .unwrap();
+    assert_eq!(capture["capturedEventHead"], 3);
+    assert_eq!(capture["node"]["state"]["nodeId"], "node-a");
+    assert_eq!(capture["node"]["updatedSequence"], 2);
+    assert_eq!(capture["nodeAlerts"][0]["state"]["alertId"], "disk-low");
+    assert_eq!(capture["nodeAlerts"][0]["updatedSequence"], 3);
+    assert!(matches!(
+        client.snapshot_source_capture("org-a", "node-other").await,
+        Err(ClientError::Rpc(_))
+    ));
     assert_eq!(capture["harnesses"][0]["id"], "codex");
     assert_eq!(capture["harnesses"][0]["updatedSequence"], 1);
     assert_eq!(
@@ -237,10 +278,10 @@ async fn gateway_harness_inventory_is_durable_and_captured_with_its_event_head()
         node_id: "node-a".into(),
         checkpoint_id: "checkpoint-1".into(),
         snapshot_id: "snapshot-1".into(),
-        captured_event_head: 1,
+        captured_event_head: 3,
         created_at_ms: now,
         expires_at_ms: now + agentux_store::snapshot::MIN_RETENTION.as_millis() as i64,
-        high_water_sequence: 1,
+        high_water_sequence: 3,
         payload: serde_json::json!({"entries": []}),
     };
     let binding = rpc::SnapshotBinding {
@@ -248,8 +289,8 @@ async fn gateway_harness_inventory_is_durable_and_captured_with_its_event_head()
         node_id: "node-a".into(),
         checkpoint_id: "checkpoint-1".into(),
         snapshot_id: "snapshot-1".into(),
-        captured_event_head: 1,
-        high_water_sequence: 1,
+        captured_event_head: 3,
+        high_water_sequence: 3,
     };
     assert_eq!(
         client.materialize_snapshot(&materialization).await.unwrap(),

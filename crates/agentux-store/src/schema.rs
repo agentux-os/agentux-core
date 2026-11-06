@@ -228,6 +228,28 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (organization_id, node_id, checkpoint_id)
     );
     ",
+    // 15: durable local node state and Core-owned alert lifecycle.
+    "
+    CREATE TABLE snapshot_node_state (
+        singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+        node_id         TEXT NOT NULL,
+        current_state   TEXT NOT NULL,
+        updated_sequence INTEGER NOT NULL
+    );
+
+    CREATE TABLE snapshot_node_alerts (
+        alert_id        TEXT PRIMARY KEY,
+        current_state   TEXT,
+        updated_sequence INTEGER NOT NULL,
+        removed_sequence INTEGER,
+        CHECK ((current_state IS NULL) = (removed_sequence IS NOT NULL))
+    );
+
+    CREATE TABLE snapshot_node_alert_inventory_state (
+        singleton       INTEGER PRIMARY KEY CHECK (singleton = 1),
+        updated_sequence INTEGER NOT NULL
+    );
+    ",
 ];
 
 /// The schema version this build writes.

@@ -22,19 +22,21 @@ Two Command servers in one institution therefore never share or take nodes. A no
 |---|---|
 | `node.hello` | On start: capabilities, AgentUX version, the last event sequence it handed out |
 | `node.heartbeat` | Every 30 s: `status`, `capacity.activeRuns`, `capacity.waitingForHuman` |
+| `node.status_changed` | When the gateway connects to local `agentuxd` (`ready`) or shuts down gracefully (`draining`) |
 | `harness.status` | When the agent CLIs change, checked every 5 minutes and after limit changes: installed, signed in, version, spend, plan windows, limits |
 | `harness.limits_changed` | When the usage limits in force change |
 | `approval.requested` | A run waits for the human: kind, title, detail (cut at 4000 characters), options |
 | `run.updated` / `run.completed` / `run.failed` | A run changed: state, step, roles and models, activity, cost and budget, branch, pull request, error, and once a session opened, `agentIsolation` (`mode` `none` or `bubblewrap`, `network`, and `source`: `project`, `node-policy`, `command` or `default`) |
 | `execution.activity` | When an ACP session reports a tool call starting or reaching a terminal status: stable tool-call ID, session/role/run correlation and a generic safe summary. Tool titles, inputs, outputs, plans and reasoning are not sent. |
+| `node.alert` | Relays a Core-owned alert state or removal when a local alert producer exists |
 
 Messages are POSTed to `<command>/v1/protocol/messages` with `Authorization: Bearer <node token>`. Events carry a `sequence` that keeps growing across restarts (`~/.local/state/agentux/gateway.json`) and an `eventId` of `<nodeId>-<sequence>`. The gateway saves the pending outbox and its local event-log cursor atomically. After a restart it retries the same queued messages and resumes the daemon event stream from that cursor, preserving event IDs for retries. When `node.event_replay.v1` is accepted, sequenced events remain in the outbox until Command acknowledges a contiguous durable cursor; `node.resume` replays retained events in order and reports when the requested cursor expired. Without that capability, the gateway keeps legacy send-and-drain behavior. The outbox holds up to 5000 messages and drops the oldest first when full; runs go on regardless.
 
-Harness inventory changes are first persisted by Core with a local event sequence, then relayed through the same ordered outbox as other local events. The local capture-to-gateway sequence binding is persisted in Core SQLite; the gateway JSON file continues to hold its event cursor and retry outbox.
+Node status and harness inventory changes are first persisted by Core with a local event sequence, then relayed through the same ordered outbox as other local events. The gateway reports `ready` only after it connects and subscribes to local `agentuxd`; a graceful gateway stop records `draining`. Its capacity object is currently empty. Alert events use the same path, but there is no concrete alert producer yet. The local capture-to-gateway sequence binding is persisted in Core SQLite; the gateway JSON file continues to hold its event cursor and retry outbox.
 
 `execution.activity.v1` is offered in `node.hello` and used only when Command returns it in `acceptedCapabilities`. The current Core emits `tool_started`, `tool_completed` and `tool_failed` when the ACP adapter reports the corresponding status. It does not infer task trees, delegation, progress percentages or artifacts from provider-specific data. `node.event_replay.v1` is negotiated the same way.
 
-The node-alert contract assigns enrolled alert relay and authenticated organization/node scoping to the gateway. Runtime implementation remains tracked in Core #102. See the [node alert contract](node-alerts.md). The gateway does not derive alerts from heartbeat or harness polling; Command derives fleet presence separately.
+The node-alert contract assigns enrolled alert relay and authenticated organization/node scoping to the gateway. The relay is implemented; selecting and connecting a concrete local alert producer remains tracked in Core #102. See the [node alert contract](node-alerts.md). The gateway does not derive alerts from heartbeat or harness polling; Command derives fleet presence separately.
 
 ## Commands from Command
 

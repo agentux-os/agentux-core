@@ -23,9 +23,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentux_api::rpc::HarnessInfo;
 use agentux_api::{
-    AttemptStatus, BusMessage, CheckResult, Event, EventBody, HarnessLimit, PermissionRequest,
-    Project, PullRequest, RequestKind, RequestStatus, Run, RunStatus, Session, SessionState,
-    SessionUsage, SnapshotProjectionType, StepAttempt, StepKind,
+    AttemptStatus, BusMessage, CheckResult, Event, EventBody, HarnessLimit, NodeAlertChange,
+    NodeAlertState, NodeState, PermissionRequest, Project, PullRequest, RequestKind, RequestStatus,
+    Run, RunStatus, Session, SessionState, SessionUsage, SnapshotProjectionType, StepAttempt,
+    StepKind,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
@@ -710,6 +711,222 @@ impl Tx<'_> {
         .collect()
     }
 
+    /// Replaces the complete local operational node state and emits the
+    /// matching sequence-owned event in the same SQLite transaction.
+    pub fn replace_node_state(&mut self, node: &NodeState) -> Result<Option<i64>> {
+        node.validate().map_err(Error::Data)?;
+        let current: Option<(String, String)> = self
+            .tx
+            .query_row(
+                "SELECT node_id, current_state FROM snapshot_node_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((current_node_id, current_state)) = &current {
+            if current_node_id != &node.node_id {
+                return Err(Error::Data(
+                    "node state identity cannot change for this Core instance".into(),
+                ));
+            }
+            if current_state == &to_json(node)? {
+                return Ok(None);
+            }
+        }
+        self.emit(None, EventBody::NodeStatusChanged { node: node.clone() })?;
+        let sequence = self.events.last().expect("emit appends an event").seq;
+        self.tx.execute(
+            "INSERT INTO snapshot_node_state (singleton, node_id, current_state, updated_sequence)
+             VALUES (1, ?1, ?2, ?3)
+             ON CONFLICT (singleton) DO UPDATE SET
+                 current_state = excluded.current_state,
+                 updated_sequence = excluded.updated_sequence",
+            params![node.node_id, to_json(node)?, sequence],
+        )?;
+        Ok(Some(sequence))
+    }
+
+    /// Replaces one complete alert state and emits its typed change atomically.
+    pub fn upsert_node_alert(&mut self, alert: &NodeAlertState) -> Result<Option<i64>> {
+        alert.validate().map_err(Error::Data)?;
+        let serialized = to_json(alert)?;
+        let current: Option<Option<String>> = self
+            .tx
+            .query_row(
+                "SELECT current_state FROM snapshot_node_alerts WHERE alert_id = ?1",
+                [&alert.alert_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current
+            .as_ref()
+            .is_some_and(|state| state.as_ref() == Some(&serialized))
+        {
+            return Ok(None);
+        }
+        self.emit(
+            None,
+            EventBody::NodeAlertChanged {
+                alert: NodeAlertChange::State {
+                    alert: alert.clone(),
+                },
+            },
+        )?;
+        let sequence = self.events.last().expect("emit appends an event").seq;
+        self.tx.execute(
+            "INSERT INTO snapshot_node_alerts (
+                 alert_id, current_state, updated_sequence, removed_sequence
+             ) VALUES (?1, ?2, ?3, NULL)
+             ON CONFLICT (alert_id) DO UPDATE SET
+                 current_state = excluded.current_state,
+                 updated_sequence = excluded.updated_sequence,
+                 removed_sequence = NULL",
+            params![alert.alert_id, serialized, sequence],
+        )?;
+        Ok(Some(sequence))
+    }
+
+    /// Records an explicit alert removal tombstone at its event sequence.
+    pub fn remove_node_alert(&mut self, alert_id: &str) -> Result<Option<i64>> {
+        if alert_id.trim().is_empty() {
+            return Err(Error::Data("alertId is required".into()));
+        }
+        let current: Option<Option<String>> = self
+            .tx
+            .query_row(
+                "SELECT current_state FROM snapshot_node_alerts WHERE alert_id = ?1",
+                [alert_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if !current.is_some_and(|state| state.is_some()) {
+            return Ok(None);
+        }
+        self.emit(
+            None,
+            EventBody::NodeAlertChanged {
+                alert: NodeAlertChange::Removed {
+                    alert_id: alert_id.into(),
+                },
+            },
+        )?;
+        let sequence = self.events.last().expect("emit appends an event").seq;
+        self.tx.execute(
+            "UPDATE snapshot_node_alerts
+             SET current_state = NULL, updated_sequence = ?2, removed_sequence = ?2
+             WHERE alert_id = ?1 AND current_state IS NOT NULL",
+            params![alert_id, sequence],
+        )?;
+        Ok(Some(sequence))
+    }
+
+    /// Replaces the complete alert inventory observed by Core. Per-alert
+    /// changes, their event sequences and the inventory marker are atomic.
+    pub fn replace_node_alert_inventory(
+        &mut self,
+        alerts: &[NodeAlertState],
+    ) -> Result<Option<i64>> {
+        let mut desired = BTreeMap::new();
+        for alert in alerts {
+            alert.validate().map_err(Error::Data)?;
+            if desired
+                .insert(alert.alert_id.clone(), alert.clone())
+                .is_some()
+            {
+                return Err(Error::Data(format!(
+                    "duplicate alert id {:?}",
+                    alert.alert_id
+                )));
+            }
+        }
+        let mut statement = self.tx.prepare(
+            "SELECT alert_id, current_state FROM snapshot_node_alerts
+             WHERE current_state IS NOT NULL ORDER BY alert_id",
+        )?;
+        let current = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<BTreeMap<_, _>, _>>()?;
+        drop(statement);
+        let initialized = self.node_alert_inventory_updated_sequence()?.is_some();
+        let desired_json = desired
+            .iter()
+            .map(|(id, alert)| Ok((id.clone(), to_json(alert)?)))
+            .collect::<Result<BTreeMap<_, _>>>()?;
+        if initialized && current == desired_json {
+            return Ok(None);
+        }
+        for alert in desired.values() {
+            self.upsert_node_alert(alert)?;
+        }
+        for id in current.keys().filter(|id| !desired.contains_key(*id)) {
+            self.remove_node_alert(id)?;
+        }
+        let sequence = self.last_event_seq()?;
+        self.tx.execute(
+            "INSERT INTO snapshot_node_alert_inventory_state (singleton, updated_sequence)
+             VALUES (1, ?1)
+             ON CONFLICT (singleton) DO UPDATE SET updated_sequence = excluded.updated_sequence",
+            [sequence],
+        )?;
+        Ok(Some(sequence))
+    }
+
+    fn node_projection(&self) -> Result<Option<snapshot::NodeProjectionEntry>> {
+        let row: Option<(String, i64)> = self
+            .tx
+            .query_row(
+                "SELECT current_state, updated_sequence FROM snapshot_node_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(state, updated_sequence)| {
+            Ok(snapshot::NodeProjectionEntry {
+                state: from_json(&state)?,
+                updated_sequence,
+            })
+        })
+        .transpose()
+    }
+
+    fn node_alert_inventory_updated_sequence(&self) -> Result<Option<i64>> {
+        Ok(self
+            .tx
+            .query_row(
+                "SELECT updated_sequence FROM snapshot_node_alert_inventory_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    fn node_alert_projections(&self) -> Result<Vec<snapshot::NodeAlertProjectionEntry>> {
+        let mut statement = self.tx.prepare(
+            "SELECT alert_id, current_state, updated_sequence, removed_sequence
+             FROM snapshot_node_alerts ORDER BY alert_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, state, updated_sequence, removed_at_sequence) = row?;
+            Ok(snapshot::NodeAlertProjectionEntry {
+                id,
+                state: state.as_deref().map(from_json).transpose()?,
+                updated_sequence,
+                removed_at_sequence,
+            })
+        })
+        .collect()
+    }
+
     /// Captures all currently durable, Command-owned projections and the local
     /// SQLite event head using this same read transaction.
     pub fn capture_checkpoint_sources(
@@ -717,6 +934,22 @@ impl Tx<'_> {
         organization_id: &str,
         now: i64,
     ) -> Result<snapshot::DurableCapture> {
+        self.capture_checkpoint_sources_for_node(organization_id, None, now)
+    }
+
+    /// Captures local sources only when their persisted node identity matches
+    /// the authenticated gateway scope requesting the checkpoint.
+    pub fn capture_checkpoint_sources_for_node(
+        &self,
+        organization_id: &str,
+        expected_node_id: Option<&str>,
+        now: i64,
+    ) -> Result<snapshot::DurableCapture> {
+        if let Some(expected) = expected_node_id
+            && expected.trim().is_empty()
+        {
+            return Err(Error::Data("nodeId is required for scoped capture".into()));
+        }
         let owned: Vec<RunRecord> = self
             .runs(None)?
             .into_iter()
@@ -753,11 +986,31 @@ impl Tx<'_> {
             .filter(|session| run_ids.contains(session.run_id.as_str()))
             .collect();
         let mut unavailable = snapshot::unavailable_projections();
+        let node = self.node_projection()?;
+        if let (Some(expected), Some(node)) = (expected_node_id, node.as_ref())
+            && node.state.node_id != expected
+        {
+            return Err(Error::Data(
+                "checkpoint nodeId does not match the persisted Core node identity".into(),
+            ));
+        }
+        if node.is_none() {
+            unavailable.push(snapshot::UnavailableProjection {
+                kind: snapshot::ProjectionKind::Node,
+                reason: "the Core instance has not committed its complete node state".into(),
+            });
+        }
         if self.harness_inventory_updated_sequence()?.is_none() {
             unavailable.push(snapshot::UnavailableProjection {
                 kind: snapshot::ProjectionKind::Harness,
                 reason: "the trusted gateway has not delivered a complete harness inventory yet"
                     .into(),
+            });
+        }
+        if self.node_alert_inventory_updated_sequence()?.is_none() {
+            unavailable.push(snapshot::UnavailableProjection {
+                kind: snapshot::ProjectionKind::NodeAlert,
+                reason: "Core has no complete observed node-alert inventory yet".into(),
             });
         }
         Ok(snapshot::DurableCapture {
@@ -768,6 +1021,8 @@ impl Tx<'_> {
             sessions,
             limits: self.limits(now)?,
             harnesses: self.harness_projections()?,
+            node,
+            node_alerts: self.node_alert_projections()?,
             gates,
             business_projections: self.business_projections(organization_id)?,
             unavailable,
