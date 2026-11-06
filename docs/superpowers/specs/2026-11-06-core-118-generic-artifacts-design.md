@@ -67,8 +67,11 @@ recover the recorded result and reject changed content for the same key. Core
 scopes each key by `(organizationId, runId, producerId, producerKey,
 publicationId)`; manifest generation is recorded for reconciliation but is
 not in the idempotency tuple. Updates use a new publication ID. After removal,
-a new publication ID creates a new artifact incarnation. Older versions
-remain dereferenceable through replay and snapshot retention.
+a new publication ID creates a new artifact incarnation. Superseded or
+removed bytes remain dereferenceable for at least 30 days, and longer while
+replay/outbox, an unexpired checkpoint, or an active download references them.
+Garbage collection runs only after all holds expire; an expired URI returns
+`410 Gone` and never resolves to another digest.
 
 For enrolled runs, Core derives organization and mission ownership from the
 persisted `RunOrigin`; it verifies the organization against the authenticated
@@ -121,7 +124,8 @@ retention.
 - Enforce the Protocol 25 MiB per-reference limit; reject oversize before
   committing metadata.
 - Bind every content URI to an immutable digest and retain that version for
-  all active replay/snapshot references.
+  at least 30 days after supersession/removal and for all active replay,
+  outbox, checkpoint, and download references, whichever is longer.
 - Require checkpoint artifacts to contain the complete content revision
   metadata even if a permissive generic schema would accept less.
 - Never store host paths, credentials, raw prompts, tool input/output, or

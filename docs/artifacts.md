@@ -98,10 +98,15 @@ content.
   version, then atomically update the current projection and sequence. Retain
   older versions while a replay or snapshot could still reference them. The
   new URI contains the new digest, while the old URI continues to identify the
-  previous bytes until its retention expires.
+  previous bytes for at least 30 days after supersession, and longer while an
+  event remains in the replay/outbox window, a checkpoint can still reference
+  it, or a download is active.
 - **Remove:** Write a projection tombstone with the exact local event sequence
   in the same SQLite transaction. Do not silently delete the record or blob.
-  Garbage collection follows the agreed replay/snapshot retention window.
+  Keep the bytes for at least 30 days after removal and longer while replay,
+  outbox, checkpoint, or active-download references remain. After that, the
+  old URI returns `410 Gone`; it never resolves to different bytes. Retain the
+  tombstone until the replay and checkpoint recovery windows expire.
 - **Republish after removal:** A producer key may be published again only as a
   new artifact incarnation with a new `artifactId`. Core retains the mapping
   from producer key to incarnation and never reuses a tombstoned ID. Old
@@ -117,6 +122,12 @@ content.
   publication creates a new artifact incarnation and ID. Startup recovery
   reconciles staged/orphaned blobs and verifies that every live projection
   points to a present, digest-matching object.
+
+Thirty days is the minimum content-retention window for superseded or removed
+versions. An active replay/outbox/checkpoint reference extends the hold beyond
+that minimum. Garbage collection cannot remove a version while any such hold
+is active. At quota, Core rejects new publications rather than shortening the
+retention guarantee or evicting live artifacts.
 
 Protocol #12 carries `artifact_available` and a bounded reference, but it does
 not define authenticated byte retrieval or a removal activity. Protocol #17

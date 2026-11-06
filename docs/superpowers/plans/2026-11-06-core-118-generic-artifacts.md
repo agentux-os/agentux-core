@@ -49,7 +49,9 @@ Protocol #20.
 - [ ] Accept the Core #118 proposal and Protocol #20 retrieval/removal contract.
 - [ ] Implement idempotency scope as
   `(organizationId, runId, producerId, producerKey, publicationId)`; validate
-  media type and define retention/garbage-collection rules and quota default.
+  media type and configure storage quota. Retain superseded/removed bytes for
+  at least 30 days and longer while replay/outbox/checkpoint/download holds
+  remain; collect only after all holds expire.
 - [ ] Add a typed Core publisher API bound to an authorized run/session/role.
 
 ### 2. Add managed content storage
