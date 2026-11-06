@@ -263,6 +263,18 @@ fn command_run_start_replay_requires_the_same_core_deduplication_key() {
         run_id,
         operation_idempotency_key: Some("mission-run-b".into()),
     };
+    let project = store
+        .write(|tx| tx.register_project("app", "/tmp/command-run-start"))
+        .unwrap();
+    let mut local_run = sample_run(&project.id);
+    local_run.run.id = "local-run-1".into();
+    local_run.run.origin = Some(agentux_api::RunOrigin {
+        organization_id: "org-a".into(),
+        mission_id: "mission-b".into(),
+        command_run_id: "mission-run-b".into(),
+        definition_version: None,
+    });
+    store.write(|tx| tx.insert_run(&local_run)).unwrap();
     store
         .write(|tx| tx.update_command_projection(&with_local_run_id(Status::Received, None)))
         .unwrap();
