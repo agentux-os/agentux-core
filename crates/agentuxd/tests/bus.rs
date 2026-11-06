@@ -1084,7 +1084,7 @@ async fn opted_in_agent_publishes_captures_and_removes_its_artifact() {
         .find(|projection| projection.id == artifact.artifact_id)
         .unwrap();
     assert!(tombstone.state.is_none());
-    assert_eq!(tombstone.removed_sequence, Some(removed.sequence));
+    assert_eq!(tombstone.removed_at_sequence, Some(removed.sequence));
     assert!(
         capture
             .unavailable
