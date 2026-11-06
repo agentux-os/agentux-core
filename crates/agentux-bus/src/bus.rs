@@ -810,6 +810,20 @@ impl Bus {
                     })?;
                 BusReply::ArtifactPublished(published)
             }
+            BusCall::RemoveArtifact(args) => {
+                args.validate()
+                    .map_err(|reason| BusError::Invalid { reason })?;
+                let identity = self.lock().authorize(caller, BusTool::RemoveArtifact)?.0;
+                let removed = self
+                    .inner
+                    .backend
+                    .remove_artifact(identity, args)
+                    .await
+                    .map_err(|error| BusError::Backend {
+                        reason: error.to_string(),
+                    })?;
+                BusReply::ArtifactRemoved(removed)
+            }
         })
     }
 

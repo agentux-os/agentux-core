@@ -18,6 +18,7 @@ fn summary(tool: BusTool) -> &'static str {
         BusTool::GetRunState => "see the run's step, branch, checks, sessions and open questions",
         BusTool::AskHuman => "escalate a decision you cannot take to the human",
         BusTool::PublishArtifact => "publish an explicitly declared text deliverable for this run",
+        BusTool::RemoveArtifact => "remove an artifact published by this session",
     }
 }
 
@@ -31,6 +32,7 @@ pub fn description(tool: BusTool) -> &'static str {
         BusTool::GetRunState => descriptions::GET_RUN_STATE,
         BusTool::AskHuman => descriptions::ASK_HUMAN,
         BusTool::PublishArtifact => descriptions::PUBLISH_ARTIFACT,
+        BusTool::RemoveArtifact => descriptions::REMOVE_ARTIFACT,
     }
 }
 

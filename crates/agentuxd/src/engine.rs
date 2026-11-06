@@ -317,6 +317,46 @@ impl Engine {
         self.publish_artifact(&publication, declaration.content_text.as_bytes())
     }
 
+    /// Remove an artifact using the authenticated run session as its owner.
+    pub(crate) fn remove_agent_artifact(
+        &self,
+        identity: &agentux_bus::SessionIdentity,
+        removal: agentux_bus::RemoveArtifact,
+    ) -> Result<i64> {
+        removal.validate().map_err(Error::InvalidParams)?;
+        let (record, session) = self.inner.store.read(|tx| {
+            let record = tx.run(&identity.run.0)?.ok_or_else(|| {
+                agentux_store::Error::Data("artifact run no longer exists".into())
+            })?;
+            let session = tx.session(&identity.session.0)?.ok_or_else(|| {
+                agentux_store::Error::Data("artifact session no longer exists".into())
+            })?;
+            Ok::<_, agentux_store::Error>((record, session))
+        })?;
+        if session.run_id != identity.run.0
+            || session.role != identity.role
+            || session.state == agentux_api::SessionState::Ended
+            || session.ended_at.is_some()
+        {
+            return Err(Error::Unauthorized(
+                "artifact removal requires the active persisted producer session".into(),
+            ));
+        }
+        let origin = record.run.origin.ok_or_else(|| {
+            Error::InvalidParams("generic artifacts require a Command-owned run".into())
+        })?;
+        self.inner
+            .store
+            .write(|tx| {
+                tx.remove_artifact(
+                    &origin.organization_id,
+                    &removal.artifact_id,
+                    &identity.session.0,
+                )
+            })?
+            .ok_or_else(|| Error::InvalidParams("artifact does not exist".into()))
+    }
+
     /// Remove an artifact through its original producer session.
     pub fn remove_artifact(
         &self,

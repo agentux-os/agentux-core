@@ -218,7 +218,7 @@ impl Default for Bus {
             max_tokens_per_run: 50_000,
             allow: BusTool::ALL
                 .into_iter()
-                .filter(|tool| *tool != BusTool::PublishArtifact)
+                .filter(|tool| !matches!(tool, BusTool::PublishArtifact | BusTool::RemoveArtifact))
                 .collect(),
         }
     }
@@ -235,10 +235,11 @@ pub enum BusTool {
     GetRunState,
     AskHuman,
     PublishArtifact,
+    RemoveArtifact,
 }
 
 impl BusTool {
-    pub const ALL: [BusTool; 7] = [
+    pub const ALL: [BusTool; 8] = [
         Self::PostMessage,
         Self::ReadMessages,
         Self::RequestReview,
@@ -246,6 +247,7 @@ impl BusTool {
         Self::GetRunState,
         Self::AskHuman,
         Self::PublishArtifact,
+        Self::RemoveArtifact,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -257,6 +259,7 @@ impl BusTool {
             Self::GetRunState => "get_run_state",
             Self::AskHuman => "ask_human",
             Self::PublishArtifact => "publish_artifact",
+            Self::RemoveArtifact => "remove_artifact",
         }
     }
 }

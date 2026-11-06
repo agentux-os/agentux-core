@@ -16,7 +16,7 @@ use agentux_api::{
 };
 use agentux_bus::{
     AskHuman, BusCall, BusEndpoint as _, BusError, BusReply, DaemonEndpoint, HumanReplyStatus,
-    PostMessage, ReadMessages, RequestReview, Target,
+    PostMessage, PublishArtifact, ReadMessages, RemoveArtifact, RequestReview, Target,
 };
 use agentux_fake_agent::{Setup, Turn, TurnResult, acp, script};
 use agentux_harness::{AcpSession, Events, McpServer, PermissionHandler, SessionOptions};
@@ -39,6 +39,8 @@ struct Seen {
     set_config: Vec<(String, String, String)>,
     /// Free-form notes from the agents.
     notes: Vec<String>,
+    /// Results returned by the artifact publisher tool.
+    artifacts: Vec<agentux_bus::ArtifactPublished>,
 }
 
 type Shared = Arc<Mutex<Seen>>;
@@ -176,6 +178,9 @@ async fn daemon(f: &Fixture, seen: &Shared, behave: Behave, models: &[&str]) -> 
             }),
             ..Settings::default()
         },
+    )
+    .with_artifact_store(
+        agentux_store::artifact_store::ContentStore::open(f.tmp.path().join("artifacts")).unwrap(),
     );
     let (stop, stopped) = oneshot::channel::<()>();
     tokio::spawn({
@@ -948,6 +953,146 @@ pipeline:
   - step: review
     role: reviewer
 ";
+
+const ARTIFACT_PIPELINE: &str = "version: 1
+roles:
+  implementer:
+    harness: codex
+bus:
+  allow: [publish_artifact, remove_artifact]
+pipeline:
+  - step: implement
+    role: implementer
+    approve: true
+";
+
+fn publishes_explicit_artifact(ctx: Ctx, turn: Turn) -> BoxFuture<'static, TurnResult> {
+    Box::pin(async move {
+        let bus = ctx.bus().await;
+        let reply = bus
+            .call(BusCall::PublishArtifact(PublishArtifact {
+                producer_key: "release-notes".into(),
+                publication_id: "publication-1".into(),
+                name: "Release notes".into(),
+                media_type: "text/markdown".into(),
+                content_text: "# Release notes\nReady for review.\n".into(),
+            }))
+            .await
+            .unwrap();
+        let BusReply::ArtifactPublished(artifact) = reply else {
+            panic!("unexpected publication reply: {reply:?}");
+        };
+        ctx.seen.lock().unwrap().artifacts.push(artifact);
+        turn.message("Published the release notes artifact.")?;
+        Ok(acp::StopReason::EndTurn)
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn opted_in_agent_publishes_captures_and_removes_its_artifact() {
+    let f = fixture(ARTIFACT_PIPELINE);
+    let seen = Shared::default();
+    let d = daemon(&f, &seen, publishes_explicit_artifact, &[]).await;
+    let project = d
+        .engine
+        .register_project(f.repo.to_str().unwrap())
+        .await
+        .unwrap();
+    let run = d
+        .engine
+        .start_run(StartRun {
+            project_id: project.id,
+            prompt: Some("Prepare release notes".into()),
+            origin: Some(agentux_api::RunOrigin {
+                organization_id: "org-a".into(),
+                mission_id: "mission-a".into(),
+                command_run_id: "command-run-a".into(),
+                definition_version: None,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    wait_for(&d.engine, &run.id, |run| run.status == RunStatus::Waiting).await;
+
+    let artifact = seen.lock().unwrap().artifacts[0].clone();
+    let content_store =
+        agentux_store::artifact_store::ContentStore::open(f.tmp.path().join("artifacts")).unwrap();
+    assert_eq!(
+        content_store.read(&artifact.revision).unwrap(),
+        b"# Release notes\nReady for review.\n"
+    );
+
+    d.engine
+        .store()
+        .write(|tx| {
+            tx.replace_node_state(&agentux_api::NodeState {
+                node_id: "node-a".into(),
+                status: agentux_api::NodeOperationalStatus::Ready,
+                capacity: serde_json::json!({"activeRuns": 1}),
+            })
+        })
+        .unwrap();
+    let capture = d
+        .engine
+        .store()
+        .read(|tx| tx.capture_checkpoint_sources_for_node("org-a", Some("node-a"), 0))
+        .unwrap();
+    let projection = capture
+        .business_projections
+        .iter()
+        .find(|projection| projection.id == artifact.artifact_id)
+        .unwrap();
+    let expected_uri = format!(
+        "artifact://node-a/{}/{}",
+        artifact.artifact_id, artifact.revision
+    );
+    assert_eq!(projection.state.as_ref().unwrap()["uri"], expected_uri);
+    assert_eq!(
+        projection.state.as_ref().unwrap()["currentState"]["uri"],
+        expected_uri
+    );
+    assert!(
+        capture
+            .unavailable
+            .iter()
+            .any(|source| { source.kind == agentux_store::snapshot::ProjectionKind::Artifact })
+    );
+
+    let server = seen.lock().unwrap().servers[0].1.clone();
+    let bus = DaemonEndpoint::connect(&d.socket, &token_of(&server))
+        .await
+        .unwrap();
+    let removed = bus
+        .call(BusCall::RemoveArtifact(RemoveArtifact {
+            artifact_id: artifact.artifact_id.clone(),
+        }))
+        .await
+        .unwrap();
+    let BusReply::ArtifactRemoved(removed) = removed else {
+        panic!("unexpected removal reply: {removed:?}");
+    };
+    assert!(removed.sequence > artifact.sequence);
+
+    let capture = d
+        .engine
+        .store()
+        .read(|tx| tx.capture_checkpoint_sources_for_node("org-a", Some("node-a"), 0))
+        .unwrap();
+    let tombstone = capture
+        .business_projections
+        .iter()
+        .find(|projection| projection.id == artifact.artifact_id)
+        .unwrap();
+    assert!(tombstone.state.is_none());
+    assert_eq!(tombstone.removed_at_sequence, Some(removed.sequence));
+    assert!(
+        capture
+            .unavailable
+            .iter()
+            .any(|source| { source.kind == agentux_store::snapshot::ProjectionKind::Artifact })
+    );
+    let _ = d.stop.send(());
+}
 
 /// Takes its time over the implement step; notes every other prompt, reads
 /// its mail on bus wakes and answers the human's messages.

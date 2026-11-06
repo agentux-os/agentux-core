@@ -1615,7 +1615,8 @@ impl Tx<'_> {
             let mut stmt = self.tx.prepare(
                 "SELECT projection_id FROM snapshot_business_projections
                  WHERE projection_type = 'artifact' AND organization_id = ?1
-                   AND run_id = ?2 AND removed_sequence IS NULL",
+                   AND run_id = ?2 AND removed_sequence IS NULL
+                   AND json_extract(current_state, '$.currentState.kind') = 'pull_request'",
             )?;
             let rows = stmt.query_map(params![organization_id, record.run.id], |row| {
                 row.get::<_, String>(0)
