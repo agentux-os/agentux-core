@@ -617,6 +617,26 @@ pub struct NodeAlertState {
     pub status: NodeAlertStatus,
 }
 
+/// Verified artifact lifecycle data emitted by the Core artifact registry.
+/// `agent_id` is derived from the persisted session assignment, never supplied
+/// by an artifact producer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactActivity {
+    pub activity_id: String,
+    pub mission_id: String,
+    pub run_id: String,
+    pub agent_id: String,
+    pub role_id: String,
+    pub session_id: String,
+    pub artifact_id: String,
+    pub revision: String,
+    pub name: String,
+    pub media_type: String,
+    pub byte_length: u64,
+    pub summary: String,
+}
+
 impl NodeAlertState {
     pub fn validate(&self) -> Result<(), String> {
         for (field, value) in [
@@ -797,6 +817,15 @@ pub enum EventBody {
         projection_type: SnapshotProjectionType,
         id: String,
         removed: bool,
+    },
+    /// A verified artifact revision became current for a Command-owned run.
+    ArtifactAvailable {
+        artifact: ArtifactActivity,
+    },
+    /// A generic artifact was removed; its immutable revisions remain under
+    /// retention and the ID is permanently tombstoned.
+    ArtifactRemoved {
+        artifact: ArtifactActivity,
     },
 }
 

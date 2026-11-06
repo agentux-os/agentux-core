@@ -216,7 +216,10 @@ impl Default for Bus {
         Self {
             max_turns_per_exchange: 6,
             max_tokens_per_run: 50_000,
-            allow: BusTool::ALL.to_vec(),
+            allow: BusTool::ALL
+                .into_iter()
+                .filter(|tool| *tool != BusTool::PublishArtifact)
+                .collect(),
         }
     }
 }
@@ -231,16 +234,18 @@ pub enum BusTool {
     Handoff,
     GetRunState,
     AskHuman,
+    PublishArtifact,
 }
 
 impl BusTool {
-    pub const ALL: [BusTool; 6] = [
+    pub const ALL: [BusTool; 7] = [
         Self::PostMessage,
         Self::ReadMessages,
         Self::RequestReview,
         Self::Handoff,
         Self::GetRunState,
         Self::AskHuman,
+        Self::PublishArtifact,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -251,6 +256,7 @@ impl BusTool {
             Self::Handoff => "handoff",
             Self::GetRunState => "get_run_state",
             Self::AskHuman => "ask_human",
+            Self::PublishArtifact => "publish_artifact",
         }
     }
 }

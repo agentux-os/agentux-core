@@ -13,8 +13,8 @@ use crate::bridge::BusEndpoint;
 use crate::prompt::session_prompt;
 use crate::tools::descriptions::*;
 use crate::tools::{
-    AskHuman, BusCall, BusReply, Handoff, HumanReply, Inbox, PostMessage, Posted, ReadMessages,
-    RequestReview, RunStateReply,
+    ArtifactPublished, AskHuman, BusCall, BusReply, Handoff, HumanReply, Inbox, PostMessage,
+    Posted, PublishArtifact, ReadMessages, RequestReview, RunStateReply,
 };
 
 /// Name the server reports, and the name harnesses show its tools under.
@@ -110,6 +110,17 @@ impl BusServer {
     async fn ask_human(&self, Parameters(args): Parameters<AskHuman>) -> ToolResult<HumanReply> {
         match self.call(BusCall::AskHuman(args)).await? {
             BusReply::Human(reply) => Ok(Json(reply)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    #[tool(name = "publish_artifact", description = PUBLISH_ARTIFACT)]
+    async fn publish_artifact(
+        &self,
+        Parameters(args): Parameters<PublishArtifact>,
+    ) -> ToolResult<ArtifactPublished> {
+        match self.call(BusCall::PublishArtifact(args)).await? {
+            BusReply::ArtifactPublished(published) => Ok(Json(published)),
             other => Err(unexpected(&other)),
         }
     }

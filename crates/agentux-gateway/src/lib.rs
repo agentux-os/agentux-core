@@ -620,6 +620,10 @@ impl Messages {
                 session_id,
                 event: session_event,
             } => self.activity_from_session_event(event.seq, session_id, session_event),
+            // Generic artifacts are persisted locally, but their lifecycle is
+            // not sent until authenticated retrieval is implemented and the
+            // matching protocol capability can be advertised safely.
+            EventBody::ArtifactAvailable { .. } | EventBody::ArtifactRemoved { .. } => None,
             _ => None,
         }
     }

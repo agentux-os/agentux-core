@@ -30,6 +30,72 @@ After a handoff, stop working on the task.";
     pub const ASK_HUMAN: &str = "Escalate a decision to the human supervising the run; it appears in their inbox. \
 Use it only for decisions you cannot take yourself (requirements, trade-offs, permissions, being stuck), not for status updates. \
 Waits a while for the answer; if none comes in time, the result says the question is pending and the answer arrives later in your mailbox.";
+
+    pub const PUBLISH_ARTIFACT: &str = "Publish a text artifact that is an explicit deliverable of your current run. \
+Provide the complete text content directly; filesystem paths, URLs, tool output and partial streams are not accepted. \
+Use a stable producer_key for updates and a new publication_id for each revision. This tool is available only when enabled for the project.";
+}
+
+const MAX_ARTIFACT_BYTES: usize = 25 * 1024 * 1024;
+
+/// Explicit textual artifact publication. Content is supplied directly, never by path or URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PublishArtifact {
+    /// Stable logical key scoped to this producer and run; updates retain the artifact ID.
+    pub producer_key: String,
+    /// Unique ID for this publication attempt; reuse it only for an exact retry.
+    pub publication_id: String,
+    /// Human-readable display name.
+    pub name: String,
+    /// Media type, for example `text/markdown` or `application/json`.
+    pub media_type: String,
+    /// Complete textual artifact body, limited to 25 MiB in UTF-8.
+    #[schemars(length(max = 26214400))]
+    pub content_text: String,
+}
+
+impl PublishArtifact {
+    pub fn validate(&self) -> Result<(), String> {
+        for (field, value, max) in [
+            ("producer_key", &self.producer_key, 256),
+            ("publication_id", &self.publication_id, 128),
+            ("name", &self.name, 256),
+            ("media_type", &self.media_type, 127),
+        ] {
+            if value.trim().is_empty()
+                || value.chars().count() > max
+                || value.chars().any(char::is_control)
+            {
+                return Err(format!(
+                    "{field} must be non-empty, bounded and contain no control characters"
+                ));
+            }
+        }
+        if !self.media_type.contains('/')
+            || self.media_type.starts_with('/')
+            || self.media_type.ends_with('/')
+        {
+            return Err("media_type must be a type/subtype".into());
+        }
+        if self.content_text.len() > MAX_ARTIFACT_BYTES {
+            return Err(format!(
+                "artifact content exceeds {MAX_ARTIFACT_BYTES} UTF-8 bytes"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactPublished {
+    pub artifact_id: String,
+    pub revision: String,
+    pub media_type: String,
+    pub byte_length: u64,
+    pub sequence: i64,
+    pub created: bool,
 }
 
 /// Arguments of `post_message`.
@@ -167,6 +233,7 @@ pub enum BusCall {
     Handoff(Handoff),
     GetRunState,
     AskHuman(AskHuman),
+    PublishArtifact(PublishArtifact),
 }
 
 impl BusCall {
@@ -178,6 +245,7 @@ impl BusCall {
             Self::Handoff(_) => BusTool::Handoff,
             Self::GetRunState => BusTool::GetRunState,
             Self::AskHuman(_) => BusTool::AskHuman,
+            Self::PublishArtifact(_) => BusTool::PublishArtifact,
         }
     }
 }
@@ -190,4 +258,5 @@ pub enum BusReply {
     Inbox(Inbox),
     RunState(Box<RunStateReply>),
     Human(HumanReply),
+    ArtifactPublished(ArtifactPublished),
 }

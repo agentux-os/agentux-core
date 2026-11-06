@@ -250,6 +250,76 @@ const MIGRATIONS: &[&str] = &[
         updated_sequence INTEGER NOT NULL
     );
     ",
+    // 16: generic artifact registry, immutable revisions and publication idempotency.
+    "
+    CREATE TABLE artifacts (
+        organization_id TEXT NOT NULL,
+        artifact_id     TEXT NOT NULL,
+        run_id          TEXT NOT NULL REFERENCES runs(id),
+        producer_id     TEXT NOT NULL,
+        producer_key    TEXT NOT NULL,
+        session_id      TEXT NOT NULL REFERENCES sessions(id),
+        agent_id        TEXT NOT NULL,
+        role_id         TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        media_type      TEXT NOT NULL,
+        current_revision TEXT,
+        byte_length     INTEGER,
+        created_sequence INTEGER NOT NULL,
+        updated_sequence INTEGER NOT NULL,
+        removed_sequence INTEGER,
+        PRIMARY KEY (organization_id, artifact_id),
+        CHECK ((current_revision IS NULL) = (removed_sequence IS NOT NULL))
+    );
+    CREATE UNIQUE INDEX active_artifact_producer_key
+        ON artifacts (organization_id, run_id, producer_id, producer_key)
+        WHERE removed_sequence IS NULL;
+    CREATE INDEX artifacts_by_run
+        ON artifacts (organization_id, run_id, artifact_id);
+
+    CREATE TABLE artifact_revisions (
+        organization_id TEXT NOT NULL,
+        artifact_id     TEXT NOT NULL,
+        revision        TEXT NOT NULL,
+        media_type      TEXT NOT NULL,
+        byte_length     INTEGER NOT NULL CHECK (byte_length BETWEEN 0 AND 26214400),
+        created_at_ms   INTEGER NOT NULL,
+        retain_until_ms INTEGER NOT NULL,
+        PRIMARY KEY (organization_id, artifact_id, revision),
+        FOREIGN KEY (organization_id, artifact_id)
+            REFERENCES artifacts (organization_id, artifact_id)
+    );
+    CREATE INDEX artifact_revisions_retention
+        ON artifact_revisions (retain_until_ms);
+
+    CREATE TABLE artifact_publications (
+        organization_id TEXT NOT NULL,
+        run_id          TEXT NOT NULL,
+        producer_id     TEXT NOT NULL,
+        producer_key    TEXT NOT NULL,
+        publication_id  TEXT NOT NULL,
+        artifact_id     TEXT NOT NULL,
+        revision        TEXT NOT NULL,
+        sequence        INTEGER NOT NULL,
+        byte_length     INTEGER NOT NULL,
+        media_type      TEXT NOT NULL,
+        name            TEXT NOT NULL,
+        session_id      TEXT NOT NULL,
+        agent_id        TEXT NOT NULL,
+        role_id          TEXT NOT NULL,
+        PRIMARY KEY (organization_id, run_id, producer_id, producer_key, publication_id),
+        FOREIGN KEY (organization_id, artifact_id, revision)
+            REFERENCES artifact_revisions (organization_id, artifact_id, revision)
+    );
+
+    CREATE TABLE artifact_sources (
+        producer_id      TEXT PRIMARY KEY,
+        manifest_generation TEXT NOT NULL,
+        reconciled_sequence INTEGER,
+        enabled          INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        retired_sequence INTEGER
+    );
+    ",
 ];
 
 /// The schema version this build writes.

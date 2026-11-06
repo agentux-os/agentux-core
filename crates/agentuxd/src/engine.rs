@@ -194,6 +194,7 @@ pub struct Engine {
 
 pub(crate) struct Inner {
     pub(crate) store: Store,
+    artifact_store: Mutex<Option<agentux_store::artifact_store::ContentStore>>,
     pub(crate) executor: Arc<dyn StepExecutor>,
     pub(crate) settings: Settings,
     /// Driver task per run. A run has at most one.
@@ -219,6 +220,7 @@ impl Engine {
         Self {
             inner: Arc::new(Inner {
                 store,
+                artifact_store: Mutex::new(None),
                 executor,
                 settings,
                 tasks: Mutex::new(HashMap::new()),
@@ -235,6 +237,97 @@ impl Engine {
 
     pub fn store(&self) -> &Store {
         &self.inner.store
+    }
+
+    /// Configure Core's private content-addressed store. The daemon calls
+    /// this once at startup; publication remains an in-process API so remote
+    /// callers cannot select filesystem paths or content digests.
+    pub fn with_artifact_store(
+        self,
+        artifacts: agentux_store::artifact_store::ContentStore,
+    ) -> Self {
+        *self
+            .inner
+            .artifact_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(artifacts);
+        self
+    }
+
+    /// Publish verified bytes from a trusted producer. Content is committed
+    /// before its SQLite reference, so a database failure can orphan a blob
+    /// but can never expose a projection that points at missing content.
+    pub fn publish_artifact(
+        &self,
+        publication: &agentux_store::artifact::Publication,
+        bytes: &[u8],
+    ) -> Result<agentux_store::artifact::PublishedArtifact> {
+        let content_store = self
+            .inner
+            .artifact_store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+            .ok_or_else(|| Error::Internal("artifact storage is not configured".into()))?;
+        let content = content_store
+            .put_verified(bytes)
+            .map_err(|error| Error::Internal(format!("cannot store artifact bytes: {error}")))?;
+        self.inner
+            .store
+            .write(|tx| tx.publish_artifact(publication, &content))
+            .map_err(Into::into)
+    }
+
+    /// Publish an artifact declared by the session-scoped AgentUX MCP tool.
+    /// Run, organization and role are resolved from durable Core records; the
+    /// producer cannot choose them in its tool arguments.
+    pub(crate) fn publish_agent_artifact(
+        &self,
+        identity: &agentux_bus::SessionIdentity,
+        declaration: agentux_bus::PublishArtifact,
+    ) -> Result<agentux_store::artifact::PublishedArtifact> {
+        declaration.validate().map_err(Error::InvalidParams)?;
+        let (record, session) = self.inner.store.read(|tx| {
+            let record = tx.run(&identity.run.0)?.ok_or_else(|| {
+                agentux_store::Error::Data("artifact run no longer exists".into())
+            })?;
+            let session = tx.session(&identity.session.0)?.ok_or_else(|| {
+                agentux_store::Error::Data("artifact session no longer exists".into())
+            })?;
+            Ok::<_, agentux_store::Error>((record, session))
+        })?;
+        if session.run_id != identity.run.0 || session.role != identity.role {
+            return Err(Error::Unauthorized(
+                "artifact session identity does not match the persisted run role".into(),
+            ));
+        }
+        let origin = record.run.origin.ok_or_else(|| {
+            Error::InvalidParams("generic artifacts require a Command-owned run".into())
+        })?;
+        let publication = agentux_store::artifact::Publication {
+            organization_id: origin.organization_id,
+            run_id: identity.run.0.clone(),
+            session_id: identity.session.0.clone(),
+            producer_id: "agentux-bus".into(),
+            producer_key: declaration.producer_key,
+            publication_id: declaration.publication_id,
+            name: declaration.name,
+            media_type: declaration.media_type,
+        };
+        self.publish_artifact(&publication, declaration.content_text.as_bytes())
+    }
+
+    /// Remove an artifact through its original producer session.
+    pub fn remove_artifact(
+        &self,
+        organization_id: &str,
+        artifact_id: &str,
+        session_id: &str,
+    ) -> Result<Option<i64>> {
+        self.inner
+            .store
+            .write(|tx| tx.remove_artifact(organization_id, artifact_id, session_id))
+            .map_err(Into::into)
     }
 
     /// Picks up every unfinished run after a (re)start. Attempts left

@@ -1,7 +1,7 @@
 # Core #118: Generic Artifact Lifecycle Plan
 
-> **Status:** proposed sequence; implementation begins after the owner accepts
-> the artifact contract and Protocol #20 defines remote dereference.
+> **Status:** implementation in progress; Core #118 and Protocol #20 contracts
+> were accepted by the owner on 2026-11-06.
 
 **Goal:** Connect an authoritative, verifiable artifact lifecycle to Core
 snapshots without advertising incomplete artifact inventories.
@@ -46,13 +46,14 @@ Protocol #20.
 
 ### 1. Finalize protocol and Core contracts
 
-- [ ] Accept the Core #118 proposal and Protocol #20 retrieval/removal contract.
-- [ ] Implement idempotency scope as
+- [x] Accept the Core #118 proposal and Protocol #20 retrieval/removal contract.
+- [x] Implement idempotency scope as
   `(organizationId, runId, producerId, producerKey, publicationId)`; validate
-  media type and configure storage quota. Retain superseded/removed bytes for
-  at least 30 days and longer while replay/outbox/checkpoint/download holds
-  remain; collect only after all holds expire.
-- [ ] Add a typed Core publisher API bound to an authorized run/session/role.
+  media type and enforce a conservative 1 GiB node-wide cap. Retain
+  superseded/removed bytes for at least 30 days. Configurable quota,
+  hold-aware collection, and garbage collection remain outstanding.
+- [x] Add an opt-in typed AgentUX bus publisher bound to an authorized
+  run/session/role; end-to-end producer validation remains outstanding.
 
 ### 2. Add managed content storage
 
@@ -73,7 +74,8 @@ Protocol #20.
 - [ ] Emit `artifact_available` only with the content verified by Core.
 - [ ] Keep gate/system outputs local until a protocol actor model represents
   their actual source.
-- [ ] Test the real producer through create, update, and removal.
+- [ ] Test the real producer through create, update, and removal; the MCP
+  publication route is implemented but not yet fixture-validated end to end.
 
 ### 4. Add authenticated remote retrieval and reconciliation
 

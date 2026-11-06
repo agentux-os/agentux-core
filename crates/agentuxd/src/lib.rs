@@ -99,7 +99,12 @@ pub async fn run(options: Options) -> Result<(), Box<dyn Error>> {
         notifier: notify::Notifier::desktop(),
         ..Settings::default()
     };
-    let engine = Engine::with_settings(store, executor, settings);
+    let artifact_root = database
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("artifacts");
+    let artifacts = agentux_store::artifact_store::ContentStore::open(artifact_root)?;
+    let engine = Engine::with_settings(store, executor, settings).with_artifact_store(artifacts);
     let resumed = engine.resume()?;
     let _limits = engine.watch_limits();
     eprintln!(
