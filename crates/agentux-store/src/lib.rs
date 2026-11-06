@@ -1010,6 +1010,7 @@ impl Tx<'_> {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
+        let mut effective_run_id = update.run_id.clone();
         if let Some((state, owner, old_run_id)) = existing {
             if owner != update.organization_id {
                 return Err(Error::Data("command projection owner mismatch".into()));
@@ -1021,9 +1022,6 @@ impl Tx<'_> {
                 return Err(Error::Data(
                     "command ID was reused for another method".into(),
                 ));
-            }
-            if old_run_id.is_some() && old_run_id != update.run_id {
-                return Err(Error::Data("command run association cannot change".into()));
             }
             let old_idempotency_key = previous
                 .get("operationIdempotencyKey")
@@ -1037,6 +1035,27 @@ impl Tx<'_> {
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
+            let safe_run_start_retry = update.method == "run.start"
+                && update.status == Status::Executing
+                && old_idempotency_key.is_some()
+                && old_idempotency_key == update.operation_idempotency_key.as_deref()
+                && matches!(old_status, "interrupted" | "completed");
+            if old_run_id.is_some() && old_run_id != update.run_id {
+                if update.run_id.is_none() && safe_run_start_retry {
+                    effective_run_id = old_run_id.clone();
+                } else {
+                    return Err(Error::Data("command run association cannot change".into()));
+                }
+            }
+            // Replaying a locally accepted decision must be idempotent. Preserve
+            // its advanced state while run_decided retries the safe run.start.
+            if update.status == Status::Confirmed
+                && update.method == "run.start"
+                && old_idempotency_key.is_some()
+                && matches!(old_status, "executing" | "interrupted" | "completed")
+            {
+                return Ok(None);
+            }
             // A redelivered request starts its local policy path again, but
             // must not reset or replay any already advanced durable state.
             if update.status == Status::Received {
@@ -1073,10 +1092,8 @@ impl Tx<'_> {
                         )
                         | ("interrupted", Status::ReconciliationRequired)
                 );
-                let recoverable_run_start = matches!(
-                    old_status,
-                    "interrupted" | "awaiting_confirmation" | "completed"
-                ) && update.status == Status::Executing
+                let recoverable_run_start = matches!(old_status, "interrupted" | "completed")
+                    && update.status == Status::Executing
                     && update.method == "run.start"
                     && old_idempotency_key.is_some();
                 if !allowed && !recoverable_run_start {
@@ -1100,7 +1117,7 @@ impl Tx<'_> {
             "status": status,
             "currentState": { "status": status },
         });
-        if let Some(run_id) = &update.run_id {
+        if let Some(run_id) = &effective_run_id {
             state["runId"] = run_id.clone().into();
         }
         if let Some(key) = &update.operation_idempotency_key {
@@ -1111,7 +1128,7 @@ impl Tx<'_> {
             projection_type: SnapshotProjectionType::Command,
             id: update.command_id.clone(),
             organization_id: update.organization_id.clone(),
-            run_id: update.run_id.clone(),
+            run_id: effective_run_id,
             state,
         };
         self.upsert_business_projection(&projection).map(Some)

@@ -389,7 +389,7 @@ impl Pending {
     /// Claims decided commands durably before execution. A claimed non-idempotent
     /// effect stays blocked after a crash; `run.start` may be retried only with
     /// its stable mission run ID.
-    pub fn take_decided(&self) -> Vec<(Held, bool)> {
+    pub fn take_decided(&self) -> Vec<Held> {
         let mut held = self.list();
         let mut decided = Vec::new();
         for item in &mut held {
@@ -408,9 +408,8 @@ impl Pending {
             if (!item.claimed || safe_retry)
                 && matches!(item.decision.as_deref(), Some("accept" | "reject"))
             {
-                let was_claimed = item.claimed;
                 item.claimed = true;
-                decided.push((item.clone(), was_claimed));
+                decided.push(item.clone());
             }
         }
         if decided.is_empty() {
@@ -790,7 +789,7 @@ pub async fn run_decided(
     client: &mut Client,
     pending: &Pending,
 ) -> Result<Vec<(String, String, Value)>, String> {
-    for (held, was_claimed) in pending.take_decided() {
+    for held in pending.take_decided() {
         let accepted = held.decision.as_deref() == Some("accept");
         let mut terminal_status = None;
         let organization_id = held
@@ -801,20 +800,16 @@ pub async fn run_decided(
         let operation_idempotency_key =
             operation_idempotency_key(&held.method, &held.params, organization_id);
         let outcome = if accepted {
-            let confirmed = if was_claimed {
-                Ok(())
-            } else {
-                record_lifecycle(
-                    client,
-                    organization_id,
-                    &held.command_id,
-                    &held.method,
-                    operation_idempotency_key.as_deref(),
-                    agentux_api::rpc::CommandLifecycleStatus::Confirmed,
-                    None,
-                )
-                .await
-            };
+            let confirmed = record_lifecycle(
+                client,
+                organization_id,
+                &held.command_id,
+                &held.method,
+                operation_idempotency_key.as_deref(),
+                agentux_api::rpc::CommandLifecycleStatus::Confirmed,
+                None,
+            )
+            .await;
             if let Err(confirmation_error) = confirmed {
                 let interrupted = record_lifecycle(
                     client,
@@ -996,8 +991,8 @@ mod tests {
         assert!(pending.decide("nope", true).is_err());
         let decided = pending.take_decided();
         assert_eq!(decided.len(), 1);
-        assert_eq!(decided[0].0.decision.as_deref(), Some("accept"));
-        assert!(decided[0].0.claimed);
+        assert_eq!(decided[0].decision.as_deref(), Some("accept"));
+        assert!(decided[0].claimed);
         assert_eq!(pending.list().len(), 2);
         assert!(pending.take_decided().is_empty());
         let restarted = Pending::new(pending.path.clone());
@@ -1057,6 +1052,6 @@ mod tests {
         let restarted = Pending::new(pending.path.clone());
         let retry = restarted.take_decided();
         assert_eq!(retry.len(), 1);
-        assert!(retry[0].1);
+        assert!(retry[0].claimed);
     }
 }

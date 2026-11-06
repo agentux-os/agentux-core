@@ -254,6 +254,47 @@ fn command_run_start_replay_requires_the_same_core_deduplication_key() {
         store.read(|tx| tx.last_event_seq()).unwrap(),
         final_sequence
     );
+
+    let with_local_run_id = |status, run_id| agentux_api::rpc::CommandProjectionUpdate {
+        organization_id: "org-a".into(),
+        command_id: "cmd-local-run-id".into(),
+        method: "run.start".into(),
+        status,
+        run_id,
+        operation_idempotency_key: Some("mission-run-b".into()),
+    };
+    store
+        .write(|tx| tx.update_command_projection(&with_local_run_id(Status::Received, None)))
+        .unwrap();
+    store
+        .write(|tx| {
+            tx.update_command_projection(&with_local_run_id(
+                Status::Executing,
+                Some("local-run-1".into()),
+            ))
+        })
+        .unwrap();
+    store
+        .write(|tx| {
+            tx.update_command_projection(&with_local_run_id(
+                Status::Completed,
+                Some("local-run-1".into()),
+            ))
+        })
+        .unwrap();
+    store
+        .write(|tx| tx.update_command_projection(&with_local_run_id(Status::Executing, None)))
+        .unwrap();
+    assert!(
+        store
+            .write(|tx| {
+                tx.update_command_projection(&with_local_run_id(
+                    Status::Completed,
+                    Some("local-run-2".into()),
+                ))
+            })
+            .is_err()
+    );
 }
 
 #[test]
@@ -274,6 +315,14 @@ fn claimed_run_start_can_resume_from_pending_confirmation() {
         .unwrap();
     store
         .write(|tx| tx.update_command_projection(&update(Status::AwaitingConfirmation)))
+        .unwrap();
+    assert!(
+        store
+            .write(|tx| tx.update_command_projection(&update(Status::Executing)))
+            .is_err()
+    );
+    store
+        .write(|tx| tx.update_command_projection(&update(Status::Confirmed)))
         .unwrap();
     assert!(
         store

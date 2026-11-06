@@ -316,7 +316,7 @@ async fn commands_run_wait_for_the_node_or_are_refused() {
 
     // Rejected at the node: reported, not run.
     pending.decide("c5", false).unwrap();
-    let events = commands::run_decided(&mut client, &pending).await;
+    let events = commands::run_decided(&mut client, &pending).await.unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].0, "command.completed");
     assert_eq!(events[0].1["ok"], false);
