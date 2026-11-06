@@ -98,6 +98,207 @@ fn harness_info(id: &str, installed: bool) -> agentux_api::rpc::HarnessInfo {
     }
 }
 
+fn node_state(
+    status: agentux_api::NodeOperationalStatus,
+    active_runs: u64,
+) -> agentux_api::NodeState {
+    agentux_api::NodeState {
+        node_id: "node-a".into(),
+        status,
+        capacity: serde_json::json!({"activeRuns": active_runs, "waitingForHuman": 0}),
+    }
+}
+
+fn node_alert(
+    status: agentux_api::NodeAlertStatus,
+    last_observed_at: &str,
+) -> agentux_api::NodeAlertState {
+    agentux_api::NodeAlertState {
+        alert_id: "harness-claude-unavailable".into(),
+        producer: "harness-monitor".into(),
+        code: "harness_unavailable".into(),
+        condition_key: "harness:claude".into(),
+        summary: if status == agentux_api::NodeAlertStatus::Resolved {
+            "Claude harness is available again."
+        } else {
+            "Claude harness is unavailable."
+        }
+        .into(),
+        first_observed_at: "2026-11-05T12:00:00Z".into(),
+        last_observed_at: last_observed_at.into(),
+        status,
+    }
+}
+
+#[test]
+fn node_and_alert_sources_are_sequenced_durable_and_captured_atomically() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.db");
+    let store = Store::open(&path).unwrap();
+
+    let first_node = node_state(agentux_api::NodeOperationalStatus::Ready, 0);
+    assert_eq!(
+        store
+            .write(|tx| tx.replace_node_state(&first_node))
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        store
+            .write(|tx| tx.replace_node_state(&first_node))
+            .unwrap(),
+        None
+    );
+    let changed_node = node_state(agentux_api::NodeOperationalStatus::Draining, 1);
+    assert_eq!(
+        store
+            .write(|tx| tx.replace_node_state(&changed_node))
+            .unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        store
+            .write(|tx| {
+                tx.upsert_node_alert(&node_alert(
+                    agentux_api::NodeAlertStatus::Active,
+                    "2026-11-05T12:00:00Z",
+                ))
+            })
+            .unwrap(),
+        Some(3)
+    );
+    assert_eq!(
+        store
+            .write(|tx| {
+                tx.upsert_node_alert(&node_alert(
+                    agentux_api::NodeAlertStatus::Resolved,
+                    "2026-11-05T12:05:00Z",
+                ))
+            })
+            .unwrap(),
+        Some(4)
+    );
+    assert_eq!(
+        store
+            .write(|tx| tx.remove_node_alert("harness-claude-unavailable"))
+            .unwrap(),
+        Some(5)
+    );
+    drop(store);
+
+    let reopened = Store::open(&path).unwrap();
+    let captured = reopened
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    assert_eq!(captured.captured_event_head, 5);
+    assert_eq!(captured.node.as_ref().unwrap().updated_sequence, 2);
+    assert_eq!(
+        captured.node.as_ref().unwrap().state.status,
+        agentux_api::NodeOperationalStatus::Draining
+    );
+    assert_eq!(captured.node_alerts.len(), 1);
+    assert_eq!(captured.node_alerts[0].removed_at_sequence, Some(5));
+    assert_eq!(captured.node_alerts[0].updated_sequence, 5);
+    assert!(captured.node_alerts[0].state.is_none());
+
+    let events = reopened.read(|tx| tx.events_since(0, None)).unwrap();
+    assert!(matches!(
+        &events[0].body,
+        EventBody::NodeStatusChanged { .. }
+    ));
+    assert!(matches!(
+        &events[1].body,
+        EventBody::NodeStatusChanged { .. }
+    ));
+    assert!(matches!(
+        &events[2].body,
+        EventBody::NodeAlertChanged { .. }
+    ));
+    assert!(matches!(
+        &events[3].body,
+        EventBody::NodeAlertChanged { .. }
+    ));
+    assert!(matches!(
+        &events[4].body,
+        EventBody::NodeAlertChanged { .. }
+    ));
+}
+
+#[test]
+fn node_source_rejects_invalid_status_and_cross_identity_updates() {
+    let store = Store::open_in_memory().unwrap();
+    let offline = serde_json::from_value::<agentux_api::NodeState>(serde_json::json!({
+        "nodeId": "node-a",
+        "status": "offline",
+        "capacity": {"activeRuns": 0}
+    }));
+    assert!(offline.is_err());
+    assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 0);
+    let mut invalid = node_state(agentux_api::NodeOperationalStatus::Ready, 0);
+    invalid.capacity = serde_json::json!([]);
+    assert!(store.write(|tx| tx.replace_node_state(&invalid)).is_err());
+    assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 0);
+
+    store
+        .write(|tx| {
+            tx.replace_node_state(&node_state(agentux_api::NodeOperationalStatus::Ready, 0))
+        })
+        .unwrap();
+    invalid = node_state(agentux_api::NodeOperationalStatus::Ready, 1);
+    invalid.node_id = "node-b".into();
+    assert!(store.write(|tx| tx.replace_node_state(&invalid)).is_err());
+    assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 1);
+}
+
+#[test]
+fn node_alert_source_rejects_blank_or_unordered_state() {
+    let store = Store::open_in_memory().unwrap();
+    let mut blank = node_alert(agentux_api::NodeAlertStatus::Active, "2026-11-05T12:00:00Z");
+    blank.summary = "  ".into();
+    assert!(store.write(|tx| tx.upsert_node_alert(&blank)).is_err());
+    let reversed = node_alert(agentux_api::NodeAlertStatus::Active, "2026-11-05T11:59:59Z");
+    assert!(store.write(|tx| tx.upsert_node_alert(&reversed)).is_err());
+    assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 0);
+}
+
+#[test]
+fn empty_node_alert_inventory_is_distinguished_from_never_observed() {
+    let store = Store::open_in_memory().unwrap();
+    let before = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    assert!(before.node.is_none());
+    assert!(before.node_alerts.is_empty());
+    assert!(
+        before
+            .unavailable
+            .iter()
+            .any(|entry| entry.kind == snapshot::ProjectionKind::Node)
+    );
+    assert!(
+        before
+            .unavailable
+            .iter()
+            .any(|entry| entry.kind == snapshot::ProjectionKind::NodeAlert)
+    );
+
+    store
+        .write(|tx| {
+            tx.replace_node_state(&node_state(agentux_api::NodeOperationalStatus::Ready, 0))?;
+            tx.replace_node_alert_inventory(&[])
+        })
+        .unwrap();
+    let after = store
+        .read(|tx| tx.capture_checkpoint_sources("org-a", now_ms()))
+        .unwrap();
+    assert!(after.node.is_some());
+    assert!(after.node_alerts.is_empty());
+    assert!(!after.unavailable.iter().any(|entry| matches!(
+        entry.kind,
+        snapshot::ProjectionKind::Node | snapshot::ProjectionKind::NodeAlert
+    )));
+}
+
 #[test]
 fn harness_source_updates_tombstones_and_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
@@ -635,6 +836,9 @@ fn migration_11_preserves_version_10_rows_and_scopes_projection_ids_by_org() {
              DROP TABLE snapshot_capture_bindings;
              DROP TABLE snapshot_harness_inventory_state;
              DROP TABLE snapshot_harnesses;
+             DROP TABLE snapshot_node_alert_inventory_state;
+             DROP TABLE snapshot_node_alerts;
+             DROP TABLE snapshot_node_state;
              PRAGMA user_version = 10;",
         )
         .unwrap();
@@ -1073,8 +1277,8 @@ fn snapshot_source_marks_unsupported_projections_unavailable() {
             SourceKind::Derived,
             SourceKind::Sourced,
             SourceKind::Sourced,
-            SourceKind::Unavailable,
-            SourceKind::Unavailable,
+            SourceKind::Sourced,
+            SourceKind::Sourced,
             SourceKind::Sourced,
             SourceKind::Sourced,
             SourceKind::Unavailable,

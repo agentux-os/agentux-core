@@ -276,6 +276,24 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
                     .map_err(Error::from),
             )
         }
+        method::NODE_STATE_REPLACE => {
+            let params: rpc::NodeStateReplace = parse(params)?;
+            to_value(
+                engine
+                    .store()
+                    .write(|tx| tx.replace_node_state(&params.node))
+                    .map_err(Error::from),
+            )
+        }
+        method::NODE_ALERT_INVENTORY_REPLACE => {
+            let params: rpc::NodeAlertInventory = parse(params)?;
+            to_value(
+                engine
+                    .store()
+                    .write(|tx| tx.replace_node_alert_inventory(&params.alerts))
+                    .map_err(Error::from),
+            )
+        }
         method::HARNESSES_TEST => to_value(engine.test_harness(parse(params)?).await),
         method::PREFERENCES_GET => to_value(engine.get_prefs()),
         method::PREFERENCES_SET => {
@@ -313,18 +331,19 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
         method::RUNS_EVENTS => to_value(engine.run_events(parse(params)?)),
         method::SNAPSHOT_SOURCE_CAPTURE => {
             let params: rpc::SnapshotSourceCapture = parse(params)?;
-            if params.organization_id.trim().is_empty() {
+            if params.organization_id.trim().is_empty() || params.node_id.trim().is_empty() {
                 return Err(rpc::Error::new(
                     code::INVALID_PARAMS,
-                    "organizationId is required",
+                    "organizationId and nodeId are required",
                 ));
             }
             to_value(
                 engine
                     .store()
                     .read(|tx| {
-                        tx.capture_checkpoint_sources(
+                        tx.capture_checkpoint_sources_for_node(
                             &params.organization_id,
+                            Some(&params.node_id),
                             agentux_store::now_ms(),
                         )
                     })

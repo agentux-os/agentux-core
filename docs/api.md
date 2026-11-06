@@ -34,7 +34,7 @@ echo '{"jsonrpc":"2.0","id":1,"method":"runs.list"}' | socat - UNIX-CONNECT:$XDG
 | `runs.get` | `{ runId }` | `{ run: Run, attempts: StepAttempt[], requests: PermissionRequest[], sessions: Session[] }` |
 | `runs.cancel` | `{ runId }` | `Run` |
 | `runs.events` | `{ runId, sinceSeq?, limit? }` — `limit` defaults to 1000, at most 10000 | `{ events: Event[], more, headSeq }`: the run's stored events with `seq > sinceSeq`, oldest first; see [History](#history) |
-| `snapshots.source_capture` | `{ organizationId }` | Atomic durable Core projection sources and the SQLite event head from one read transaction, plus explicit unavailable projection reasons; this is an internal data-boundary primitive and does not claim complete AUXP checkpoint coverage |
+| `snapshots.source_capture` | `{ organizationId, nodeId }` | Atomic durable Core projection sources and the SQLite event head from one read transaction, plus explicit unavailable projection reasons; rejects a node ID that differs from persisted Core identity; this is an internal data-boundary primitive and does not claim complete AUXP checkpoint coverage |
 | `snapshots.materialize` | `{ organizationId, nodeId, checkpointId, snapshotId, capturedEventHead, createdAtMs, expiresAtMs, highWaterSequence, payload }` | Atomically persists immutable snapshot pages and their sequence binding; identical retries succeed and conflicting retries fail |
 | `snapshots.binding_get` | `{ organizationId, nodeId, checkpointId }` | Reads the immutable binding for restart recovery, or `null` if no checkpoint exists |
 | `sessions.list` | `{ runId? }` | `Session[]`, oldest first |
@@ -103,7 +103,7 @@ Where the replay ends, the subscription gets one notification of its own, exactl
 
 ### Snapshot projection source ownership
 
-`snapshots.source_capture` returns durable harness and business-projection records from the same SQLite read transaction as `capturedEventHead`. The gateway writes a complete harness inventory; changes and removals share one SQLite event sequence, and removed harnesses remain as tombstones. `snapshots.materialize` atomically stores immutable pages with the binding between that Core event head and the gateway's high-water sequence; `snapshots.binding_get` recovers the binding after a restart. This still does **not** claim complete checkpoint coverage: node, node-alert, artifact, task, and command sources remain explicitly listed in `unavailable`. Consumers must not treat an unavailable source as an authoritative empty inventory.
+`snapshots.source_capture` returns durable node, harness, node-alert and business-projection records from the same SQLite read transaction as `capturedEventHead`. Node and alert state changes, harness inventory changes, and their event sequences are stored atomically; removals remain as tombstones. `snapshots.materialize` atomically stores immutable pages with the binding between that Core event head and the gateway's high-water sequence; `snapshots.binding_get` recovers the binding after a restart. The enrolled gateway now supplies node readiness and the complete harness inventory, but no concrete alert producer exists and business-projection producers remain unconnected. Checkpoint coverage is incomplete; consumers must not treat an unavailable source as an authoritative empty inventory.
 
 The intended owners are the artifact lifecycle producer, the typed task lifecycle producer, and the node gateway for Command lifecycle. No producer currently writes the business-projection rows. Follow-up work must connect each owner, source organization scope from authenticated/enrolled context, and test its real create/update/remove/restart lifecycle before coverage changes to `sourced`. A task requires a run whose persisted `RunOrigin` belongs to that organization; an artifact may be organization-owned without a run, but any supplied run link must belong to the same organization. Local-only runs cannot be stored or captured. Command rows may omit `runId`; Protocol #17 requires `commandId`, `organizationId`, `status`, and non-empty `currentState`, while `method` is optional. The future gateway writer must bind its `organizationId` to the enrolled node configuration. Command parameters and credentials must never enter projection state.
 
@@ -118,6 +118,8 @@ Snapshot capability remains disabled while any required source is unavailable.
 | `log` | `text` | Check output, agent summaries, commits, notes such as a resume after restart |
 | `session` | `session: Session` | A session started or changed state or usage (full snapshot) |
 | `session_event` | `sessionId`, `event: SessionEvent` | Something happened in a session |
+| `node_status_changed` | `node: NodeState` | The enrolled gateway reported a node operational-state change (no `runId`) |
+| `node_alert_changed` | `alert: NodeAlertChange` | A Core-owned node alert changed or was removed (no `runId`) |
 | `bus_message` | `message: BusMessage` | Traffic on the run's agent bus (see [Agent bus](#agent-bus)) |
 | `limits` | `limits: HarnessLimit[]` | The usage limits in force changed (no `runId`) |
 | `harness_status` | `harnesses: HarnessInfo[]` | The complete local harness inventory changed (no `runId`) |

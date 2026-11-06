@@ -33,8 +33,8 @@ use std::{env, fs, io};
 
 use agentux_api::rpc::HarnessInfo;
 use agentux_api::{
-    Event, EventBody, HarnessLimit, PermissionRequest, RequestStatus, Run, RunOrigin, RunStatus,
-    SessionEvent, SessionState, ToolStatus,
+    Event, EventBody, HarnessLimit, NodeOperationalStatus, NodeState, PermissionRequest,
+    RequestStatus, Run, RunOrigin, RunStatus, SessionEvent, SessionState, ToolStatus,
 };
 use auxp::activity::{ACTIVITY_SCHEMA_VERSION, Activity, ActivityKind};
 use auxp::replay::{ReplayResult, ReplayStatus};
@@ -585,6 +585,16 @@ impl Messages {
             }
             EventBody::Limits { limits } => Some(self.limits_changed(limits)),
             EventBody::HarnessStatus { harnesses } => Some(self.harness_status(harnesses)),
+            EventBody::NodeStatusChanged { node } => {
+                let message = self.event("node.status_changed", json!({ "node": node }));
+                auxp::validate(&message).ok()?;
+                Some(message)
+            }
+            EventBody::NodeAlertChanged { alert } => {
+                let message = self.event("node.alert", json!({ "alert": alert }));
+                auxp::validate(&message).ok()?;
+                Some(message)
+            }
             EventBody::Session { session } => {
                 if session.state == SessionState::Ended {
                     self.state.sessions.remove(&session.id);
@@ -1125,9 +1135,21 @@ async fn run_loop(
                 .map_err(|e| e.to_string())?,
             Err(e) => return Err(format!("cannot subscribe to agentuxd: {e}")),
         };
+        let mut node_state = NodeState {
+            node_id: messages.config.node_id.clone(),
+            status: NodeOperationalStatus::Ready,
+            capacity: json!({}),
+        };
+        if let Err(error) = client.replace_node_state(&node_state).await {
+            log(&format!("cannot persist node readiness: {error}"));
+        }
         loop {
             tokio::select! {
                 _ = &mut stop => {
+                    node_state.status = NodeOperationalStatus::Draining;
+                    if let Err(error) = client.replace_node_state(&node_state).await {
+                        log(&format!("cannot persist node shutdown state: {error}"));
+                    }
                     let _ = outbox.flush(&sink, messages.replay_enabled()).await;
                     let _ = messages.commit_outbox(&outbox);
                     return Ok(());
@@ -1432,6 +1454,69 @@ mod tests {
         assert_eq!(again.limits_changed(&[])["params"]["sequence"], 3);
         // The token never goes into a message.
         assert!(!hello.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn node_state_and_alert_events_are_relayed_as_typed_auxp_events() {
+        let mut messages = Messages::new(config(), None).unwrap();
+        let status = Event {
+            seq: 41,
+            at: 1_794_000_000_000,
+            run_id: None,
+            body: EventBody::NodeStatusChanged {
+                node: agentux_api::NodeState {
+                    node_id: "node-01".into(),
+                    status: agentux_api::NodeOperationalStatus::Ready,
+                    capacity: json!({"slots": 2}),
+                },
+            },
+        };
+        let status_message = messages.from_event(&status).unwrap();
+        assert_eq!(status_message["method"], "node.status_changed");
+        assert_eq!(status_message["params"]["sequence"], 1);
+        assert_eq!(status_message["params"]["node"]["nodeId"], "node-01");
+        auxp::validate(&status_message).unwrap();
+
+        let alert = agentux_api::NodeAlertState {
+            alert_id: "disk-low".into(),
+            producer: "system-monitor".into(),
+            code: "disk.low".into(),
+            condition_key: "root".into(),
+            summary: "Root filesystem usage is high".into(),
+            first_observed_at: "2026-11-05T12:00:00Z".into(),
+            last_observed_at: "2026-11-05T12:00:00Z".into(),
+            status: agentux_api::NodeAlertStatus::Active,
+        };
+        let state = Event {
+            seq: 42,
+            at: 1_794_000_001_000,
+            run_id: None,
+            body: EventBody::NodeAlertChanged {
+                alert: agentux_api::NodeAlertChange::State {
+                    alert: alert.clone(),
+                },
+            },
+        };
+        let state_message = messages.from_event(&state).unwrap();
+        assert_eq!(state_message["method"], "node.alert");
+        assert_eq!(state_message["params"]["sequence"], 2);
+        assert_eq!(state_message["params"]["alert"]["kind"], "state");
+        auxp::validate(&state_message).unwrap();
+
+        let removed = Event {
+            seq: 43,
+            at: 1_794_000_002_000,
+            run_id: None,
+            body: EventBody::NodeAlertChanged {
+                alert: agentux_api::NodeAlertChange::Removed {
+                    alert_id: alert.alert_id,
+                },
+            },
+        };
+        let removed_message = messages.from_event(&removed).unwrap();
+        assert_eq!(removed_message["params"]["sequence"], 3);
+        assert_eq!(removed_message["params"]["alert"]["kind"], "removed");
+        auxp::validate(&removed_message).unwrap();
     }
 
     #[test]

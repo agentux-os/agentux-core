@@ -8,11 +8,12 @@ enrolled with AgentUX Command. The Cockpit can therefore show the local source
 of truth without requiring a gateway or a Command connection.
 
 The node-alert contract assigns enrolled alert relay and authenticated
-organization/node scoping to the gateway. Runtime implementation remains
-tracked in Core #102.
+organization/node scoping to the gateway. The gateway relay and durable Core
+records are implemented in Core #102; the concrete local alert producer is
+still unselected and no alert inventory is currently reported as complete.
 
-Once implemented, the gateway will relay sequenced Core-owned alert events and
-bind exported state to the authenticated organization and node identity.
+The gateway relays sequenced Core-owned alert events and binds exported state
+to the authenticated organization and node identity.
 Command will project the received state; it will not create, resolve, or
 rewrite Core alert identities or statuses. Command separately derives fleet
 presence (`online`,
