@@ -76,7 +76,12 @@ that belongs to the run; an unbound actor identity is rejected.
   that producer support exists, Core must not publish loop iterations as
   separate tasks.
 - Approval pauses and resumes the existing task; it does not create a task.
-  The producer reports `blocked` while waiting when that state is known.
+  `blocked` is a deliberately generic task status: it means the task is not
+  currently executing, but does not encode whether it awaits approval or a
+  retry. Approval state is obtained from the separate typed approval flow.
+  Consumers must not use free-text `summary` as a control signal or infer the
+  blocked reason. Core may retain the precise local reason for recovery. A
+  machine-readable blocked reason requires a compatible Protocol evolution.
 - `completed`, `failed`, and `cancelled` are terminal for one logical task.
   A terminal task cannot silently restart. A recoverable attempt failure is
   represented as `blocked` while a retry is scheduled, never as task status
@@ -93,10 +98,13 @@ sequence in the same durable transaction as the task state. Recovery replays
 the same event IDs and sequence; it does not re-emit creation with a new ID.
 For every write, Core resolves the run from the persisted run ID. For
 Command-originated runs, it takes `organizationId` and `missionId` from the
-durable `Run.origin` (`RunOrigin`) and verifies them against the authenticated
-gateway enrollment; it ignores organization identity in untrusted event data.
-For local standalone runs, `Run.origin` is absent and the task remains local,
-not eligible for an organization-scoped snapshot.
+durable `Run.origin` (`RunOrigin`). Core compares the origin's
+`organizationId` with the authenticated gateway enrollment and requires each
+activity's `missionId` to match the persisted `RunOrigin.missionId`. The
+enrollment does not supply mission identity. Core ignores organization
+identity in untrusted event data. For local standalone runs, `Run.origin` is
+absent and the task remains local, not eligible for an organization-scoped
+snapshot.
 
 ## Implementation gate
 
