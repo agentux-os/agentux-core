@@ -1738,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn session_plans_and_other_non_tool_events_do_not_become_activity() {
+    fn acp_initial_and_replacement_plans_do_not_become_activity() {
         let mut messages = Messages::new(config(), None).unwrap();
         messages
             .state
@@ -1761,18 +1761,17 @@ mod tests {
                 definition_version: None,
             },
         );
+        let plans: Vec<Value> =
+            serde_json::from_str(include_str!("../tests/fixtures/acp-plan-snapshots.json"))
+                .unwrap();
+        for fixture in plans {
+            let event: Event = serde_json::from_value(fixture).unwrap();
+            assert!(messages.from_event(&event).is_none());
+        }
+        assert_eq!(messages.last_sequence(), 0);
         for (seq, session_event) in [
             (
-                50,
-                SessionEvent::Plan {
-                    items: vec![agentux_api::PlanItem {
-                        text: "PRIVATE plan text".into(),
-                        status: agentux_api::PlanItemStatus::InProgress,
-                    }],
-                },
-            ),
-            (
-                51,
+                52,
                 SessionEvent::Diff {
                     tool_call_id: "tool-9".into(),
                     path: "private.txt".into(),
@@ -1781,14 +1780,14 @@ mod tests {
                 },
             ),
             (
-                52,
+                53,
                 SessionEvent::Message {
                     from: agentux_api::MessageFrom::Agent,
                     text: "PRIVATE response".into(),
                 },
             ),
             (
-                53,
+                54,
                 SessionEvent::Usage {
                     usage: agentux_api::SessionUsage {
                         used_tokens: 1,
@@ -1798,7 +1797,7 @@ mod tests {
                 },
             ),
             (
-                54,
+                55,
                 SessionEvent::Permission {
                     request_id: "request-1".into(),
                 },

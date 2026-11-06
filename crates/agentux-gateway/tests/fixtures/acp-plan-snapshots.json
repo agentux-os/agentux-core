@@ -1,0 +1,31 @@
+[
+  {
+    "seq": 50,
+    "at": 1794000000000,
+    "runId": "local-run",
+    "kind": "session_event",
+    "sessionId": "session-1",
+    "event": {
+      "kind": "plan",
+      "items": [
+        { "text": "PRIVATE initial plan", "status": "in_progress" },
+        { "text": "PRIVATE first step", "status": "pending" }
+      ]
+    }
+  },
+  {
+    "seq": 51,
+    "at": 1794000000001,
+    "runId": "local-run",
+    "kind": "session_event",
+    "sessionId": "session-1",
+    "event": {
+      "kind": "plan",
+      "items": [
+        { "text": "PRIVATE replacement plan", "status": "in_progress" },
+        { "text": "PRIVATE reordered step", "status": "pending" },
+        { "text": "PRIVATE added step", "status": "pending" }
+      ]
+    }
+  }
+]
