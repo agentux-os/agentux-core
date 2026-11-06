@@ -1382,7 +1382,7 @@ impl Tx<'_> {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if existing_revision.is_some_and(|(media_type, byte_length)| {
+        if existing_revision.as_ref().is_some_and(|(media_type, byte_length)| {
             media_type != publication.media_type || byte_length != byte_length_sql
         }) {
             return Err(Error::Data(
