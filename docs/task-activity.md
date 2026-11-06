@@ -49,6 +49,9 @@ allows `attempt` to be omitted in its general activity schema, so Core's task
 ingestion rule is intentionally stricter and rejects task lifecycle events
 without it. Tightening the shared protocol requirement is a separate
 compatibility decision; this proposal does not silently change the schema.
+For runtime-originated events, Core also binds the event's producer, `agentId`,
+`roleId`, and optional `sessionId` to the authenticated local harness/session
+that belongs to the run; an unbound actor identity is rejected.
 
 ## Lifecycle and ownership boundaries
 
@@ -58,9 +61,14 @@ compatibility decision; this proposal does not silently change the schema.
   producer records a recoverable attempt failure as `blocked` while retry is
   pending, with the current attempt number. Starting the next attempt changes
   the status to `running` and increments `attempt`. The task's `failed` status
-  and `task_failed` event are terminal and are emitted only when the producer
-  gives up. Consumers can therefore distinguish retry scheduling from final
-  failure without treating `failed` as both terminal and retryable.
+  is terminal and is represented by exactly one `task_failed` event, emitted
+  only when the producer gives up. A producer must not also emit
+  `task_status_changed` with `status: failed`; that avoids duplicate terminal
+  failure notifications. Success is represented by exactly one
+  `task_completed` event, not a `task_status_changed` with `status: completed`.
+  Cancellation is represented by `task_status_changed` with `status: cancelled`
+  because Protocol #12 has no separate cancellation event. Consumers can
+  therefore distinguish retry scheduling from terminal failure.
 - A loop iteration that represents new work gets a new task ID and may name
   its parent task. The orchestration layer must persist an explicit iteration
   identity before publication; `stepIndex`, attempt count, or event ordering
@@ -70,8 +78,9 @@ compatibility decision; this proposal does not silently change the schema.
 - Approval pauses and resumes the existing task; it does not create a task.
   The producer reports `blocked` while waiting when that state is known.
 - `completed`, `failed`, and `cancelled` are terminal for one logical task.
-  A retry after a non-terminal failed attempt may return the task to `running`
-  with the next attempt number; a terminal task cannot silently restart.
+  A terminal task cannot silently restart. A recoverable attempt failure is
+  represented as `blocked` while a retry is scheduled, never as task status
+  `failed`.
 - Pipeline `gate` and `pull_request` steps are orchestration or artifact work,
   not agent tasks. They do not emit `task_*` events unless a future contract
   explicitly models them as a separate task class.
@@ -82,10 +91,12 @@ compatibility decision; this proposal does not silently change the schema.
 Core records each activity with a stable activity/event ID and its local
 sequence in the same durable transaction as the task state. Recovery replays
 the same event IDs and sequence; it does not re-emit creation with a new ID.
-For every write, Core resolves the run from the persisted run ID and derives
-organization scope from that run's stored origin plus the authenticated
-enrollment context; it ignores organization identity in untrusted event data.
-A local-only run cannot be exported into an organization-scoped task snapshot.
+For every write, Core resolves the run from the persisted run ID. For
+Command-originated runs, it takes `organizationId` and `missionId` from the
+durable `Run.origin` (`RunOrigin`) and verifies them against the authenticated
+gateway enrollment; it ignores organization identity in untrusted event data.
+For local standalone runs, `Run.origin` is absent and the task remains local,
+not eligible for an organization-scoped snapshot.
 
 ## Implementation gate
 
@@ -97,15 +108,17 @@ remain excluded under the [plan snapshot mapping](superpowers/specs/2026-11-06-c
 
 The implementation must add durable task identity, attempt/session/agent
 bindings, and explicit loop iteration IDs for Core-owned agent work, plus a
-validated ingestion path for runtime-owned task events. If a required field or
-event cannot be represented under Protocol #12, the producer must remain
-disabled until an additive, capability-negotiated protocol change is agreed;
-it must not infer a substitute. Tests must cover creation, transitions,
-approvals, recoverable and terminal failure, retry and loop identity, replay
-after restart, source collisions, organization isolation, and complete
-inventory/removal capture before the unavailable marker is removed. Until
-Protocol provides a typed source for runtime-created Tasks, that producer
-remains disabled; Core-owned tasks alone do not establish completeness for
+validated ingestion path for the typed runtime task events already defined by
+Protocol #12. If the producer cannot provide the required task and actor
+bindings, or a required field cannot be represented under Protocol #12, that
+producer must remain disabled until an additive, capability-negotiated
+protocol change is agreed; Core must not infer a substitute. Tests must cover
+creation, transitions, approvals, recoverable and terminal failure, retry and
+loop identity, replay after restart, source collisions, organization
+isolation, and complete inventory/removal capture before the unavailable
+marker is removed. Runtime-created Tasks remain disabled until a runtime emits
+the typed events and Core can ingest, persist, replay, and reconcile their
+complete inventory; Core-owned tasks alone do not establish completeness for
 the combined task inventory.
 
 See [Core #117](https://github.com/agentux-os/agentux-core/issues/117) for the
