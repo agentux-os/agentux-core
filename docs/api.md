@@ -107,6 +107,13 @@ Where the replay ends, the subscription gets one notification of its own, exactl
 
 The intended owners are the artifact lifecycle producer, the typed task lifecycle producer, and the authenticated node gateway for Command lifecycle. The gateway writes safe Command lifecycle states through the local Core API into SQLite, scoped to its enrolled organization and published with the event sequence. It records no request parameters, credentials, or arbitrary operation results. `run.start` stores the stable Command run ID as an operation idempotency key so a retry can recover the Core-deduplicated run; other operations fail closed after an interrupted effect. Confirmed-command results remain in the local pending file until their `command.completed` event is durably committed to the gateway outbox. Command rows remain explicitly `unavailable` in `source_capture` until the lifecycle inventory has a complete restart/reconciliation path. Command-owned runs project their typed pull request as a run-scoped artifact in the same SQLite transaction as the run event; clearing it writes a tombstone. This covers pull requests only, so the artifact family stays `unavailable` until generic artifact lifecycle events have an authoritative producer. A task requires a run whose persisted `RunOrigin` belongs to that organization; an artifact may be organization-owned without a run, but any supplied run link must belong to the same organization. Local-only runs cannot be stored or captured. Command rows may omit `runId`; Protocol #17 requires `commandId`, `organizationId`, `status`, and non-empty `currentState`, while `method` is optional. Command parameters and credentials must never enter projection state.
 
+The proposed artifact owner, publication path, content verification, and
+snapshot gate are documented in [`artifacts.md`](artifacts.md), with its
+[design](superpowers/specs/2026-11-06-core-118-generic-artifacts-design.md)
+and [implementation sequence](superpowers/plans/2026-11-06-core-118-generic-artifacts.md).
+The current store persists projection metadata only; it does not yet store or
+serve generic artifact bytes.
+
 Snapshot capability remains disabled while any required source is unavailable.
 
 The proposed task lifecycle contract is documented in
