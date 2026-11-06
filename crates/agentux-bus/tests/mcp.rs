@@ -243,15 +243,22 @@ async fn artifact_publication_is_hidden_by_default_and_requires_explicit_opt_in(
         .find(|tool| tool.name == "publish_artifact")
         .expect("explicitly enabled artifact tool is listed");
     let schema = serde_json::to_value(publish.input_schema.as_ref()).unwrap();
+    let mut required = schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|field| field.as_str().unwrap())
+        .collect::<Vec<_>>();
+    required.sort_unstable();
     assert_eq!(
-        schema["required"],
-        json!([
+        required,
+        vec![
             "content_text",
             "media_type",
             "name",
             "producer_key",
             "publication_id"
-        ])
+        ]
     );
     assert_eq!(
         schema["properties"]["content_text"]["maxLength"],
