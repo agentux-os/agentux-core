@@ -18,6 +18,9 @@ The publishing path is:
    Core derives the organization, run, session, and role from durable records.
    Harness transcripts, tool output, diffs, and guessed local paths are not
    artifact declarations.
+   The same project opt-in can expose `remove_artifact`; it accepts only the
+   stable artifact ID returned to that session and writes a tombstone under
+   the original producer-session binding.
 2. Core verifies the source is authorized for that persisted run, enforces the
    Protocol limit of 25 MiB per reference, calculates byte length and SHA-256,
    and stores the bytes in a private node-local content store. Core assigns and
@@ -41,12 +44,11 @@ Core-only gates, project-level artifacts, or other producers without an
 agent/role identity stay local until a compatible protocol contract represents
 their true source.
 
-The current storage table contains projection metadata, not artifact bytes.
-The first implementation therefore needs a managed blob store and a typed
-producer API in `agentuxd`; importing files directly from an arbitrary path or
-fetching a producer-supplied HTTPS URL is out of scope. Core must not make
-network requests to arbitrary artifact URLs, which would create an SSRF and
-credential-leak boundary.
+Core now has a private content-addressed blob store and an opt-in session-bound
+AgentUX MCP publisher. The publisher accepts bounded text directly; importing
+from arbitrary host paths or fetching producer-supplied URLs remains out of
+scope. Core must not make network requests to arbitrary artifact URLs, which
+would create an SSRF and credential-leak boundary.
 
 ## Identity, revisions, and ownership
 

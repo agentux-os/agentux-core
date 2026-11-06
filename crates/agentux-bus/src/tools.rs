@@ -34,6 +34,8 @@ Waits a while for the answer; if none comes in time, the result says the questio
     pub const PUBLISH_ARTIFACT: &str = "Publish a text artifact that is an explicit deliverable of your current run. \
 Provide the complete text content directly; filesystem paths, URLs, tool output and partial streams are not accepted. \
 Use a stable producer_key for updates and a new publication_id for each revision. This tool is available only when enabled for the project.";
+
+    pub const REMOVE_ARTIFACT: &str = "Remove an artifact that this active session published. Removal creates a durable tombstone and does not immediately delete retained content. The tool is available only when enabled for the project.";
 }
 
 const MAX_ARTIFACT_BYTES: usize = 25 * 1024 * 1024;
@@ -96,6 +98,35 @@ pub struct ArtifactPublished {
     pub byte_length: u64,
     pub sequence: i64,
     pub created: bool,
+}
+
+/// Remove an artifact published by the current session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RemoveArtifact {
+    /// Stable Core-generated ID returned by `publish_artifact`.
+    pub artifact_id: String,
+}
+
+impl RemoveArtifact {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.artifact_id.trim().is_empty()
+            || self.artifact_id.chars().count() > 128
+            || self.artifact_id.chars().any(char::is_control)
+        {
+            return Err(
+                "artifact_id must be non-empty, bounded and contain no control characters".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactRemoved {
+    pub artifact_id: String,
+    pub sequence: i64,
 }
 
 /// Arguments of `post_message`.
@@ -234,6 +265,7 @@ pub enum BusCall {
     GetRunState,
     AskHuman(AskHuman),
     PublishArtifact(PublishArtifact),
+    RemoveArtifact(RemoveArtifact),
 }
 
 impl BusCall {
@@ -246,6 +278,7 @@ impl BusCall {
             Self::GetRunState => BusTool::GetRunState,
             Self::AskHuman(_) => BusTool::AskHuman,
             Self::PublishArtifact(_) => BusTool::PublishArtifact,
+            Self::RemoveArtifact(_) => BusTool::RemoveArtifact,
         }
     }
 }
@@ -259,4 +292,5 @@ pub enum BusReply {
     RunState(Box<RunStateReply>),
     Human(HumanReply),
     ArtifactPublished(ArtifactPublished),
+    ArtifactRemoved(ArtifactRemoved),
 }

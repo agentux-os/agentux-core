@@ -244,6 +244,14 @@ fn artifact_publication_is_bound_idempotent_and_tombstoned() {
     assert_eq!(old_retry.sequence, first.sequence);
 
     let removed_sequence = store
+        .write(|tx| tx.remove_artifact("org-a", &first.artifact_id, "other-session"))
+        .unwrap_err();
+    assert!(
+        removed_sequence
+            .to_string()
+            .contains("original producer session")
+    );
+    let removed_sequence = store
         .write(|tx| tx.remove_artifact("org-a", &first.artifact_id, "session-a"))
         .unwrap()
         .unwrap();

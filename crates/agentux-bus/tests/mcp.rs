@@ -227,12 +227,12 @@ async fn artifact_publication_is_hidden_by_default_and_requires_explicit_opt_in(
     assert!(
         default_tools
             .iter()
-            .all(|tool| tool.name != "publish_artifact")
+            .all(|tool| tool.name != "publish_artifact" && tool.name != "remove_artifact")
     );
     default_client.cancel().await.unwrap();
 
     let config = BusConfig {
-        allow: vec![BusTool::PublishArtifact],
+        allow: vec![BusTool::PublishArtifact, BusTool::RemoveArtifact],
         ..BusConfig::default()
     };
     let opted_in_bus = bus(config);
@@ -264,5 +264,6 @@ async fn artifact_publication_is_hidden_by_default_and_requires_explicit_opt_in(
         schema["properties"]["content_text"]["maxLength"],
         json!(26214400)
     );
+    assert!(tools.iter().any(|tool| tool.name == "remove_artifact"));
     opted_in_client.cancel().await.unwrap();
 }
