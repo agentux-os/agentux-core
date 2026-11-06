@@ -13,8 +13,9 @@ use crate::bridge::BusEndpoint;
 use crate::prompt::session_prompt;
 use crate::tools::descriptions::*;
 use crate::tools::{
-    ArtifactPublished, AskHuman, BusCall, BusReply, Handoff, HumanReply, Inbox, PostMessage,
-    Posted, PublishArtifact, ReadMessages, RemoveArtifact, RequestReview, RunStateReply,
+    ArtifactPublished, ArtifactRemoved, AskHuman, BusCall, BusReply, Handoff, HumanReply, Inbox,
+    PostMessage, Posted, PublishArtifact, ReadMessages, RemoveArtifact, RequestReview,
+    RunStateReply,
 };
 
 /// Name the server reports, and the name harnesses show its tools under.

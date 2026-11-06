@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use crate::backend::BusBackend;
 use crate::tools::{
     AskHuman, BusCall, BusReply, Handoff, HumanReply, HumanReplyStatus, Inbox, PostMessage, Posted,
-    ReadMessages, RemoveArtifact, RequestReview, RunStateReply, SessionInfo,
+    ReadMessages, RequestReview, RunStateReply, SessionInfo,
 };
 use crate::types::{
     BusEvent, EventKind, HumanQuestion, Message, MessageKind, Participant, RunId, SessionId,
