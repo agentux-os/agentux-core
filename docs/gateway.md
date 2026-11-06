@@ -69,4 +69,6 @@ aux node confirm <commandId>  # run it (within a few seconds)
 aux node reject <commandId>
 ```
 
-Either way a `command.completed` event reports the outcome under the original `commandId`. A command sent again with the same `commandId` gets the first answer.
+The gateway durably records safe lifecycle states (`received`, confirmation or denial, `executing`, and the outcome) in Core SQLite, scoped to the enrolled organization. Projection rows contain no command parameters, credentials, or arbitrary results. `run.start` records its stable Command run ID as an operation idempotency key; after an uncertain outcome, a retry with that same key can recover the existing Core run, while a changed key is rejected. Other advanced commands are not automatically executed again after restart and require local reconciliation. The local pending-confirmation file still contains the parameters needed to execute a command after an operator accepts it; completed results remain there until Core durably commits `command.completed` to its event outbox.
+
+This producer does not make `command` a sourced snapshot family yet. Snapshot capture continues to list it as unavailable until restart recovery can prove the authoritative inventory and preserve completion delivery across a crash.

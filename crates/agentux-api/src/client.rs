@@ -105,6 +105,15 @@ impl Client {
         .await
     }
 
+    /// Records a safe lifecycle transition from the authenticated gateway.
+    pub async fn update_command_projection(
+        &mut self,
+        update: &rpc::CommandProjectionUpdate,
+    ) -> Result<Option<i64>, ClientError> {
+        self.call(rpc::method::COMMAND_PROJECTION_UPDATE, update)
+            .await
+    }
+
     /// Replaces the local node's durable operational state.
     pub async fn replace_node_state(
         &mut self,

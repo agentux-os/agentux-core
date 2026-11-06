@@ -308,6 +308,13 @@ pub struct Held {
     /// `accept` or `reject`, set by `aux node confirm` / `reject`.
     #[serde(default)]
     pub decision: Option<String>,
+    /// A durable claim means a prior gateway process may have started the
+    /// effect. It is retained separately from the human decision.
+    #[serde(default)]
+    pub claimed: bool,
+    /// Safe result awaiting durable insertion into the gateway event outbox.
+    #[serde(default)]
+    pub completion: Option<Value>,
 }
 
 /// Commands waiting for confirmation, in `~/.local/state/agentux/gateway-pending.json`.
@@ -343,8 +350,11 @@ impl Pending {
     /// Holds a command, once per commandId.
     pub fn hold(&self, command_id: &str, method: &str, params: &Value) -> Result<(), String> {
         let mut held = self.list();
-        if held.iter().any(|h| h.command_id == command_id) {
-            return Ok(());
+        if let Some(existing) = held.iter().find(|h| h.command_id == command_id) {
+            if existing.method == method && existing.params == *params {
+                return Ok(());
+            }
+            return Err("commandId was reused with different command content".into());
         }
         held.push(Held {
             command_id: command_id.into(),
@@ -352,6 +362,8 @@ impl Pending {
             params: params.clone(),
             received_at: jiff::Timestamp::now().to_string(),
             decision: None,
+            claimed: false,
+            completion: None,
         });
         self.save(&held)
     }
@@ -363,21 +375,94 @@ impl Pending {
             .iter_mut()
             .find(|h| h.command_id == command_id)
             .ok_or_else(|| format!("no command {command_id} is waiting"))?;
+        if entry.decision.is_some() {
+            return Err(format!(
+                "command {command_id} already has a decision; reconcile its local state"
+            ));
+        }
         entry.decision = Some(if accept { "accept" } else { "reject" }.into());
         let decided = entry.clone();
         self.save(&held)?;
         Ok(decided)
     }
 
-    /// Takes the decided commands out of the list.
+    /// Claims decided commands durably before execution. A claimed non-idempotent
+    /// effect stays blocked after a crash; `run.start` may be retried only with
+    /// its stable mission run ID.
     pub fn take_decided(&self) -> Vec<Held> {
-        let held = self.list();
-        let (decided, waiting): (Vec<Held>, Vec<Held>) =
-            held.into_iter().partition(|h| h.decision.is_some());
-        if !decided.is_empty() {
-            let _ = self.save(&waiting);
+        let mut held = self.list();
+        let mut decided = Vec::new();
+        for item in &mut held {
+            let safe_retry = (item.decision.as_deref() == Some("reject")
+                && item.completion.is_none())
+                || (item.method == "run.start"
+                    && item.completion.is_none()
+                    && item
+                        .params
+                        .get("organizationId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|organization_id| {
+                            operation_idempotency_key(&item.method, &item.params, organization_id)
+                                .is_some()
+                        }));
+            if (!item.claimed || safe_retry)
+                && matches!(item.decision.as_deref(), Some("accept" | "reject"))
+            {
+                item.claimed = true;
+                decided.push(item.clone());
+            }
+        }
+        if decided.is_empty() {
+            return decided;
+        }
+        if self.save(&held).is_err() {
+            return Vec::new();
         }
         decided
+    }
+
+    /// Removes a claimed command after its local outcome has been recorded.
+    pub fn complete(&self, command_id: &str) -> Result<(), String> {
+        let mut held = self.list();
+        held.retain(|item| item.command_id != command_id);
+        self.save(&held)
+    }
+
+    /// Stores the decided command's completion before it is handed to the
+    /// gateway event outbox, so a restart can retry delivery without rerunning
+    /// its effect.
+    pub fn save_completion(&self, command_id: &str, completion: &Value) -> Result<(), String> {
+        let mut held = self.list();
+        let item = held
+            .iter_mut()
+            .find(|item| item.command_id == command_id)
+            .ok_or_else(|| format!("no pending command {command_id}"))?;
+        if !item.claimed {
+            return Err(format!("command {command_id} was not claimed"));
+        }
+        if item
+            .completion
+            .as_ref()
+            .is_some_and(|existing| existing != completion)
+        {
+            return Err(format!(
+                "command {command_id} already has another completion"
+            ));
+        }
+        item.completion = Some(completion.clone());
+        self.save(&held)
+    }
+
+    /// Completions remain available across restarts until the event outbox
+    /// durably commits them and the caller removes the pending entry.
+    pub fn completions(&self) -> Vec<(String, Value)> {
+        self.list()
+            .into_iter()
+            .filter_map(|item| {
+                item.completion
+                    .map(|completion| (item.command_id, completion))
+            })
+            .collect()
     }
 }
 
@@ -397,6 +482,67 @@ pub struct Handled {
 pub enum GatewayCommand {
     Resume { after: i64 },
     Acknowledge { through: i64 },
+}
+
+async fn record_lifecycle(
+    client: &mut Client,
+    organization_id: &str,
+    command_id: &str,
+    method: &str,
+    operation_idempotency_key: Option<&str>,
+    status: agentux_api::rpc::CommandLifecycleStatus,
+    run_id: Option<String>,
+) -> Result<(), Failure> {
+    client
+        .update_command_projection(&rpc::CommandProjectionUpdate {
+            organization_id: organization_id.into(),
+            command_id: command_id.into(),
+            method: method.into(),
+            status,
+            run_id,
+            operation_idempotency_key: operation_idempotency_key.map(str::to_string),
+        })
+        .await
+        .map(|_| ())
+        .map_err(failed)
+}
+
+fn command_owned_run_id(result: &Value, organization_id: &str) -> Option<String> {
+    let run = result.get("run")?;
+    if run
+        .get("origin")
+        .and_then(|origin| origin.get("organizationId"))
+        .and_then(Value::as_str)
+        != Some(organization_id)
+    {
+        return None;
+    }
+    result
+        .get("localRunId")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn operation_idempotency_key(
+    method: &str,
+    params: &Value,
+    organization_id: &str,
+) -> Option<String> {
+    if method != "run.start" {
+        return None;
+    }
+    let origin = origin(params)?;
+    (origin.organization_id == organization_id).then_some(origin.command_run_id)
+}
+
+fn outcome_status(outcome: &Result<Value, Failure>) -> agentux_api::rpc::CommandLifecycleStatus {
+    match outcome {
+        Ok(_) => agentux_api::rpc::CommandLifecycleStatus::Completed,
+        Err((INVALID_PARAMS | DENIED | NOT_IMPLEMENTED, _)) => {
+            agentux_api::rpc::CommandLifecycleStatus::Failed
+        }
+        Err(_) => agentux_api::rpc::CommandLifecycleStatus::Interrupted,
+    }
 }
 
 /// Recent answers by commandId: a command sent again gets the same answer.
@@ -490,6 +636,8 @@ pub async fn handle(
             "provider credentials are not protocol payloads",
         ));
     }
+    let operation_idempotency_key =
+        operation_idempotency_key(method, &params, &node.organization_id);
     if let Some(answer) = answers.get(&command_id) {
         return none(answer.clone());
     }
@@ -526,6 +674,19 @@ pub async fn handle(
             gateway_command: Some(gateway_command),
         };
     }
+    if let Err((code, message)) = record_lifecycle(
+        client,
+        &node.organization_id,
+        &command_id,
+        method,
+        operation_idempotency_key.as_deref(),
+        agentux_api::rpc::CommandLifecycleStatus::Received,
+        None,
+    )
+    .await
+    {
+        return none(error(&id, code, &message));
+    }
     let denied = |reason: &str| {
         Some((
             "command.denied".to_string(),
@@ -533,22 +694,89 @@ pub async fn handle(
         ))
     };
     let handled = match policy.decide(method) {
-        Decision::Deny => Handled {
-            response: error(&id, DENIED, REASON_DENIED_BY_POLICY),
-            event: denied(REASON_DENIED_BY_POLICY),
-            gateway_command: None,
-        },
-        Decision::Confirm => match pending.hold(&command_id, method, &params) {
+        Decision::Deny => match record_lifecycle(
+            client,
+            &node.organization_id,
+            &command_id,
+            method,
+            operation_idempotency_key.as_deref(),
+            agentux_api::rpc::CommandLifecycleStatus::Denied,
+            None,
+        )
+        .await
+        {
             Ok(()) => Handled {
-                response: error(&id, HELD, REASON_AWAITING_CONFIRMATION),
-                event: denied(REASON_AWAITING_CONFIRMATION),
+                response: error(&id, DENIED, REASON_DENIED_BY_POLICY),
+                event: denied(REASON_DENIED_BY_POLICY),
                 gateway_command: None,
             },
-            Err(e) => none(error(&id, FAILED, &format!("cannot hold the command: {e}"))),
-        },
-        Decision::Allow => match execute(client, method, &params).await {
-            Ok(result) => none(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
             Err((code, message)) => none(error(&id, code, &message)),
+        },
+        Decision::Confirm => match record_lifecycle(
+            client,
+            &node.organization_id,
+            &command_id,
+            method,
+            operation_idempotency_key.as_deref(),
+            agentux_api::rpc::CommandLifecycleStatus::AwaitingConfirmation,
+            None,
+        )
+        .await
+        {
+            Ok(()) => match pending.hold(&command_id, method, &params) {
+                Ok(()) => Handled {
+                    response: error(&id, HELD, REASON_AWAITING_CONFIRMATION),
+                    event: denied(REASON_AWAITING_CONFIRMATION),
+                    gateway_command: None,
+                },
+                Err(e) => none(error(&id, FAILED, &format!("cannot hold the command: {e}"))),
+            },
+            Err((code, message)) => none(error(&id, code, &message)),
+        },
+        Decision::Allow => match record_lifecycle(
+            client,
+            &node.organization_id,
+            &command_id,
+            method,
+            operation_idempotency_key.as_deref(),
+            agentux_api::rpc::CommandLifecycleStatus::Executing,
+            None,
+        )
+        .await
+        {
+            Err((code, message)) => none(error(&id, code, &message)),
+            Ok(()) => match execute(client, method, &params).await {
+                Ok(result) => {
+                    let run_id = command_owned_run_id(&result, &node.organization_id);
+                    match record_lifecycle(
+                        client,
+                        &node.organization_id,
+                        &command_id,
+                        method,
+                        operation_idempotency_key.as_deref(),
+                        agentux_api::rpc::CommandLifecycleStatus::Completed,
+                        run_id,
+                    )
+                    .await
+                    {
+                        Ok(()) => none(json!({ "jsonrpc": "2.0", "id": id, "result": result })),
+                        Err((code, message)) => none(error(&id, code, &message)),
+                    }
+                }
+                Err((code, message)) => {
+                    let _ = record_lifecycle(
+                        client,
+                        &node.organization_id,
+                        &command_id,
+                        method,
+                        operation_idempotency_key.as_deref(),
+                        outcome_status(&Err((code, message.clone()))),
+                        None,
+                    )
+                    .await;
+                    none(error(&id, code, &message))
+                }
+            },
         },
     };
     answers.put(&command_id, handled.response.clone());
@@ -557,14 +785,104 @@ pub async fn handle(
 
 /// Runs (or drops) the commands someone decided on; each gives a
 /// `command.completed` event.
-pub async fn run_decided(client: &mut Client, pending: &Pending) -> Vec<(String, Value)> {
-    let mut events = Vec::new();
+pub async fn run_decided(
+    client: &mut Client,
+    pending: &Pending,
+) -> Result<Vec<(String, String, Value)>, String> {
     for held in pending.take_decided() {
         let accepted = held.decision.as_deref() == Some("accept");
+        let mut terminal_status = None;
+        let organization_id = held
+            .params
+            .get("organizationId")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let operation_idempotency_key =
+            operation_idempotency_key(&held.method, &held.params, organization_id);
         let outcome = if accepted {
-            execute(client, &held.method, &held.params).await
+            let confirmed = record_lifecycle(
+                client,
+                organization_id,
+                &held.command_id,
+                &held.method,
+                operation_idempotency_key.as_deref(),
+                agentux_api::rpc::CommandLifecycleStatus::Confirmed,
+                None,
+            )
+            .await;
+            if let Err(confirmation_error) = confirmed {
+                let interrupted = record_lifecycle(
+                    client,
+                    organization_id,
+                    &held.command_id,
+                    &held.method,
+                    operation_idempotency_key.as_deref(),
+                    agentux_api::rpc::CommandLifecycleStatus::Interrupted,
+                    None,
+                )
+                .await;
+                let message = if interrupted.is_ok() {
+                    "command effect may have run; local reconciliation is required".to_string()
+                } else {
+                    confirmation_error.1
+                };
+                Err((FAILED, message))
+            } else {
+                match record_lifecycle(
+                    client,
+                    organization_id,
+                    &held.command_id,
+                    &held.method,
+                    operation_idempotency_key.as_deref(),
+                    agentux_api::rpc::CommandLifecycleStatus::Executing,
+                    None,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        let outcome = execute(client, &held.method, &held.params).await;
+                        terminal_status = Some(outcome_status(&outcome));
+                        outcome
+                    }
+                    Err(error) => Err(error),
+                }
+            }
         } else {
-            Err((DENIED, "rejected at the node".into()))
+            match record_lifecycle(
+                client,
+                organization_id,
+                &held.command_id,
+                &held.method,
+                operation_idempotency_key.as_deref(),
+                agentux_api::rpc::CommandLifecycleStatus::Denied,
+                None,
+            )
+            .await
+            {
+                Ok(()) => {
+                    terminal_status = Some(agentux_api::rpc::CommandLifecycleStatus::Denied);
+                    Err((DENIED, "rejected at the node".into()))
+                }
+                Err(error) => Err(error),
+            }
+        };
+        let run_id = outcome
+            .as_ref()
+            .ok()
+            .and_then(|result| command_owned_run_id(result, organization_id));
+        let lifecycle = if let Some(status) = terminal_status {
+            record_lifecycle(
+                client,
+                organization_id,
+                &held.command_id,
+                &held.method,
+                operation_idempotency_key.as_deref(),
+                status,
+                run_id,
+            )
+            .await
+        } else {
+            Ok(())
         };
         let mut payload = json!({
             "commandId": held.command_id,
@@ -576,9 +894,17 @@ pub async fn run_decided(client: &mut Client, pending: &Pending) -> Vec<(String,
             Ok(result) => payload["result"] = result,
             Err((code, message)) => payload["error"] = json!({ "code": code, "message": message }),
         }
-        events.push(("command.completed".to_string(), payload));
+        if let Err((code, message)) = lifecycle {
+            payload["ok"] = false.into();
+            payload["error"] = json!({ "code": code, "message": message });
+        }
+        pending.save_completion(&held.command_id, &payload)?;
     }
-    events
+    Ok(pending
+        .completions()
+        .into_iter()
+        .map(|(command_id, payload)| (command_id, "command.completed".into(), payload))
+        .collect())
 }
 
 /// The policy file the gateway uses: `/etc/agentux/node-policy.yaml`.
@@ -637,7 +963,19 @@ mod tests {
     }
 
     #[test]
-    fn held_commands_wait_once_and_leave_when_decided() {
+    fn ambiguous_execution_errors_require_reconciliation() {
+        assert_eq!(
+            outcome_status(&Err((FAILED, "connection closed".into()))),
+            agentux_api::rpc::CommandLifecycleStatus::Interrupted
+        );
+        assert_eq!(
+            outcome_status(&Err((INVALID_PARAMS, "invalid input".into()))),
+            agentux_api::rpc::CommandLifecycleStatus::Failed
+        );
+    }
+
+    #[test]
+    fn decided_commands_are_claimed_before_execution_and_removed_after_completion() {
         let dir = tempfile::tempdir().unwrap();
         let pending = Pending::new(dir.path().join("pending.json"));
         pending
@@ -649,11 +987,71 @@ mod tests {
         pending.hold("c2", "preferences.set", &json!({})).unwrap();
         assert_eq!(pending.list().len(), 2);
         assert!(pending.take_decided().is_empty());
-        pending.decide("c2", false).unwrap();
+        pending.decide("c2", true).unwrap();
         assert!(pending.decide("nope", true).is_err());
         let decided = pending.take_decided();
         assert_eq!(decided.len(), 1);
-        assert_eq!(decided[0].decision.as_deref(), Some("reject"));
+        assert_eq!(decided[0].decision.as_deref(), Some("accept"));
+        assert!(decided[0].claimed);
+        assert_eq!(pending.list().len(), 2);
+        assert!(pending.take_decided().is_empty());
+        let restarted = Pending::new(pending.path.clone());
+        assert!(restarted.take_decided().is_empty());
+        pending.complete("c2").unwrap();
+        assert_eq!(pending.take_decided().len(), 0);
         assert_eq!(pending.list().len(), 1);
+    }
+
+    #[test]
+    fn command_completion_is_durable_until_the_outbox_commits_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = Pending::new(dir.path().join("pending.json"));
+        pending
+            .hold(
+                "c1",
+                "run.start",
+                &json!({
+                    "organizationId": "org-a",
+                    "missionId": "mission-a",
+                    "runId": "run-a",
+                    "prompt": "x"
+                }),
+            )
+            .unwrap();
+        pending.decide("c1", true).unwrap();
+        assert_eq!(pending.take_decided().len(), 1);
+        let completion = json!({"commandId": "c1", "ok": true, "result": {"localRunId": "r1"}});
+        pending.save_completion("c1", &completion).unwrap();
+
+        let restarted = Pending::new(pending.path.clone());
+        assert!(restarted.take_decided().is_empty());
+        assert_eq!(restarted.completions(), [("c1".into(), completion)]);
+        restarted.complete("c1").unwrap();
+        assert!(restarted.completions().is_empty());
+    }
+
+    #[test]
+    fn claimed_run_start_can_recover_with_its_stable_mission_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let pending = Pending::new(dir.path().join("pending.json"));
+        pending
+            .hold(
+                "c1",
+                "run.start",
+                &json!({
+                    "organizationId": "org-a",
+                    "missionId": "mission-a",
+                    "runId": "run-a",
+                    "prompt": "x"
+                }),
+            )
+            .unwrap();
+        pending.decide("c1", true).unwrap();
+        assert_eq!(pending.take_decided().len(), 1);
+
+        let restarted = Pending::new(pending.path.clone());
+        let retry = restarted.take_decided();
+        assert_eq!(retry.len(), 1);
+        assert!(retry[0].claimed);
     }
 }

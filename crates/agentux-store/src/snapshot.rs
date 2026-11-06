@@ -81,11 +81,11 @@ pub const fn checkpoint_capability_enabled() -> bool {
 pub fn unavailable_projections() -> Vec<UnavailableProjection> {
     ProjectionKind::ALL.into_iter().filter_map(|kind| {
         let reason = match kind {
-            ProjectionKind::Artifact => Some(
-                "durable storage exists, but the authoritative artifact lifecycle producer is not connected",
-            ),
             ProjectionKind::Command => Some(
                 "durable storage exists, but the authenticated gateway command lifecycle producer is not connected",
+            ),
+            ProjectionKind::Artifact => Some(
+                "typed pull request artifacts are projected, but the generic artifact lifecycle producer is not connected",
             ),
             ProjectionKind::Task => Some(
                 "durable storage exists, but the typed task lifecycle producer is not connected",

@@ -1225,9 +1225,19 @@ fn handle_gateway_out(
     log: &mut impl FnMut(&str),
 ) -> Result<(), String> {
     match out {
-        channel::Out::Event(method, payload) => {
-            outbox.push(messages.custom_event(&method, payload));
-            messages.commit_outbox(outbox)?;
+        channel::Out::Event {
+            method,
+            payload,
+            completion_ack,
+        } => {
+            let result = {
+                outbox.push(messages.custom_event(&method, payload));
+                messages.commit_outbox(outbox)
+            };
+            if let Some((_, acknowledgement)) = completion_ack {
+                let _ = acknowledgement.send(result.clone());
+            }
+            result?;
         }
         channel::Out::Log(line) => log(&line),
         channel::Out::Resume { after, id, reply } => {
@@ -1300,6 +1310,61 @@ mod tests {
         assert_eq!(message["method"], "harness.status");
         assert_eq!(message["params"]["sequence"], 1);
         assert_eq!(message["params"]["harnesses"][0]["id"], "codex");
+    }
+
+    #[test]
+    fn command_completion_acknowledges_only_after_durable_outbox_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("gateway-state.json");
+        let mut messages = Messages::new(config(), Some(state_path.clone())).unwrap();
+        let mut outbox = Outbox::default();
+        let (acknowledge, mut acknowledged) = tokio::sync::oneshot::channel();
+
+        handle_gateway_out(
+            channel::Out::Event {
+                method: "command.completed".into(),
+                payload: json!({"commandId": "c1", "ok": true}),
+                completion_ack: Some(("c1".into(), acknowledge)),
+            },
+            &mut messages,
+            &mut outbox,
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(acknowledged.try_recv().unwrap(), Ok(()));
+        let restored = Messages::new(config(), Some(state_path)).unwrap();
+        assert_eq!(restored.state.pending_outbox.len(), 1);
+        assert_eq!(
+            restored.state.pending_outbox[0]["method"],
+            "command.completed"
+        );
+    }
+
+    #[test]
+    fn command_completion_is_not_acknowledged_when_outbox_commit_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_directory = dir.path().join("file");
+        std::fs::write(&not_a_directory, "x").unwrap();
+        let mut messages = Messages::new(config(), None).unwrap();
+        messages.state_path = Some(not_a_directory.join("state.json"));
+        let mut outbox = Outbox::default();
+        let (acknowledge, mut acknowledged) = tokio::sync::oneshot::channel();
+
+        assert!(
+            handle_gateway_out(
+                channel::Out::Event {
+                    method: "command.completed".into(),
+                    payload: json!({"commandId": "c1", "ok": true}),
+                    completion_ack: Some(("c1".into(), acknowledge)),
+                },
+                &mut messages,
+                &mut outbox,
+                &mut |_| {},
+            )
+            .is_err()
+        );
+        assert!(acknowledged.try_recv().unwrap().is_err());
     }
 
     #[test]

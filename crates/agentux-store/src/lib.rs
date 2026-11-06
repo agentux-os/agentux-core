@@ -1140,6 +1140,255 @@ impl Tx<'_> {
         Ok(sequence)
     }
 
+    fn sync_command_pull_request_artifact(&mut self, record: &RunRecord) -> Result<()> {
+        let Some(origin) = record.run.origin.as_ref() else {
+            return Ok(());
+        };
+        let organization_id = &origin.organization_id;
+        let existing_ids = {
+            let mut stmt = self.tx.prepare(
+                "SELECT projection_id FROM snapshot_business_projections
+                 WHERE projection_type = 'artifact' AND organization_id = ?1
+                   AND run_id = ?2 AND removed_sequence IS NULL",
+            )?;
+            let rows = stmt.query_map(params![organization_id, record.run.id], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let next_id = record
+            .run
+            .pull_request
+            .as_ref()
+            .map(|pull_request| format!("pr-{}-{}", record.run.id, pull_request.number));
+
+        for id in existing_ids {
+            if Some(id.as_str()) != next_id.as_deref() {
+                self.remove_business_projection(
+                    SnapshotProjectionType::Artifact,
+                    &id,
+                    organization_id,
+                )?;
+            }
+        }
+
+        let (Some(pull_request), Some(id)) = (record.run.pull_request.as_ref(), next_id) else {
+            return Ok(());
+        };
+        let url = url::Url::parse(pull_request.url.trim()).map_err(|_| {
+            Error::Data("pull request artifact URL must be a safe HTTPS URL".into())
+        })?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.as_str().len() > 2048
+        {
+            return Err(Error::Data(
+                "pull request artifact URL must be a safe HTTPS URL".into(),
+            ));
+        }
+        let current_state = serde_json::json!({
+            "artifactId": id,
+            "organizationId": organization_id,
+            "runId": record.run.id,
+            "kind": "pull_request",
+            "status": "available",
+            "name": format!("Pull request #{}", pull_request.number),
+            "uri": url.as_str(),
+            "number": pull_request.number,
+        });
+        let state = serde_json::json!({
+            "artifactId": id,
+            "organizationId": organization_id,
+            "runId": record.run.id,
+            "status": "available",
+            "currentState": current_state,
+        });
+        self.upsert_business_projection(&snapshot::BusinessProjection {
+            projection_type: SnapshotProjectionType::Artifact,
+            id,
+            organization_id: organization_id.clone(),
+            run_id: Some(record.run.id.clone()),
+            state,
+        })?;
+        Ok(())
+    }
+
+    /// Applies a safe lifecycle transition from the trusted node gateway.
+    /// Parameters and arbitrary operation results cannot enter this record.
+    pub fn update_command_projection(
+        &mut self,
+        update: &agentux_api::rpc::CommandProjectionUpdate,
+    ) -> Result<Option<i64>> {
+        use agentux_api::rpc::CommandLifecycleStatus as Status;
+
+        if update.organization_id.trim().is_empty()
+            || update.command_id.trim().is_empty()
+            || update.method.trim().is_empty()
+            || update.method.len() > 128
+            || !update
+                .method
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        {
+            return Err(Error::Data(
+                "command organization, ID, and a valid method are required".into(),
+            ));
+        }
+        if update
+            .operation_idempotency_key
+            .as_deref()
+            .is_some_and(|key| {
+                update.method != "run.start"
+                    || key.trim().is_empty()
+                    || key.len() > 128
+                    || !key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            })
+        {
+            return Err(Error::Data(
+                "operation idempotency keys are only valid for run.start and must be safe IDs"
+                    .into(),
+            ));
+        }
+
+        let existing: Option<(String, String, Option<String>)> = self
+            .tx
+            .query_row(
+                "SELECT current_state, organization_id, run_id
+                 FROM snapshot_business_projections
+                 WHERE projection_type = 'command' AND projection_id = ?1
+                   AND organization_id = ?2 AND current_state IS NOT NULL",
+                params![update.command_id, update.organization_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let mut effective_run_id = update.run_id.clone();
+        if let Some((state, owner, old_run_id)) = existing {
+            if owner != update.organization_id {
+                return Err(Error::Data("command projection owner mismatch".into()));
+            }
+            let previous: serde_json::Value = from_json(&state)?;
+            if previous.get("method").and_then(serde_json::Value::as_str)
+                != Some(update.method.as_str())
+            {
+                return Err(Error::Data(
+                    "command ID was reused for another method".into(),
+                ));
+            }
+            let old_idempotency_key = previous
+                .get("operationIdempotencyKey")
+                .and_then(serde_json::Value::as_str);
+            if old_idempotency_key != update.operation_idempotency_key.as_deref() {
+                return Err(Error::Data(
+                    "command operation idempotency key cannot change".into(),
+                ));
+            }
+            let old_status = previous
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            let safe_run_start_retry = update.method == "run.start"
+                && update.status == Status::Executing
+                && old_idempotency_key.is_some()
+                && old_idempotency_key == update.operation_idempotency_key.as_deref()
+                && matches!(old_status, "interrupted" | "completed");
+            if old_run_id.is_some() && old_run_id != update.run_id {
+                if update.run_id.is_none() && safe_run_start_retry {
+                    effective_run_id = old_run_id.clone();
+                } else {
+                    return Err(Error::Data("command run association cannot change".into()));
+                }
+            }
+            // Replaying a locally accepted decision must be idempotent. Preserve
+            // its advanced state while run_decided retries the safe run.start.
+            if update.status == Status::Confirmed
+                && update.method == "run.start"
+                && old_idempotency_key.is_some()
+                && matches!(old_status, "executing" | "interrupted" | "completed")
+            {
+                return Ok(None);
+            }
+            // A redelivered request starts its local policy path again, but
+            // must not reset or replay any already advanced durable state.
+            if update.status == Status::Received {
+                return Ok(None);
+            }
+            if old_status == update.status.as_str() {
+                if update.status == Status::Executing {
+                    if update.method == "run.start" && old_idempotency_key.is_some() {
+                        return Ok(None);
+                    }
+                    return Err(Error::Data(
+                        "command may already be executing; local reconciliation is required".into(),
+                    ));
+                }
+                if previous.get("runId").and_then(serde_json::Value::as_str)
+                    == update.run_id.as_deref()
+                {
+                    return Ok(None);
+                }
+            } else {
+                let allowed = matches!(
+                    (old_status, update.status),
+                    (
+                        "received",
+                        Status::AwaitingConfirmation
+                            | Status::Denied
+                            | Status::Executing
+                            | Status::Failed
+                    ) | ("awaiting_confirmation", Status::Confirmed | Status::Denied)
+                        | ("confirmed", Status::Executing | Status::Denied)
+                        | (
+                            "executing",
+                            Status::Completed | Status::Failed | Status::Interrupted
+                        )
+                        | ("interrupted", Status::ReconciliationRequired)
+                );
+                let recoverable_run_start = matches!(old_status, "interrupted" | "completed")
+                    && update.status == Status::Executing
+                    && update.method == "run.start"
+                    && old_idempotency_key.is_some();
+                if !allowed && !recoverable_run_start {
+                    return Err(Error::Data(format!(
+                        "invalid command lifecycle transition: {old_status} -> {}; local reconciliation is required",
+                        update.status.as_str()
+                    )));
+                }
+            }
+        } else if update.status != Status::Received {
+            return Err(Error::Data(
+                "a command lifecycle must begin in received state".into(),
+            ));
+        }
+
+        let status = update.status.as_str();
+        let mut state = serde_json::json!({
+            "commandId": update.command_id,
+            "organizationId": update.organization_id,
+            "method": update.method,
+            "status": status,
+            "currentState": { "status": status },
+        });
+        if let Some(run_id) = &effective_run_id {
+            state["runId"] = run_id.clone().into();
+        }
+        if let Some(key) = &update.operation_idempotency_key {
+            state["operationIdempotencyKey"] = key.clone().into();
+            state["currentState"]["operationIdempotencyKey"] = key.clone().into();
+        }
+        let projection = snapshot::BusinessProjection {
+            projection_type: SnapshotProjectionType::Command,
+            id: update.command_id.clone(),
+            organization_id: update.organization_id.clone(),
+            run_id: effective_run_id,
+            state,
+        };
+        self.upsert_business_projection(&projection).map(Some)
+    }
+
     /// Marks a projection removed without losing its organization, identity,
     /// run association, or sequence attribution. Wrong-owner and repeated
     /// removals are no-ops and cannot disclose another organization's row.
@@ -1256,7 +1505,33 @@ impl Tx<'_> {
             EventBody::Run {
                 run: record.run.clone(),
             },
-        )
+        )?;
+        self.sync_command_pull_request_artifact(record)
+    }
+
+    /// Returns the existing Command-owned run for a retry, or inserts it.
+    /// The lookup and insert share this write transaction so concurrent
+    /// retries cannot create two runs for the same organization/run pair.
+    pub fn insert_command_run(&mut self, record: &RunRecord) -> Result<(RunRecord, bool)> {
+        let origin = record.run.origin.as_ref().ok_or_else(|| {
+            Error::Data("a Command-owned run requires an organization run origin".into())
+        })?;
+        if let Some(existing) = self.command_run(&origin.organization_id, &origin.command_run_id)? {
+            let same_request = existing.run.project_id == record.run.project_id
+                && existing.run.title == record.run.title
+                && existing.run.prompt == record.run.prompt
+                && existing.run.roles == record.run.roles
+                && existing.run.models == record.run.models
+                && existing.run.origin == record.run.origin;
+            if !same_request {
+                return Err(Error::Data(
+                    "command run ID was reused with different run parameters".into(),
+                ));
+            }
+            return Ok((existing, false));
+        }
+        self.insert_run(record)?;
+        Ok((record.clone(), true))
     }
 
     /// Writes `record` back, bumping `updated_at`, and emits a run event.
@@ -1281,7 +1556,8 @@ impl Tx<'_> {
             EventBody::Run {
                 run: record.run.clone(),
             },
-        )
+        )?;
+        self.sync_command_pull_request_artifact(record)
     }
 
     pub fn run(&self, id: &str) -> Result<Option<RunRecord>> {
@@ -1289,6 +1565,25 @@ impl Tx<'_> {
             .tx
             .prepare(&format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1"))?;
         let mut rows = stmt.query([id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(run_from_row(row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Finds a Command-owned run by its stable organization-scoped run ID.
+    pub fn command_run(
+        &self,
+        organization_id: &str,
+        command_run_id: &str,
+    ) -> Result<Option<RunRecord>> {
+        let mut stmt = self.tx.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs
+             WHERE json_extract(origin, '$.organizationId') = ?1
+               AND json_extract(origin, '$.commandRunId') = ?2
+             ORDER BY started_at, id LIMIT 1"
+        ))?;
+        let mut rows = stmt.query(params![organization_id, command_run_id])?;
         match rows.next()? {
             Some(row) => Ok(Some(run_from_row(row)?)),
             None => Ok(None),

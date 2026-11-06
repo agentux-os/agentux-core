@@ -856,12 +856,19 @@ impl Engine {
             config_yaml: yaml,
             base_commit: None,
         };
-        self.inner.store.write(|tx| {
+        let (started, created) = self.inner.store.write(|tx| {
             record.run.id = tx.unused_id(Table::Runs)?;
-            tx.insert_run(&record)
+            if record.run.origin.is_some() {
+                tx.insert_command_run(&record)
+            } else {
+                tx.insert_run(&record)?;
+                Ok((record.clone(), true))
+            }
         })?;
-        self.spawn(&record.run.id);
-        Ok(record.run)
+        if created {
+            self.spawn(&started.run.id);
+        }
+        Ok(started.run)
     }
 
     pub fn runs(&self, project_id: Option<&str>) -> Result<Vec<Run>> {

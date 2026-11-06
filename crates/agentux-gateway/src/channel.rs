@@ -26,7 +26,13 @@ use crate::policy::Policy;
 /// What the command connection reports to the gateway's main loop.
 pub enum Out {
     /// An event to send to Command: method and payload.
-    Event(String, Value),
+    Event {
+        method: String,
+        payload: Value,
+        /// Present for command completions; the worker removes the durable
+        /// pending result only after Core has committed it to the event outbox.
+        completion_ack: Option<(String, oneshot::Sender<Result<(), String>>)>,
+    },
     Log(String),
     Resume {
         after: i64,
@@ -185,7 +191,11 @@ pub async fn command_loop(
                         break format!("write error: {e}");
                     }
                     if let Some((method, payload)) = handled.event {
-                        let _ = out.send(Out::Event(method, payload));
+                        let _ = out.send(Out::Event {
+                            method,
+                            payload,
+                            completion_ack: None,
+                        });
                     }
                 }
             }
@@ -235,8 +245,27 @@ async fn worker(
                 let _ = done.send(handled);
             }
             _ = decided.tick() => {
-                for (method, payload) in commands::run_decided(&mut client, &pending).await {
-                    let _ = out.send(Out::Event(method, payload));
+                match commands::run_decided(&mut client, &pending).await {
+                    Ok(completions) => for (command_id, method, payload) in completions {
+                        let (acknowledge, acknowledged) = oneshot::channel();
+                        if out.send(Out::Event {
+                            method,
+                            payload,
+                            completion_ack: Some((command_id.clone(), acknowledge)),
+                        }).is_ok()
+                            && matches!(acknowledged.await, Ok(Ok(())))
+                            && let Err(error) = pending.complete(&command_id)
+                        {
+                            let _ = out.send(Out::Log(format!(
+                                "cannot clear delivered command {command_id}: {error}"
+                            )));
+                        }
+                    },
+                    Err(error) => {
+                        let _ = out.send(Out::Log(format!(
+                            "cannot persist a decided command completion: {error}"
+                        )));
+                    }
                 }
             }
         }

@@ -276,6 +276,15 @@ async fn handle(engine: &Engine, method: &str, params: Value) -> Result<Value, r
                     .map_err(Error::from),
             )
         }
+        method::COMMAND_PROJECTION_UPDATE => {
+            let update: rpc::CommandProjectionUpdate = parse(params)?;
+            to_value(
+                engine
+                    .store()
+                    .write(|tx| tx.update_command_projection(&update))
+                    .map_err(Error::from),
+            )
+        }
         method::NODE_STATE_REPLACE => {
             let params: rpc::NodeStateReplace = parse(params)?;
             to_value(
