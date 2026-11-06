@@ -1194,6 +1194,8 @@ impl Tx<'_> {
                 "verified artifact content metadata is invalid".into(),
             ));
         }
+        let byte_length_sql = i64::try_from(content.byte_length)
+            .map_err(|_| Error::Data("artifact byte length exceeds SQLite integer range".into()))?;
 
         let ownership: Option<(Option<String>, String, String, Option<i64>)> = self
             .tx
@@ -1234,12 +1236,12 @@ impl Tx<'_> {
             params![publication.organization_id, publication.run_id, publication.producer_id, publication.producer_key, publication.publication_id],
             |row| Ok((
                 row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
-                row.get::<_, u64>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
+                row.get::<_, i64>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?,
             )),
         ).optional()? {
             let (artifact_id, revision, sequence, byte_length, media_type, name, session_id, stored_agent_id, stored_role_id) = existing;
-            if revision != content.sha256 || byte_length != content.byte_length
+            if revision != content.sha256 || byte_length != byte_length_sql
                 || media_type != publication.media_type || name != publication.name
                 || session_id != publication.session_id
             {
@@ -1260,7 +1262,7 @@ impl Tx<'_> {
             ));
         }
 
-        let active: Option<(String, Option<String>, Option<u64>, i64, String, String, String)> = self
+        let active: Option<(String, Option<String>, Option<i64>, i64, String, String, String)> = self
             .tx
             .query_row(
                 "SELECT artifact_id, current_revision, byte_length, updated_sequence, name, media_type, session_id FROM artifacts
@@ -1321,7 +1323,7 @@ impl Tx<'_> {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0, 0, NULL)",
                 params![publication.organization_id, artifact_id, publication.run_id, publication.producer_id,
                     publication.producer_key, publication.session_id, agent_id, role_id, publication.name,
-                    publication.media_type, content.sha256, content.byte_length],
+                    publication.media_type, content.sha256, byte_length_sql],
             )?;
         }
         let changed = old_revision.as_deref() != Some(content.sha256.as_str())
@@ -1339,7 +1341,7 @@ impl Tx<'_> {
                 ],
             )?;
         }
-        let existing_revision: Option<(String, u64)> = self
+        let existing_revision: Option<(String, i64)> = self
             .tx
             .query_row(
                 "SELECT media_type, byte_length FROM artifact_revisions
@@ -1349,7 +1351,7 @@ impl Tx<'_> {
             )
             .optional()?;
         if existing_revision.is_some_and(|(media_type, byte_length)| {
-            media_type != publication.media_type || byte_length != content.byte_length
+            media_type != publication.media_type || byte_length != byte_length_sql
         }) {
             return Err(Error::Data(
                 "artifact revision metadata does not match its immutable content identity".into(),
@@ -1359,7 +1361,7 @@ impl Tx<'_> {
             "INSERT OR IGNORE INTO artifact_revisions (organization_id, artifact_id, revision, media_type,
              byte_length, created_at_ms, retain_until_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![publication.organization_id, artifact_id, content.sha256, publication.media_type,
-                content.byte_length, created_at, created_at.saturating_add(artifact::MIN_RETENTION_MS)],
+                byte_length_sql, created_at, created_at.saturating_add(artifact::MIN_RETENTION_MS)],
         )?;
 
         let sequence = if changed {
@@ -1394,7 +1396,7 @@ impl Tx<'_> {
                  created_sequence = CASE WHEN created_sequence = 0 THEN ?10 ELSE created_sequence END
                  WHERE organization_id = ?1 AND artifact_id = ?2",
                 params![publication.organization_id, artifact_id, publication.session_id, agent_id, role_id,
-                    publication.name, publication.media_type, content.sha256, content.byte_length, sequence],
+                    publication.name, publication.media_type, content.sha256, byte_length_sql, sequence],
             )?;
             let state = serde_json::json!({
                 "artifactId": artifact_id,
@@ -1426,7 +1428,7 @@ impl Tx<'_> {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![publication.organization_id, publication.run_id, publication.producer_id,
                 publication.producer_key, publication.publication_id, artifact_id, content.sha256, sequence,
-                content.byte_length, publication.media_type, publication.name, publication.session_id,
+                byte_length_sql, publication.media_type, publication.name, publication.session_id,
                 agent_id, role_id],
         )?;
         Ok(artifact::PublishedArtifact {
@@ -1456,7 +1458,7 @@ impl Tx<'_> {
         artifact_id: &str,
         session_id: &str,
     ) -> Result<Option<i64>> {
-        let artifact: Option<(String, String, String, String, String, String, String, String, Option<String>, Option<u64>, Option<i64>)> = self.tx.query_row(
+        let artifact: Option<(String, String, String, String, String, String, String, String, Option<String>, Option<i64>, Option<i64>)> = self.tx.query_row(
             "SELECT run_id, session_id, agent_id, role_id, name, producer_id, producer_key, media_type, current_revision, byte_length, removed_sequence
              FROM artifacts WHERE organization_id = ?1 AND artifact_id = ?2",
             params![organization_id, artifact_id],
@@ -1505,8 +1507,10 @@ impl Tx<'_> {
         }
         let revision =
             revision.ok_or_else(|| Error::Data("live artifact has no current revision".into()))?;
-        let byte_length =
-            byte_length.ok_or_else(|| Error::Data("live artifact has no byte length".into()))?;
+        let byte_length = u64::try_from(
+            byte_length.ok_or_else(|| Error::Data("live artifact has no byte length".into()))?,
+        )
+        .map_err(|_| Error::Data("artifact byte length is negative".into()))?;
         let activity = ArtifactActivity {
             activity_id: format!("artifact-{}", new_id()),
             mission_id: origin.mission_id,
