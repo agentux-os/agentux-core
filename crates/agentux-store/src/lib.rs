@@ -1039,8 +1039,17 @@ impl Tx<'_> {
             });
         }
         let mut business_projections = self.business_projections(organization_id)?;
+        let generic_artifact_ids = {
+            let mut stmt = self.tx.prepare(
+                "SELECT artifact_id FROM artifacts
+                 WHERE organization_id = ?1 AND removed_sequence IS NULL",
+            )?;
+            let rows = stmt.query_map([organization_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<std::collections::HashSet<_>>>()?
+        };
         for projection in &mut business_projections {
             if projection.projection_type != SnapshotProjectionType::Artifact
+                || !generic_artifact_ids.contains(&projection.id)
                 || projection.state.is_none()
             {
                 continue;
