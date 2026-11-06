@@ -137,9 +137,10 @@ fn command_lifecycle_projection_is_safe_scoped_and_transitioned() {
     let update = |status| agentux_api::rpc::CommandProjectionUpdate {
         organization_id: "org-a".into(),
         command_id: "cmd-1".into(),
-        method: "run.start".into(),
+        method: "bus.post".into(),
         status,
         run_id: None,
+        operation_idempotency_key: None,
     };
     let received = update(agentux_api::rpc::CommandLifecycleStatus::Received);
     assert_eq!(
@@ -184,7 +185,7 @@ fn command_lifecycle_projection_is_safe_scoped_and_transitioned() {
         .unwrap();
     let state = command.state.as_ref().unwrap();
     assert_eq!(state["status"], "completed");
-    assert_eq!(state["method"], "run.start");
+    assert_eq!(state["method"], "bus.post");
     assert!(state.get("params").is_none());
     assert!(state.get("providerToken").is_none());
 
@@ -195,6 +196,91 @@ fn command_lifecycle_projection_is_safe_scoped_and_transitioned() {
             .is_err()
     );
     assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), 3);
+}
+
+#[test]
+fn command_run_start_replay_requires_the_same_core_deduplication_key() {
+    use agentux_api::rpc::CommandLifecycleStatus as Status;
+
+    let store = Store::open_in_memory().unwrap();
+    let update = |status, key: &str| agentux_api::rpc::CommandProjectionUpdate {
+        organization_id: "org-a".into(),
+        command_id: "cmd-run-start".into(),
+        method: "run.start".into(),
+        status,
+        run_id: None,
+        operation_idempotency_key: Some(key.into()),
+    };
+    store
+        .write(|tx| tx.update_command_projection(&update(Status::Received, "mission-run-a")))
+        .unwrap();
+    store
+        .write(|tx| tx.update_command_projection(&update(Status::Executing, "mission-run-a")))
+        .unwrap();
+    store
+        .write(|tx| tx.update_command_projection(&update(Status::Interrupted, "mission-run-a")))
+        .unwrap();
+    assert_eq!(
+        store
+            .write(|tx| tx.update_command_projection(&update(Status::Executing, "mission-run-a")))
+            .unwrap(),
+        Some(4)
+    );
+    let sequence = store.read(|tx| tx.last_event_seq()).unwrap();
+
+    assert_eq!(
+        store
+            .write(|tx| tx.update_command_projection(&update(Status::Executing, "mission-run-a")))
+            .unwrap(),
+        None
+    );
+    assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), sequence);
+    store
+        .write(|tx| tx.update_command_projection(&update(Status::Completed, "mission-run-a")))
+        .unwrap();
+    assert!(
+        store
+            .write(|tx| tx.update_command_projection(&update(Status::Executing, "mission-run-a")))
+            .unwrap()
+            .is_some()
+    );
+    let final_sequence = store.read(|tx| tx.last_event_seq()).unwrap();
+    assert!(
+        store
+            .write(|tx| tx.update_command_projection(&update(Status::Executing, "mission-run-b")))
+            .is_err()
+    );
+    assert_eq!(
+        store.read(|tx| tx.last_event_seq()).unwrap(),
+        final_sequence
+    );
+}
+
+#[test]
+fn claimed_run_start_can_resume_from_pending_confirmation() {
+    use agentux_api::rpc::CommandLifecycleStatus as Status;
+
+    let store = Store::open_in_memory().unwrap();
+    let update = |status| agentux_api::rpc::CommandProjectionUpdate {
+        organization_id: "org-a".into(),
+        command_id: "cmd-confirmed-start".into(),
+        method: "run.start".into(),
+        status,
+        run_id: None,
+        operation_idempotency_key: Some("mission-run-a".into()),
+    };
+    store
+        .write(|tx| tx.update_command_projection(&update(Status::Received)))
+        .unwrap();
+    store
+        .write(|tx| tx.update_command_projection(&update(Status::AwaitingConfirmation)))
+        .unwrap();
+    assert!(
+        store
+            .write(|tx| tx.update_command_projection(&update(Status::Executing)))
+            .unwrap()
+            .is_some()
+    );
 }
 
 fn harness_info(id: &str, installed: bool) -> agentux_api::rpc::HarnessInfo {
@@ -853,7 +939,7 @@ fn command_owned_pull_request_is_projected_and_removed_with_run_state() {
     });
     record.run.pull_request = Some(PullRequest {
         number: 42,
-        url: "https://github.com/acme/app/pull/42".into(),
+        url: "https://forge.example:8443/acme/app/pull/42".into(),
     });
 
     store.write(|tx| tx.insert_run(&record)).unwrap();
@@ -872,7 +958,7 @@ fn command_owned_pull_request_is_projected_and_removed_with_run_state() {
     assert_eq!(state["currentState"]["kind"], "pull_request");
     assert_eq!(
         state["currentState"]["uri"],
-        "https://github.com/acme/app/pull/42"
+        "https://forge.example:8443/acme/app/pull/42"
     );
     assert_eq!(state["currentState"]["number"], 42);
 
@@ -888,6 +974,30 @@ fn command_owned_pull_request_is_projected_and_removed_with_run_state() {
         .unwrap();
     assert!(artifact.state.is_none());
     assert!(artifact.removed_at_sequence.is_some());
+}
+
+#[test]
+fn malformed_pull_request_url_rolls_back_the_run_and_events() {
+    let store = Store::open_in_memory().unwrap();
+    let project = store
+        .write(|tx| tx.register_project("app", "/src/invalid-artifact-app"))
+        .unwrap();
+    let mut record = sample_run(&project.id);
+    record.run.origin = Some(agentux_api::RunOrigin {
+        organization_id: "org-a".into(),
+        mission_id: "mission-a".into(),
+        command_run_id: "command-run-a".into(),
+        definition_version: None,
+    });
+    record.run.pull_request = Some(PullRequest {
+        number: 42,
+        url: "https://[not-ip]/pull/42".into(),
+    });
+    let before = store.read(|tx| tx.last_event_seq()).unwrap();
+
+    assert!(store.write(|tx| tx.insert_run(&record)).is_err());
+    assert!(store.read(|tx| tx.run(&record.run.id)).unwrap().is_none());
+    assert_eq!(store.read(|tx| tx.last_event_seq()).unwrap(), before);
 }
 
 #[test]

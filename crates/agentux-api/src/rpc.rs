@@ -353,6 +353,10 @@ pub struct CommandProjectionUpdate {
     pub status: CommandLifecycleStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// Stable Command run ID for the Core-deduplicated `run.start` operation.
+    /// Other handlers must not claim operation-level replay safety.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

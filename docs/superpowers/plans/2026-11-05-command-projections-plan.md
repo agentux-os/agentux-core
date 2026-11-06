@@ -25,7 +25,8 @@
 - Persist received and policy decision states before acknowledging held/denied commands.
 - Persist executing before allowed effects and completed/failed after the outcome.
 - Recover unfinished records as interrupted; never automatically replay non-idempotent operations.
-- Add operation-specific deduplication only for handlers with Core-owned atomic persistence; preserve the existing wire response for a repeated completed command.
+- Add operation-specific deduplication only for handlers with Core-owned atomic persistence; allow `run.start` recovery only with the persisted matching mission run ID, and preserve the existing wire response for a repeated completed command.
+- Retain local confirmation results until `command.completed` is committed to the durable gateway outbox; only then remove the pending record.
 - Add tests for duplicate delivery, restart before/after execution, held decision recovery, and uncertain-effect reconciliation.
 
 ### Task 4: Documentation and review

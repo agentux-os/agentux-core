@@ -920,16 +920,14 @@ impl Tx<'_> {
         let (Some(pull_request), Some(id)) = (record.run.pull_request.as_ref(), next_id) else {
             return Ok(());
         };
-        let url = pull_request.url.trim();
-        let host = url
-            .strip_prefix("https://")
-            .and_then(|rest| rest.split(['/', '?', '#']).next())
-            .unwrap_or_default();
-        if host.is_empty()
-            || host.contains('@')
-            || host.contains(':')
-            || url.chars().any(char::is_control)
-            || url.chars().any(char::is_whitespace)
+        let url = url::Url::parse(pull_request.url.trim()).map_err(|_| {
+            Error::Data("pull request artifact URL must be a safe HTTPS URL".into())
+        })?;
+        if url.scheme() != "https"
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.as_str().len() > 2048
         {
             return Err(Error::Data(
                 "pull request artifact URL must be a safe HTTPS URL".into(),
@@ -942,7 +940,7 @@ impl Tx<'_> {
             "kind": "pull_request",
             "status": "available",
             "name": format!("Pull request #{}", pull_request.number),
-            "uri": url,
+            "uri": url.as_str(),
             "number": pull_request.number,
         });
         let state = serde_json::json!({
@@ -983,6 +981,23 @@ impl Tx<'_> {
                 "command organization, ID, and a valid method are required".into(),
             ));
         }
+        if update
+            .operation_idempotency_key
+            .as_deref()
+            .is_some_and(|key| {
+                update.method != "run.start"
+                    || key.trim().is_empty()
+                    || key.len() > 128
+                    || !key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+            })
+        {
+            return Err(Error::Data(
+                "operation idempotency keys are only valid for run.start and must be safe IDs"
+                    .into(),
+            ));
+        }
 
         let existing: Option<(String, String, Option<String>)> = self
             .tx
@@ -1010,6 +1025,14 @@ impl Tx<'_> {
             if old_run_id.is_some() && old_run_id != update.run_id {
                 return Err(Error::Data("command run association cannot change".into()));
             }
+            let old_idempotency_key = previous
+                .get("operationIdempotencyKey")
+                .and_then(serde_json::Value::as_str);
+            if old_idempotency_key != update.operation_idempotency_key.as_deref() {
+                return Err(Error::Data(
+                    "command operation idempotency key cannot change".into(),
+                ));
+            }
             let old_status = previous
                 .get("status")
                 .and_then(serde_json::Value::as_str)
@@ -1021,6 +1044,9 @@ impl Tx<'_> {
             }
             if old_status == update.status.as_str() {
                 if update.status == Status::Executing {
+                    if update.method == "run.start" && old_idempotency_key.is_some() {
+                        return Ok(None);
+                    }
                     return Err(Error::Data(
                         "command may already be executing; local reconciliation is required".into(),
                     ));
@@ -1047,7 +1073,13 @@ impl Tx<'_> {
                         )
                         | ("interrupted", Status::ReconciliationRequired)
                 );
-                if !allowed {
+                let recoverable_run_start = matches!(
+                    old_status,
+                    "interrupted" | "awaiting_confirmation" | "completed"
+                ) && update.status == Status::Executing
+                    && update.method == "run.start"
+                    && old_idempotency_key.is_some();
+                if !allowed && !recoverable_run_start {
                     return Err(Error::Data(format!(
                         "invalid command lifecycle transition: {old_status} -> {}; local reconciliation is required",
                         update.status.as_str()
@@ -1070,6 +1102,10 @@ impl Tx<'_> {
         });
         if let Some(run_id) = &update.run_id {
             state["runId"] = run_id.clone().into();
+        }
+        if let Some(key) = &update.operation_idempotency_key {
+            state["operationIdempotencyKey"] = key.clone().into();
+            state["currentState"]["operationIdempotencyKey"] = key.clone().into();
         }
         let projection = snapshot::BusinessProjection {
             projection_type: SnapshotProjectionType::Command,
