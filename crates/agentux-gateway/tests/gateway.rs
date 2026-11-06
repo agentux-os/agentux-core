@@ -320,6 +320,8 @@ async fn commands_run_wait_for_the_node_or_are_refused() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].1, "command.completed");
     assert_eq!(events[0].2["ok"], false);
+    assert_eq!(pending.completions()[0].0, "c5");
+    pending.complete("c5").unwrap();
     assert!(pending.list().is_empty());
     assert!(engine.runs(None).unwrap().is_empty());
     let capture = engine
