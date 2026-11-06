@@ -109,6 +109,11 @@ The intended owners are the artifact lifecycle producer, the typed task lifecycl
 
 Snapshot capability remains disabled while any required source is unavailable.
 
+The proposed task lifecycle contract is documented in
+[`task-activity.md`](task-activity.md). Task projection remains unavailable
+until each enabled producer has a complete durable inventory and recovery
+path; the current pipeline step records alone do not satisfy that gate.
+
 | `kind` | Payload | When |
 |---|---|---|
 | `project` | `project: Project` | A project was registered |
