@@ -796,6 +796,20 @@ impl Bus {
             BusCall::Handoff(args) => BusReply::Posted(self.handoff(caller, args)?),
             BusCall::GetRunState => BusReply::RunState(Box::new(self.get_run_state(caller).await?)),
             BusCall::AskHuman(args) => BusReply::Human(self.ask_human(caller, args).await?),
+            BusCall::PublishArtifact(args) => {
+                args.validate()
+                    .map_err(|reason| BusError::Invalid { reason })?;
+                let identity = self.lock().authorize(caller, BusTool::PublishArtifact)?.0;
+                let published = self
+                    .inner
+                    .backend
+                    .publish_artifact(identity, args)
+                    .await
+                    .map_err(|error| BusError::Backend {
+                        reason: error.to_string(),
+                    })?;
+                BusReply::ArtifactPublished(published)
+            }
         })
     }
 

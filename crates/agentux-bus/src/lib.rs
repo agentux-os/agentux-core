@@ -33,8 +33,9 @@ pub use bus::{
 pub use prompt::{description, session_prompt};
 pub use server::{BusServer, SERVER_NAME};
 pub use tools::{
-    AskHuman, BusCall, BusReply, Handoff, HumanReply, HumanReplyStatus, Inbox, PostMessage, Posted,
-    ReadMessages, RequestReview, RunStateReply, SessionInfo, descriptions,
+    ArtifactPublished, AskHuman, BusCall, BusReply, Handoff, HumanReply, HumanReplyStatus, Inbox,
+    PostMessage, Posted, PublishArtifact, ReadMessages, RequestReview, RunStateReply, SessionInfo,
+    descriptions,
 };
 pub use types::{
     BusEvent, EventKind, HumanQuestion, Message, MessageKind, Participant, RunId, SessionId,

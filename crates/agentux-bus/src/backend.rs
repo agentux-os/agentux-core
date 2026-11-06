@@ -12,7 +12,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, oneshot};
 
-use crate::types::{HumanQuestion, RunId};
+use crate::tools::{ArtifactPublished, PublishArtifact};
+use crate::types::{HumanQuestion, RunId, SessionIdentity};
 
 /// A boxed, sendable future, as returned by [`BusBackend`] methods.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -27,6 +28,13 @@ pub trait BusBackend: Send + Sync + 'static {
     /// It may take hours; the bus stops waiting after its configured time and
     /// delivers a late answer to the asker's mailbox.
     fn ask_human(&self, question: HumanQuestion) -> BoxFuture<Result<String, BackendError>>;
+
+    /// Persists a session-scoped explicit artifact publication in Core.
+    fn publish_artifact(
+        &self,
+        identity: SessionIdentity,
+        publication: PublishArtifact,
+    ) -> BoxFuture<Result<ArtifactPublished, BackendError>>;
 }
 
 /// The part of a run's state the workflow engine reports to agents.
@@ -144,6 +152,18 @@ impl BusBackend for MemoryBackend {
         Box::pin(async move {
             rx.await
                 .map_err(|_| BackendError("the question was withdrawn".into()))
+        })
+    }
+
+    fn publish_artifact(
+        &self,
+        _identity: SessionIdentity,
+        _publication: PublishArtifact,
+    ) -> BoxFuture<Result<ArtifactPublished, BackendError>> {
+        Box::pin(async {
+            Err(BackendError(
+                "artifact publication requires agentuxd".into(),
+            ))
         })
     }
 }

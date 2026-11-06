@@ -693,6 +693,27 @@ impl BusBackend for DaemonBackend {
                 .map_err(|_| BackendError("the question was withdrawn".into()))
         })
     }
+
+    fn publish_artifact(
+        &self,
+        identity: SessionIdentity,
+        declaration: agentux_bus::PublishArtifact,
+    ) -> agentux_bus::BoxFuture<Result<agentux_bus::ArtifactPublished, BackendError>> {
+        let published = self.engine().and_then(|engine| {
+            engine
+                .publish_agent_artifact(&identity, declaration)
+                .map(|artifact| agentux_bus::ArtifactPublished {
+                    artifact_id: artifact.artifact_id,
+                    revision: artifact.revision,
+                    media_type: artifact.media_type,
+                    byte_length: artifact.byte_length,
+                    sequence: artifact.sequence,
+                    created: artifact.created,
+                })
+                .map_err(|error| BackendError(error.to_string()))
+        });
+        Box::pin(async move { published })
+    }
 }
 
 /// Stores the run's bus events and acts on its wakes, until the bus closes.

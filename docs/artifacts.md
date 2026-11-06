@@ -5,18 +5,19 @@
 ## Decision
 
 Core owns the node's artifact registry, durable lifecycle, and content bytes for
-generic run artifacts. A producer must explicitly publish an artifact through
-a trusted Core-owned producer interface. There is no generic artifact
-producer in the current harness or gateway, so the current typed pull-request
-projection remains a partial source and `artifact` stays unavailable in
+generic run artifacts. The AgentUX bus has an opt-in `publish_artifact` MCP
+tool for bounded text deliverables. The current typed pull-request projection
+remains a separate partial source and `artifact` stays unavailable in
 `snapshots.source_capture`.
 
 The publishing path is:
 
-1. A Core-controlled producer receives an explicit artifact output from a run
-   step and supplies a bounded byte stream plus a producer-scoped logical key,
-   display name, and media type to the Core artifact registry. Harness text,
-   tool output, diffs, and guessed local paths are not artifact declarations.
+1. A session may call `publish_artifact` only when the project explicitly lists
+   it in `bus.allow`. It supplies a complete bounded text deliverable, a
+   producer-scoped logical key, publication ID, display name, and media type.
+   Core derives the organization, run, session, and role from durable records.
+   Harness transcripts, tool output, diffs, and guessed local paths are not
+   artifact declarations.
 2. Core verifies the source is authorized for that persisted run, enforces the
    Protocol limit of 25 MiB per reference, calculates byte length and SHA-256,
    and stores the bytes in a private node-local content store. Core assigns and
@@ -82,10 +83,12 @@ host paths, raw tool input/output, credentials, or unbounded logs. Downloads
 are served only after node and organization authorization; the response never
 reveals a host filesystem path. Clients verify byte length and SHA-256 after
 retrieval and handle content as an attachment unless a separately reviewed
-safe renderer exists. A node-level storage quota and retention policy must be
-configured before publication is enabled. At quota, Core rejects publication
-with a clear error; it does not silently evict live artifacts to admit new
-content.
+safe renderer exists. A hard 1 GiB node-level revision quota currently bounds
+publication. It is conservative and not operator-configurable yet. At quota,
+Core rejects publication without silently evicting retained artifacts.
+Because garbage collection is not implemented, operators should treat opt-in
+publication as experimental until configurable quotas and retention-aware
+collection land.
 
 ## Atomic lifecycle and recovery
 

@@ -278,6 +278,45 @@ impl Engine {
             .map_err(Into::into)
     }
 
+    /// Publish an artifact declared by the session-scoped AgentUX MCP tool.
+    /// Run, organization and role are resolved from durable Core records; the
+    /// producer cannot choose them in its tool arguments.
+    pub(crate) fn publish_agent_artifact(
+        &self,
+        identity: &agentux_bus::SessionIdentity,
+        declaration: agentux_bus::PublishArtifact,
+    ) -> Result<agentux_store::artifact::PublishedArtifact> {
+        declaration.validate().map_err(Error::InvalidParams)?;
+        let (record, session) = self.inner.store.read(|tx| {
+            let record = tx.run(&identity.run.0)?.ok_or_else(|| {
+                agentux_store::Error::Data("artifact run no longer exists".into())
+            })?;
+            let session = tx.session(&identity.session.0)?.ok_or_else(|| {
+                agentux_store::Error::Data("artifact session no longer exists".into())
+            })?;
+            Ok::<_, agentux_store::Error>((record, session))
+        })?;
+        if session.run_id != identity.run.0 || session.role != identity.role {
+            return Err(Error::Unauthorized(
+                "artifact session identity does not match the persisted run role".into(),
+            ));
+        }
+        let origin = record.run.origin.ok_or_else(|| {
+            Error::InvalidParams("generic artifacts require a Command-owned run".into())
+        })?;
+        let publication = agentux_store::artifact::Publication {
+            organization_id: origin.organization_id,
+            run_id: identity.run.0.clone(),
+            session_id: identity.session.0.clone(),
+            producer_id: "agentux-bus".into(),
+            producer_key: declaration.producer_key,
+            publication_id: declaration.publication_id,
+            name: declaration.name,
+            media_type: declaration.media_type,
+        };
+        self.publish_artifact(&publication, declaration.content_text.as_bytes())
+    }
+
     /// Remove an artifact through its original producer session.
     pub fn remove_artifact(
         &self,

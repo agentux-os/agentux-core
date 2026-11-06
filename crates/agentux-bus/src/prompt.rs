@@ -17,6 +17,7 @@ fn summary(tool: BusTool) -> &'static str {
         BusTool::Handoff => "pass the task to another role with a summary and pointers",
         BusTool::GetRunState => "see the run's step, branch, checks, sessions and open questions",
         BusTool::AskHuman => "escalate a decision you cannot take to the human",
+        BusTool::PublishArtifact => "publish an explicitly declared text deliverable for this run",
     }
 }
 
@@ -29,6 +30,7 @@ pub fn description(tool: BusTool) -> &'static str {
         BusTool::Handoff => descriptions::HANDOFF,
         BusTool::GetRunState => descriptions::GET_RUN_STATE,
         BusTool::AskHuman => descriptions::ASK_HUMAN,
+        BusTool::PublishArtifact => descriptions::PUBLISH_ARTIFACT,
     }
 }
 

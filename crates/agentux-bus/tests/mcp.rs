@@ -218,3 +218,42 @@ async fn refusals_are_tool_errors_and_disallowed_tools_are_hidden() {
     client.cancel().await.unwrap();
     rev.cancel().await.unwrap();
 }
+
+#[tokio::test]
+async fn artifact_publication_is_hidden_by_default_and_requires_explicit_opt_in() {
+    let default_bus = bus(BusConfig::default());
+    let default_client = connect(&default_bus, "impl").await;
+    let default_tools = default_client.list_all_tools().await.unwrap();
+    assert!(
+        default_tools
+            .iter()
+            .all(|tool| tool.name != "publish_artifact")
+    );
+    default_client.cancel().await.unwrap();
+
+    let mut config = BusConfig::default();
+    config.allow = vec![BusTool::PublishArtifact];
+    let opted_in_bus = bus(config);
+    let opted_in_client = connect(&opted_in_bus, "impl").await;
+    let tools = opted_in_client.list_all_tools().await.unwrap();
+    let publish = tools
+        .iter()
+        .find(|tool| tool.name == "publish_artifact")
+        .expect("explicitly enabled artifact tool is listed");
+    let schema = serde_json::to_value(publish.input_schema.as_ref()).unwrap();
+    assert_eq!(
+        schema["required"],
+        json!([
+            "content_text",
+            "media_type",
+            "name",
+            "producer_key",
+            "publication_id"
+        ])
+    );
+    assert_eq!(
+        schema["properties"]["content_text"]["maxLength"],
+        json!(26214400)
+    );
+    opted_in_client.cancel().await.unwrap();
+}

@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 pub const MAX_ARTIFACT_BYTES: u64 = 25 * 1024 * 1024;
+/// Conservative node-wide cap until operators can configure quotas and GC.
+pub const MAX_TOTAL_ARTIFACT_BYTES: i64 = 1024 * 1024 * 1024;
 pub const MIN_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
 /// A digest and size produced only after Core's private store verifies and

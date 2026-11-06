@@ -1389,6 +1389,19 @@ impl Tx<'_> {
                 "artifact revision metadata does not match its immutable content identity".into(),
             ));
         }
+        if existing_revision.is_none() {
+            let stored_bytes: i64 = self.tx.query_row(
+                "SELECT COALESCE(SUM(byte_length), 0) FROM artifact_revisions",
+                [],
+                |row| row.get(0),
+            )?;
+            if stored_bytes.saturating_add(byte_length_sql) > artifact::MAX_TOTAL_ARTIFACT_BYTES {
+                return Err(Error::Data(format!(
+                    "node artifact storage quota of {} bytes is exhausted",
+                    artifact::MAX_TOTAL_ARTIFACT_BYTES
+                )));
+            }
+        }
         self.tx.execute(
             "INSERT OR IGNORE INTO artifact_revisions (organization_id, artifact_id, revision, media_type,
              byte_length, created_at_ms, retain_until_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
