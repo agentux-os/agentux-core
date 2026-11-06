@@ -36,6 +36,11 @@ Node status and harness inventory changes are first persisted by Core with a loc
 
 `execution.activity.v1` is offered in `node.hello` and used only when Command returns it in `acceptedCapabilities`. The current Core emits `tool_started`, `tool_completed` and `tool_failed` when the ACP adapter reports the corresponding status. It does not infer task trees, delegation, progress percentages or artifacts from provider-specific data. `node.event_replay.v1` is negotiated the same way.
 
+Core's proposed task ownership, identity, retry, and snapshot completeness rules
+are documented in [task-activity.md](task-activity.md). No task events are
+emitted until the authoritative producer and durable recovery path are
+implemented.
+
 The node-alert contract assigns enrolled alert relay and authenticated organization/node scoping to the gateway. The relay is implemented; selecting and connecting a concrete local alert producer remains tracked in Core #102. See the [node alert contract](node-alerts.md). The gateway does not derive alerts from heartbeat or harness polling; Command derives fleet presence separately.
 
 ## Commands from Command
