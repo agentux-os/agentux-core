@@ -30,10 +30,15 @@ The publishing path is:
 Protocol #12 requires `missionId`, `runId`, `agentId`, and `roleId` on this
 activity. The producer must therefore be bound to the actual run session and
 role; Core validates this association and never fabricates an agent identity.
-The initial remote publisher is limited to agent-originated artifacts with
-that verified attribution. Outputs from Core-only gates, project-level
-artifacts, or other producers without an agent/role identity stay local until
-a compatible protocol contract represents their true source.
+For Core-owned work, `agentId` comes from the durable Core actor assignment
+bound to the run role, following the identity rule in
+[`task-activity.md`](task-activity.md); a runtime actor ID is accepted only
+when Core binds it to the authenticated producer/session and role. If that
+mapping is absent, publication fails closed. The initial remote publisher is
+limited to agent-originated artifacts with verified attribution. Outputs from
+Core-only gates, project-level artifacts, or other producers without an
+agent/role identity stay local until a compatible protocol contract represents
+their true source.
 
 The current storage table contains projection metadata, not artifact bytes.
 The first implementation therefore needs a managed blob store and a typed
@@ -50,7 +55,11 @@ same producer key updates that logical artifact; it does not derive identity
 from a filename, path, display name, or digest. Each published content version
 is immutable and addressed internally by its verified SHA-256 digest. The
 current projection points to the latest version and stores its safe name,
-media type, byte length, and URI.
+media type, byte length, and URI. Every content URI identifies one exact
+revision, for example `artifact://<nodeId>/<artifactId>/<sha256>`; no URI means
+"latest". Dereference requires both the logical artifact ID and the digest.
+This keeps old activity events and replay references bound to the bytes they
+originally described.
 
 Every remote artifact must belong to a persisted Command-originated run. Core
 derives `organizationId` and `missionId` from `Run.origin` and verifies the
@@ -85,10 +94,17 @@ content.
   bytes.
 - **Update:** Keep the same `artifactId`; write a new immutable content
   version, then atomically update the current projection and sequence. Retain
-  older versions while a replay or snapshot could still reference them.
+  older versions while a replay or snapshot could still reference them. The
+  new URI contains the new digest, while the old URI continues to identify the
+  previous bytes until its retention expires.
 - **Remove:** Write a projection tombstone with the exact local event sequence
   in the same SQLite transaction. Do not silently delete the record or blob.
   Garbage collection follows the agreed replay/snapshot retention window.
+- **Republish after removal:** A producer key may be published again only as a
+  new artifact incarnation with a new `artifactId`. Core retains the mapping
+  from producer key to incarnation and never reuses a tombstoned ID. Old
+  replayed events therefore cannot make the new incarnation appear removed or
+  resurrect the old one.
 - **Retry and restart:** The producer supplies a stable publication
   idempotency key. A retry returns the recorded result for the same key and
   content digest; reuse with different content is rejected. Startup recovery
@@ -104,14 +120,32 @@ tracked in [Protocol #20](https://github.com/agentux-os/agentux-protocol/issues/
 Until that work lands, `artifact://` remains a local registry identifier and
 is not a promise that a remote client can fetch content.
 
+For snapshot recovery, Core and Command must additionally validate a complete
+artifact `currentState` containing `artifactId`, `organizationId`, `runId`,
+`revision` (the verified SHA-256), `mediaType`, `byteLength`, and the exact
+revision URI. Protocol #17's generic artifact projection schema does not
+currently require these content fields, so its permissive schema is not, by
+itself, sufficient evidence that a checkpoint can restore artifact state.
+Protocol #20 must define this stricter profile or a compatible schema
+extension; Core rejects incomplete artifact entries before materialization.
+
 ## Completeness gate
 
+Core maintains an authoritative producer registry from its enabled
+artifact-publisher manifest. Each registered producer has a stable source ID,
+manifest generation, and reconciliation cursor. At startup, Core compares the
+enabled manifest with its persisted registry; `source_capture` reports
+`artifact` unavailable if any enabled producer is missing, if a producer has
+not reconciled through the captured event head, or if a source was removed
+without a final inventory/tombstone pass. Producer retirement remains in the
+registry until its tombstones have passed the replay/snapshot retention window.
+
 `artifact` remains explicitly `unavailable` in `snapshots.source_capture`
-until Core can prove a complete inventory for all enabled artifact producers,
-including owner/run binding, byte availability, updates, removal tombstones,
-replay after restart, and organization isolation. A database with no artifact
-rows is not evidence that the source is complete. Command-owned pull requests
-remain valid typed artifacts but do not make the generic producer complete.
+until this registry proves a complete inventory, including owner/run binding,
+byte availability, updates, removal tombstones, replay after restart, and
+organization isolation. A database with no artifact rows is not evidence
+that the source is complete. Command-owned pull requests remain valid typed
+projections but do not make the generic producer complete.
 
 Implementation coverage must include bounded and oversized content, digest
 verification, duplicate publication, update and removal, orphan cleanup,

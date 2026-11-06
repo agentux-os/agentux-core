@@ -55,7 +55,9 @@ Protocol #20.
 - [ ] Stage, flush, hash, verify, and atomically promote content-addressed
   blobs; apply private filesystem permissions.
 - [ ] Store stable artifact identity, source key, revision, digest, media type,
-  byte length, and current projection state.
+  byte length, immutable revision URI, and current projection state.
+- [ ] Persist the enabled producer manifest and per-source reconciliation
+  cursor; retain retired source/tombstone records through the recovery window.
 - [ ] Recover staged/orphan blobs and detect missing or corrupt live objects.
 - [ ] Test size bounds, content mismatch, duplicate publication, and crash
   recovery.
@@ -75,6 +77,8 @@ Protocol #20.
   digest verification, and no host-path exposure.
 - [ ] Bind removals to tombstones and exact event sequence; retain them for the
   protocol replay/snapshot recovery window.
+- [ ] Reject incomplete checkpoint artifact state even if generic Protocol
+  schema fields are optional; require the exact content revision metadata.
 - [ ] Verify run/organization isolation, local-only exclusion, and complete
   inventory capture at one SQLite event head.
 - [ ] Remove the artifact unavailable marker only after every source passes

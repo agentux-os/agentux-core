@@ -58,15 +58,21 @@ quota. At quota, publication fails visibly; Core does not evict live objects.
 The quota and retention defaults must be selected before the producer is
 enabled.
 
-Updates retain `artifactId` and point to a new immutable content version.
-Removal writes a same-transaction tombstone and sequence. Idempotency keys
-make a repeated publication recover the recorded result and reject changed
-content for the same key. Older versions remain available through replay and
-snapshot retention.
+Updates retain `artifactId` and point to a new immutable content version; each
+URI identifies the exact SHA-256 revision, never a moving "latest" alias.
+Removal writes a same-transaction tombstone and sequence. Republishing the
+same producer key after removal creates a new `artifactId` incarnation;
+tombstoned IDs are never reused. Idempotency keys make a repeated publication
+recover the recorded result and reject changed content for the same key.
+Older versions remain dereferenceable through replay and snapshot retention.
 
 For enrolled runs, Core derives organization and mission ownership from the
 persisted `RunOrigin`; it verifies the organization against the authenticated
 gateway enrollment and checks every activity's mission against the origin.
+The mandatory `agentId` comes from the durable Core actor assignment bound to
+the run role, as defined by the task activity contract; a runtime ID must be
+bound to the authenticated producer/session. Missing actor mappings block
+publication instead of causing Core to invent an identity.
 Standalone local artifacts may remain local, but cannot enter an
 organization-scoped snapshot. Organization-owned artifacts without a run
 require a separate authenticated producer and are not covered by this run
@@ -78,6 +84,19 @@ Protocol #20 owns that contract. Until it and the Core retrieval path are
 implemented, a remote event must not claim that `artifact://` is downloadable,
 and the generic artifact snapshot family remains unavailable. Protocol #17
 provides the checkpoint path for projection tombstones after replay expiry.
+Because the generic checkpoint schema does not currently require content
+metadata for artifacts, Core and Command must validate an artifact checkpoint
+entry's `revision` (SHA-256), `mediaType`, `byteLength`, and exact revision URI
+in addition to its ID and organization. Protocol #20 must formalize this
+profile before checkpoint recovery can establish artifact completeness.
+
+Core's enabled publisher manifest is the authoritative inventory of artifact
+sources. A persisted registry records each stable producer ID, manifest
+generation, and reconciliation cursor. Capture remains unavailable when the
+configured and persisted manifests differ, a producer has not reconciled
+through the captured event head, or a source is retired without a final
+tombstone pass. A retired source remains in the registry through tombstone
+retention.
 
 ## Alternatives
 
@@ -96,6 +115,10 @@ provides the checkpoint path for projection tombstones after replay expiry.
 
 - Enforce the Protocol 25 MiB per-reference limit; reject oversize before
   committing metadata.
+- Bind every content URI to an immutable digest and retain that version for
+  all active replay/snapshot references.
+- Require checkpoint artifacts to contain the complete content revision
+  metadata even if a permissive generic schema would accept less.
 - Never store host paths, credentials, raw prompts, tool input/output, or
   unbounded logs in projection state or protocol references.
 - Require authenticated node and organization authorization before retrieval;
@@ -106,6 +129,8 @@ provides the checkpoint path for projection tombstones after replay expiry.
   over a live metadata row with missing bytes.
 - Keep the artifact family unavailable until all producer inventories,
   update/removal recovery, and organization boundaries are complete.
+- Define producer registry reconciliation and non-reuse of tombstoned artifact
+  IDs so source completeness and replay cannot be inferred from an empty table.
 
 ## Consequences
 
