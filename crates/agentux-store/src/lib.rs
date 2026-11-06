@@ -1385,7 +1385,7 @@ impl Tx<'_> {
         if existing_revision
             .as_ref()
             .is_some_and(|(media_type, byte_length)| {
-                media_type != publication.media_type || byte_length != byte_length_sql
+                media_type != &publication.media_type || *byte_length != byte_length_sql
             })
         {
             return Err(Error::Data(
