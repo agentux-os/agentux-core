@@ -280,7 +280,8 @@ fn minimal_file_gets_defaults() {
     ))
     .unwrap();
     assert_eq!(config.bus, Bus::default());
-    assert_eq!(config.bus.allow, BusTool::ALL);
+    assert_eq!(config.bus.allow, Bus::default().allow);
+    assert!(!config.bus.allow.contains(&BusTool::PublishArtifact));
     assert_eq!(config.budget.max_usd_per_run, None);
     assert_eq!(
         config.pipeline,
