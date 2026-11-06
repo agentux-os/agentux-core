@@ -85,7 +85,7 @@ pub fn unavailable_projections() -> Vec<UnavailableProjection> {
                 "durable storage exists, but the authenticated gateway command lifecycle producer is not connected",
             ),
             ProjectionKind::Artifact => Some(
-                "typed pull request artifacts are projected, but the generic artifact lifecycle producer is not connected",
+                "generic artifact retrieval and producer inventory reconciliation are incomplete",
             ),
             ProjectionKind::Task => Some(
                 "durable storage exists, but the typed task lifecycle producer is not connected",

@@ -714,6 +714,23 @@ impl BusBackend for DaemonBackend {
         });
         Box::pin(async move { published })
     }
+
+    fn remove_artifact(
+        &self,
+        identity: SessionIdentity,
+        removal: agentux_bus::RemoveArtifact,
+    ) -> agentux_bus::BoxFuture<Result<agentux_bus::ArtifactRemoved, BackendError>> {
+        let removed = self.engine().and_then(|engine| {
+            engine
+                .remove_agent_artifact(&identity, removal.clone())
+                .map(|sequence| agentux_bus::ArtifactRemoved {
+                    artifact_id: removal.artifact_id,
+                    sequence,
+                })
+                .map_err(|error| BackendError(error.to_string()))
+        });
+        Box::pin(async move { removed })
+    }
 }
 
 /// Stores the run's bus events and acts on its wakes, until the bus closes.

@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use crate::backend::BusBackend;
 use crate::tools::{
     AskHuman, BusCall, BusReply, Handoff, HumanReply, HumanReplyStatus, Inbox, PostMessage, Posted,
-    ReadMessages, RequestReview, RunStateReply, SessionInfo,
+    ReadMessages, RemoveArtifact, RequestReview, RunStateReply, SessionInfo,
 };
 use crate::types::{
     BusEvent, EventKind, HumanQuestion, Message, MessageKind, Participant, RunId, SessionId,
@@ -809,6 +809,20 @@ impl Bus {
                         reason: error.to_string(),
                     })?;
                 BusReply::ArtifactPublished(published)
+            }
+            BusCall::RemoveArtifact(args) => {
+                args.validate()
+                    .map_err(|reason| BusError::Invalid { reason })?;
+                let identity = self.lock().authorize(caller, BusTool::RemoveArtifact)?.0;
+                let removed = self
+                    .inner
+                    .backend
+                    .remove_artifact(identity, args)
+                    .await
+                    .map_err(|error| BusError::Backend {
+                        reason: error.to_string(),
+                    })?;
+                BusReply::ArtifactRemoved(removed)
             }
         })
     }

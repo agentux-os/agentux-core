@@ -12,7 +12,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, oneshot};
 
-use crate::tools::{ArtifactPublished, PublishArtifact};
+use crate::tools::{ArtifactPublished, ArtifactRemoved, PublishArtifact, RemoveArtifact};
 use crate::types::{HumanQuestion, RunId, SessionIdentity};
 
 /// A boxed, sendable future, as returned by [`BusBackend`] methods.
@@ -35,6 +35,13 @@ pub trait BusBackend: Send + Sync + 'static {
         identity: SessionIdentity,
         publication: PublishArtifact,
     ) -> BoxFuture<Result<ArtifactPublished, BackendError>>;
+
+    /// Remove a run artifact under the publishing session's identity.
+    fn remove_artifact(
+        &self,
+        identity: SessionIdentity,
+        removal: RemoveArtifact,
+    ) -> BoxFuture<Result<ArtifactRemoved, BackendError>>;
 }
 
 /// The part of a run's state the workflow engine reports to agents.
@@ -165,5 +172,13 @@ impl BusBackend for MemoryBackend {
                 "artifact publication requires agentuxd".into(),
             ))
         })
+    }
+
+    fn remove_artifact(
+        &self,
+        _identity: SessionIdentity,
+        _removal: RemoveArtifact,
+    ) -> BoxFuture<Result<ArtifactRemoved, BackendError>> {
+        Box::pin(async { Err(BackendError("artifact removal requires agentuxd".into())) })
     }
 }

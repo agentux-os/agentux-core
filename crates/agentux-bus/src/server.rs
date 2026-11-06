@@ -14,7 +14,7 @@ use crate::prompt::session_prompt;
 use crate::tools::descriptions::*;
 use crate::tools::{
     ArtifactPublished, AskHuman, BusCall, BusReply, Handoff, HumanReply, Inbox, PostMessage,
-    Posted, PublishArtifact, ReadMessages, RequestReview, RunStateReply,
+    Posted, PublishArtifact, ReadMessages, RemoveArtifact, RequestReview, RunStateReply,
 };
 
 /// Name the server reports, and the name harnesses show its tools under.
@@ -121,6 +121,17 @@ impl BusServer {
     ) -> ToolResult<ArtifactPublished> {
         match self.call(BusCall::PublishArtifact(args)).await? {
             BusReply::ArtifactPublished(published) => Ok(Json(published)),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    #[tool(name = "remove_artifact", description = REMOVE_ARTIFACT)]
+    async fn remove_artifact(
+        &self,
+        Parameters(args): Parameters<RemoveArtifact>,
+    ) -> ToolResult<ArtifactRemoved> {
+        match self.call(BusCall::RemoveArtifact(args)).await? {
+            BusReply::ArtifactRemoved(removed) => Ok(Json(removed)),
             other => Err(unexpected(&other)),
         }
     }

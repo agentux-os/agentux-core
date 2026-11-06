@@ -46,17 +46,17 @@ is limited to agent-originated outputs because Protocol #12 requires
 `agentId` and `roleId`; Core does not fabricate those identities for gates or
 system processes.
 
-The Core API accepts bytes through a typed publisher interface, not an
-arbitrary host path, URI, or caller-asserted digest. Content is staged and
+The Core API accepts bytes through a typed, opt-in AgentUX MCP publisher, not
+an arbitrary host path, URI, or caller-asserted digest. Content is staged and
 verified before its immutable blob is promoted. SQLite commits the current
 artifact projection and local event sequence only after the blob is durable.
-Orphan staged blobs can be collected; a live projection must never reference a
+Orphan cleanup remains outstanding; a live projection must never reference a
 missing or digest-mismatched object.
 
-Publication is bounded per artifact and by a configured node-level storage
-quota. At quota, publication fails visibly; Core does not evict live objects.
-The quota and retention defaults must be selected before the producer is
-enabled.
+Publication is bounded per artifact and by a conservative hard 1 GiB
+node-level revision quota. At quota, publication fails visibly; Core does not
+evict retained objects. Operator-configurable quotas and hold-aware garbage
+collection remain outstanding, so publication stays opt-in and experimental.
 
 Updates retain `artifactId` and point to a new immutable content version; each
 URI identifies the exact SHA-256 revision, never a moving "latest" alias.

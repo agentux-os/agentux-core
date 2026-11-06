@@ -96,3 +96,34 @@ Protocol #20.
   producer path, content retrieval, retention, and failure behavior.
 - [ ] Obtain independent security/contract review and green CI on x86_64 and
   aarch64 before merging implementation changes.
+
+### Next implementation slice: producer lifecycle through snapshot capture
+
+**Files:**
+- Modify `crates/agentux-config/src/lib.rs`: keep publish/remove MCP tools opt-in.
+- Modify `crates/agentux-bus/src/{tools,backend,bus,server,prompt,lib}.rs` and
+  `crates/agentux-bus/tests/mcp.rs`: define and authorize `remove_artifact`.
+- Modify `crates/agentuxd/src/{bus,engine}.rs` and
+  `crates/agentuxd/tests/bus.rs`: derive the removal owner from the live
+  session, attach the private store in the daemon fixture, and exercise an
+  actual Command-originated producer through capture and removal.
+- Modify `crates/agentux-config/tests/validation.rs`: lock down default opt-out.
+
+**Interfaces:** `RemoveArtifact { artifact_id: String }`;
+`ArtifactRemoved { artifact_id: String, sequence: i64 }`;
+Core resolves organization, run and session from authenticated bus identity,
+then delegates to the store's existing original-session tombstone check.
+
+- [ ] Add the MCP integration scenario: opted-in fake agent publishes bounded
+  content; Core persists and hashes it; snapshot capture materializes the exact
+  node/artifact/revision URI while `artifact` remains unavailable; the same
+  active producer session removes it; capture includes the tombstone and the
+  artifact family remains unavailable.
+- [ ] Implement the opt-in remove tool and ensure both publish/remove are
+  excluded by default.
+- [ ] Run targeted tests and full x86_64/aarch64 CI; update this plan and PR
+  checklist with exact outcomes.
+
+Authenticated remote retrieval, protocol capability negotiation, source
+reconciliation, and hold-aware garbage collection remain separate follow-up
+work; this slice must not advertise complete artifact inventory to Command.
