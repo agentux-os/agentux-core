@@ -41,6 +41,13 @@ are documented in [task-activity.md](task-activity.md). No task events are
 emitted until the authoritative producer and durable recovery path are
 implemented.
 
+Generic artifact publication and retrieval are not implemented. The proposed
+Core ownership and content lifecycle are documented in
+[artifacts.md](artifacts.md) and the
+[design](superpowers/specs/2026-11-06-core-118-generic-artifacts-design.md);
+the gateway must not advertise `artifact://` references as remotely
+downloadable until authenticated dereference and removal/recovery are defined.
+
 The node-alert contract assigns enrolled alert relay and authenticated organization/node scoping to the gateway. The relay is implemented; selecting and connecting a concrete local alert producer remains tracked in Core #102. See the [node alert contract](node-alerts.md). The gateway does not derive alerts from heartbeat or harness polling; Command derives fleet presence separately.
 
 ## Commands from Command
