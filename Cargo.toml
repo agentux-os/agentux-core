@@ -10,7 +10,7 @@ repository = "https://github.com/agentux-os/agentux-core"
 publish = false
 
 [workspace.dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
 agentux-api = { path = "crates/agentux-api" }
 agentux-bus = { path = "crates/agentux-bus" }
 agentux-config = { path = "crates/agentux-config" }
