@@ -9,7 +9,12 @@ all-features = true
 # code, yanked crates). An advisory with no fix yet is listed in `ignore`
 # with the reason and the date it was reviewed.
 yanked = "deny"
-ignore = []
+ignore = [
+    # chrono is unmaintained, with no replacement release (2026-11-20). It
+    # comes only through rmcp, schemars and serde_with; no AgentUX crate
+    # uses it directly. Drop this once they move to jiff or time.
+    { id = "RUSTSEC-2026-0543", reason = "chrono unmaintained; transitive only (rmcp, schemars, serde_with)" },
+]
 
 [licenses]
 # Licenses compatible with shipping the agentux RPM under Apache-2.0.
