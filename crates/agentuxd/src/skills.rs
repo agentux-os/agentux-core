@@ -188,10 +188,7 @@ pub fn check(dir: &Path, name: Option<&str>) -> Result<Tree, String> {
 
     let mut listing = Sha256::new();
     for (relative, executable) in &files {
-        let mut hasher = Sha256::new();
-        let mut file = fs::File::open(dir.join(relative))
-            .map_err(|e| format!("cannot read {}: {e}", relative.display()))?;
-        io::copy(&mut file, &mut hasher)
+        let hasher = sha256_file(&dir.join(relative))
             .map_err(|e| format!("cannot read {}: {e}", relative.display()))?;
         listing.update(relative.as_os_str().as_bytes());
         listing.update(if *executable { b"\0x\0" } else { b"\0-\0" });
@@ -377,6 +374,20 @@ fn fetch(url: &str, rev: &str, subdir: Option<&str>, dir: &Path) -> Result<(), S
 }
 
 /// Files 0444 (0555 if executable), directories 0555.
+/// A file's SHA-256, read in chunks (sha2 0.11's hashers are not `io::Write`).
+fn sha256_file(path: &Path) -> io::Result<Sha256> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(hasher);
+        }
+        hasher.update(&buffer[..read]);
+    }
+}
+
 fn read_only(dir: &Path) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
